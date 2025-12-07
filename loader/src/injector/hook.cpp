@@ -238,6 +238,7 @@ constexpr const char *kZygote = "com/android/internal/os/Zygote";
 
 ZygiskContext *g_ctx;
 HookContext *g_hook;
+JniHookDefinitions *get_defs() { return g_hook; }
 
 static ino_t g_art_inode = 0;
 static dev_t g_art_dev = 0;

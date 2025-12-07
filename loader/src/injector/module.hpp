@@ -44,7 +44,6 @@ using PltBackupList = UniqueList<PltBackupEntry>;
 using MountInfoList = UniqueList<mount_info>;
 using RegisterInfoList = RegexUniqueList<RegisterInfo>;
 using IgnoreInfoList = RegexUniqueList<IgnoreInfo>;
-using BoolList = UniqueList<bool>;
 
 struct ZygiskContext;
 struct HookContext;
@@ -403,9 +402,9 @@ struct JNIMethods {
     size_t size() const { return count; }
 };
 
-struct HookContext {
 #include "jni_hooks.hpp"
 
+struct HookContext : JniHookDefinitions {
     void *start_addr = nullptr;
     jmethodID member_getModifiers = nullptr;
     lsplt::MapInfoList cached_map_infos = {};
