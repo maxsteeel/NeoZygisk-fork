@@ -157,11 +157,7 @@ fn initialize_globals() -> Result<()> {
         .set(format!("{}/init_monitor", TMP_PATH.get().unwrap()))
         .unwrap();
     DAEMON_SOCKET_PATH
-        .set(format!(
-            "{}/{}",
-            TMP_PATH.get().unwrap(),
-            lp_select!("/cp32.sock", "/cp64.sock")
-        ))
+        .set(lp_select!("cp32.sock", "cp64.sock").to_string())
         .unwrap();
     Ok(())
 }
@@ -280,8 +276,13 @@ fn create_library_fd(so_path: &Path) -> Result<OwnedFd> {
 
 /// Creates and binds the main daemon Unix socket.
 fn create_daemon_socket() -> Result<UnixListener> {
-    utils::set_socket_create_context("u:r:zygote:s0")?;
-    let listener = utils::unix_listener_from_path(DAEMON_SOCKET_PATH.get().unwrap())?;
+    use std::os::unix::net::{UnixListener, SocketAddr};
+    use std::os::android::net::SocketAddrExt;
+
+    let name = DAEMON_SOCKET_PATH.get().unwrap();
+    let addr = SocketAddr::from_abstract_name(name.as_bytes())?;
+    let listener = UnixListener::bind_addr(&addr)?;
+
     Ok(listener)
 }
 

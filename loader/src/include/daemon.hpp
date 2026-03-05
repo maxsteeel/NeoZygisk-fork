@@ -12,7 +12,7 @@
 #define LP_SELECT(lp32, lp64) lp32
 #endif
 
-constexpr auto kCPSocketName = "/" LP_SELECT("cp32", "cp64") ".sock";
+extern std::string kCPSocketName;
 
 class UniqueFd {
     using Fd = int;

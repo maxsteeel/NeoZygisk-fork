@@ -9,6 +9,7 @@
 
 namespace zygiskd {
 static std::string TMP_PATH;
+std::string kCPSocketName = (sizeof(void*) == 8) ? "cp64.sock" : "cp32.sock";
 
 void Init(const char *path) {
     TMP_PATH = path;
@@ -19,13 +20,11 @@ std::string GetTmpPath() { return TMP_PATH; }
 
 int Connect(uint8_t retry) {
     int fd = socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    struct sockaddr_un addr{
-        .sun_family = AF_UNIX,
-        .sun_path = {0},
-    };
-    auto socket_path = TMP_PATH + kCPSocketName;
-    strcpy(addr.sun_path, socket_path.c_str());
-    socklen_t socklen = sizeof(addr);
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+
+    memcpy(addr.sun_path + 1, kCPSocketName.c_str(), kCPSocketName.size());
+    socklen_t socklen = sizeof(addr.sun_family) + kCPSocketName.size() + 1;
 
     while (retry--) {
         int r = connect(fd, reinterpret_cast<struct sockaddr *>(&addr), socklen);
