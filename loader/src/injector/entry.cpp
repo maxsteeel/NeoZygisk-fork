@@ -7,8 +7,15 @@
 using namespace std;
 
 extern "C" [[gnu::visibility("default")]]
-void entry(void* addr, size_t size, const char* path) {
-    LOGI("zygisk library injected, version %s", ZKSU_VERSION);
+void entry(void* addr, size_t size, const char* path, void (**init_array)(), size_t init_count) {
+
+    if (init_array != nullptr && init_count > 0) {
+        for (size_t i = 0; i < init_count; i++) {
+            if (init_array[i] != nullptr) init_array[i]();
+        }
+    }
+
+    LOGI("CSOLoader: zygisk library natively initialized, version %s", ZKSU_VERSION);
 
     zygiskd::Init(path);
 
@@ -34,7 +41,8 @@ void entry(void* addr, size_t size, const char* path) {
  * @return int Always returns 0 to indicate success, tricking the caller into thinking
  *             the handler was registered while we have actually blocked it.
  */
-extern "C" int __cxa_atexit(void (*func)(void*), void* arg, void* dso) {
+extern "C" [[gnu::visibility("default")]] 
+int __cxa_atexit(void (*func)(void*), void* arg, void* dso) {
     // Dl_info will be filled with information about the library
     // containing the function pointer 'func'.
     Dl_info info;
@@ -55,3 +63,6 @@ extern "C" int __cxa_atexit(void (*func)(void*), void* arg, void* dso) {
 
     return 0;
 }
+
+extern "C" [[gnu::visibility("default")]] 
+void __cxa_finalize(void * d) {}
