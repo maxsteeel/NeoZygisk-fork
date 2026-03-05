@@ -19,6 +19,7 @@
 #include "daemon.hpp"
 #include "logging.hpp"
 #include "utils.hpp"
+#include "remote_csoloader.hpp"
 
 /**
  * @brief Injects a shared library into a running process at its main entry point.
@@ -187,97 +188,66 @@ bool inject_on_main(int pid, const char *lib_path) {
     memcpy(&backup, &regs, sizeof(regs));
     map = MapInfo::Scan(std::to_string(pid));  // Re-scan maps as they may have changed.
     auto local_map = MapInfo::Scan();
+    
+    // Find libc.so return address and path for CSOLoader
     auto libc_return_addr = find_module_return_addr(map, "libc.so");
-
-    // Remotely call dlopen(lib_path, RTLD_NOW)
-    LOGV("executing remote call to dlopen(\"%s\")", lib_path);
-    auto dlopen_addr = find_func_addr(local_map, map, "libdl.so", "dlopen");
-    if (dlopen_addr == nullptr) {
-        LOGE("could not find address of dlopen in the target process");
-        return false;
-    }
-    std::vector<long> args;
-    auto remote_lib_path = push_string(pid, regs, lib_path);
-    args.push_back((long) remote_lib_path);
-    args.push_back((long) RTLD_NOW);
-    auto remote_handle =
-        remote_call(pid, regs, (uintptr_t) dlopen_addr, (uintptr_t) libc_return_addr, args);
-
-    if (remote_handle == 0) {
-        LOGE("remote call to dlopen failed, retrieving error message with dlerror");
-        auto dlerror_addr = find_func_addr(local_map, map, "libdl.so", "dlerror");
-        if (dlerror_addr == nullptr) {
-            LOGE("could not find address of dlerror; cannot retrieve error string");
-            return false;
-        }
-        args.clear();
-        auto dlerror_str_addr =
-            remote_call(pid, regs, (uintptr_t) dlerror_addr, (uintptr_t) libc_return_addr, args);
-        if (dlerror_str_addr == 0) {
-            LOGE("remote call to dlerror returned null");
-            return false;
-        }
-        auto strlen_addr = find_func_addr(local_map, map, "libc.so", "strlen");
-        if (strlen_addr == nullptr) {
-            LOGE("could not find address of strlen; cannot measure error string length");
-            return false;
-        }
-        args.clear();
-        args.push_back(dlerror_str_addr);
-        auto dlerror_len =
-            remote_call(pid, regs, (uintptr_t) strlen_addr, (uintptr_t) libc_return_addr, args);
-        if (dlerror_len <= 0) {
-            LOGE("dlerror string length is invalid (%" PRIuPTR ")", dlerror_len);
-            return false;
-        }
-        std::string err;
-        err.resize(dlerror_len + 1, 0);
-        read_proc(pid, (uintptr_t) dlerror_str_addr, err.data(), dlerror_len);
-        LOGE("dlopen error: %s", err.c_str());
-        return false;
-    }
-    LOGI("successfully loaded library via remote dlopen, handle: 0x%" PRIxPTR, remote_handle);
-
-    // Remotely call dlsym(handle, "entry")
-    LOGV("executing remote call to dlsym to find the 'entry' symbol");
-    auto dlsym_addr = find_func_addr(local_map, map, "libdl.so", "dlsym");
-    if (dlsym_addr == nullptr) {
-        LOGE("could not find address of dlsym in the target process");
-        return false;
-    }
-    args.clear();
-    auto remote_entry_str = push_string(pid, regs, "entry");
-    args.push_back(remote_handle);
-    args.push_back((long) remote_entry_str);
-    auto injector_entry =
-        remote_call(pid, regs, (uintptr_t) dlsym_addr, (uintptr_t) libc_return_addr, args);
-
-    if (injector_entry == 0) {
-        LOGE("dlsym failed to find the 'entry' symbol in the injected library");
-        return false;
-    }
-    LOGI("found injector entry point at address 0x%" PRIxPTR, injector_entry);
-
-    // Find the address range of the injected library to pass to its entry function.
-    map = MapInfo::Scan(std::to_string(pid));
-    void *start_addr = nullptr;
-    size_t block_size = 0;
+    std::string libc_path_str = "";
     for (const auto &info : map) {
-        if (info.path.find("libzygisk.so") != std::string::npos) {
-            if (start_addr == nullptr) start_addr = (void *) info.start;
-            block_size += (info.end - info.start);
+        // Strict check: make sure the filename is exactly libc.so
+        const char *filename = strrchr(info.path.c_str(), '/');
+        filename = filename ? filename + 1 : info.path.c_str();
+        if (strcmp(filename, "libc.so") == 0) {
+            libc_path_str = info.path;
+            break;
         }
     }
-    LOGV("found injected library mapped from %p with total size %zu", start_addr, block_size);
 
-    // Remotely call our entry(start_addr, block_size, path) function
-    LOGI("calling the injector's entry function to initialize NeoZygisk");
-    args.clear();
-    args.push_back((uintptr_t) start_addr);
-    args.push_back(block_size);
+    if (libc_path_str.empty()) {
+        LOGE("could not locate libc.so in remote maps");
+        return false;
+    }
+
+    uintptr_t remote_base = 0;
+    size_t remote_size = 0;
+    uintptr_t injector_entry = 0;
+    uintptr_t init_array = 0;
+    size_t init_count = 0;
+
+    if (!remote_csoloader_load_and_resolve_entry(pid, &regs, (uintptr_t)libc_return_addr, 
+                                                 local_map, map, libc_path_str.c_str(), 
+                                                 lib_path, &remote_base, &remote_size, &injector_entry,
+                                                 &init_array, &init_count)) {
+        LOGE("CSOLoader failed to map the library remotely");
+        backup.REG_IP = (long) entry_addr;
+        set_regs(pid, backup);
+        return false;
+    }
+
+    LOGI("CSOLoader success. entry: 0x%" PRIxPTR, injector_entry);
+
+    std::vector<long> args;
+    args.push_back((long)remote_base);
+    args.push_back((long)remote_size);
     auto remote_tmp_path = push_string(pid, regs, zygiskd::GetTmpPath().c_str());
-    args.push_back((long) remote_tmp_path);
-    remote_call(pid, regs, injector_entry, (uintptr_t) libc_return_addr, args);
+    args.push_back((long)remote_tmp_path);
+    args.push_back((long)init_array); // Argumento 4
+    args.push_back((long)init_count); // Argumento 5
+
+    remote_call(pid, regs, injector_entry, (uintptr_t)libc_return_addr, args);
+
+    bool injector_ok = false;
+#if defined(__arm__)
+    injector_ok = (((uintptr_t)regs.REG_IP & ~1u) == ((uintptr_t)libc_return_addr & ~1u));
+#else
+    injector_ok = ((uintptr_t)regs.REG_IP == (uintptr_t)libc_return_addr);
+#endif
+
+    if (!injector_ok) {
+        LOGE("injector entry faulted at unexpected IP: %p", (void*)regs.REG_IP);
+        backup.REG_IP = (long) entry_addr;
+        set_regs(pid, backup);
+        return false;
+    }
 
     // --- Step 5: Restore State ---
     // Set the instruction pointer back to the original entry address and restore all registers.
