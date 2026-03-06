@@ -13,6 +13,7 @@
 #include <link.h>
 #include <vector>
 #include <string>
+#include <linux/memfd.h>
 
 #include "logging.hpp"
 #include "utils.hpp"
@@ -393,7 +394,8 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     void *mprotect_addr = find_func_addr(local_map, remote_map, libc_path, "mprotect");
     void *open_addr = find_func_addr(local_map, remote_map, libc_path, "open");
     void *close_addr = find_func_addr(local_map, remote_map, libc_path, "close");
-    if (!mmap_addr || !mprotect_addr || !open_addr || !close_addr) { close(fd); return false; }
+    void *syscall_addr = find_func_addr(local_map, remote_map, libc_path, "syscall");
+    if (!mmap_addr || !mprotect_addr || !open_addr || !close_addr || !syscall_addr) { close(fd); return false; }
 
     size_t path_len = strlen(lib_path) + 1;
     std::vector<long> args = {0, (long)path_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
@@ -407,9 +409,65 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     long remote_fd = (long)remote_call(pid, call_regs, (uintptr_t)open_addr, libc_return_addr, args);
     if (remote_fd < 0) { close(fd); return false; }
 
-    args = {0, (long)map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
+    long memfd_syscall_num = 0;
+#if defined(__aarch64__)
+    memfd_syscall_num = 279;
+#elif defined(__x86_64__)
+    memfd_syscall_num = 319;
+#elif defined(__arm__)
+    memfd_syscall_num = 385;
+#elif defined(__i386__)
+    memfd_syscall_num = 356;
+#endif
+
+    args = {0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
     call_regs = regs_saved;
-    uintptr_t remote_base = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args);
+    uintptr_t name_addr = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args);
+    const char* fake_name = "jit-cache";
+    write_proc(pid, name_addr, fake_name, strlen(fake_name) + 1);
+
+    args = {memfd_syscall_num, (long)name_addr, MFD_CLOEXEC};
+    call_regs = regs_saved;
+    long memfd = (long)remote_call(pid, call_regs, (uintptr_t)syscall_addr, libc_return_addr, args);
+
+    args = {(long)name_addr, 4096};
+    void *munmap_addr = find_func_addr(local_map, remote_map, libc_path, "munmap");
+    if (munmap_addr) {
+        call_regs = regs_saved;
+        remote_call(pid, call_regs, (uintptr_t)munmap_addr, libc_return_addr, args);
+    }
+
+    uintptr_t remote_base = 0;
+
+    if (memfd >= 0) {
+        long ftruncate_syscall = 0;
+#if defined(__aarch64__)
+        ftruncate_syscall = 46;
+#elif defined(__x86_64__)
+        ftruncate_syscall = 77;
+#elif defined(__arm__)
+        ftruncate_syscall = 93;
+#elif defined(__i386__)
+        ftruncate_syscall = 93;
+#endif
+        args = {ftruncate_syscall, memfd, (long)map_size};
+        call_regs = regs_saved;
+        remote_call(pid, call_regs, (uintptr_t)syscall_addr, libc_return_addr, args);
+
+        args = {0, (long)map_size, PROT_NONE, MAP_SHARED, memfd, 0};
+        call_regs = regs_saved;
+        remote_base = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args);
+
+        args = {memfd};
+        call_regs = regs_saved;
+        remote_call(pid, call_regs, (uintptr_t)close_addr, libc_return_addr, args);
+    } else {
+        LOGW("CSOLoader: memfd_create failed, falling back to anonymous memory");
+        args = {0, (long)map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
+        call_regs = regs_saved;
+        remote_base = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args);
+    }
+
     if (!remote_base || remote_base == (uintptr_t)MAP_FAILED) { close(fd); return false; }
 
     uintptr_t load_bias = remote_base - (uintptr_t)min_vaddr;
