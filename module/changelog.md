@@ -1,22 +1,28 @@
-# 🚀 NeoZygisk-Fork v2.3-290 更新發佈
+# NeoZygisk-fork v2.3-300 Update Released
 
-### 🛡️ 隱藏與反偵測機制強化
-*   **升級 APatch & KSU 隱藏**：新增 Bootloader 屬性隱藏與偽裝邏輯。
-*   **深度記憶體隱藏 (hide_map)**：確保注入模組在記憶體映射中被徹底清理。原本 `memfd` 載入的 zygisk-module 現在會偽裝成私有匿名記憶體 (Private Anonymous Memory)，進一步降低被反作弊系統掃描的風險。
-*   **VBMeta 隨機化**：改用 `/dev/urandom` 生成 VBMeta digest，大幅提升特徵隨機性。
+I created this fork because I'm tired of all the detections in the original NeoZygisk, which persist despite NkBe's changes. For now, this fork will only prioritize hiding Zygisk (aside from this, there won't be any other advantages over the original NeoZygisk at the moment).
 
-### ⚙️ 核心注入與相容性升級
-*   **支援階層式 Zygote 啟動 (Stub Process)**：重構 `ptrace` 監控邏輯，現在完美支援 `init` -> `stub_zygote` -> `zygote` 的啟動鏈（不再受限於只能是 init 的直接子進程）。這讓模組在各種魔改系統上的注入更具韌性！
-*   **重構掛載命名空間 (Mount Namespace) 傳輸**：棄用舊版的 PID/FD 整數傳輸，改用 Unix Domain Sockets (`SCM_RIGHTS`) 直接傳遞 FD。徹底解決部分裝置（特別是 Android 12 / arm32 架構）上出現的 `Permission denied` 錯誤。
-*   **SELinux 規則補全**：允許 zygote 讀取 mount namespace，修復了在 AVD 模擬器 (qemu) 上因 SELinux 攔截導致命名空間更新失敗的問題。
-*  **直接呼叫二進位檔 bin/zygisk-ptrace64。**
+### Latest detailed changes of my fork:
 
-### 🐛 崩潰修復與底層優化
-*   **修復特定內核設備崩潰 (SIGSEGV)**：針對 Redmi Note 10 Pro (Kernel 4.14) 等設備，在讀取主執行緒堆疊時新增了 `PROT_READ` 權限檢查，跳過不可讀的 Stack Guard Pages，解決開機或執行時的隨機崩潰。
-*   **修復緩衝區覆寫 Bug**：修正了 `recv_fds` 在處理 Rust 守護進程傳遞的 Dummy Payload 時，錯誤覆寫控制訊息長度的問題。
-*   **編譯與程式碼健壯性修復**：
-    *   新增 `g_art_inode` 與 `g_art_dev` 全域變數快取，徹底解決 `/libart.so` 相關的 undeclared identifier 編譯報錯。
-    *   修復指標轉型報錯（補上 `reinterpret_cast`），解決 C++ 嚴格型別檢查問題。
-    *   修復記憶體洩漏與非法地址訪問問題。
-*   **效能與日誌優化**：優化 `/proc/self/mountinfo` 解析效能，並減少不必要的錯誤日誌干擾。
-*  **兼容 Android 17 preview**：添加 (de-)constructor 符號回退至 ProtectedData
+* **Completely abandons dlopen, introducing a native CSO Loader**: The injection core has been completely restructured, replacing it with a Custom Shared Object (CSO) Loader written natively in C++. Through manual mapping and ELF relocation, "zero linker traces" are achieved, making the injected module completely invisible in the system's soinfo tracking list.
+*Credits to **@ThePedroo** for C implementation of CSOLoader, base for this implementation*
+
+* **Deep Memory Disguise (memfd_create)**: Targeting high-strength root detectors scans such as Native Detector, the originally easily detectable anonymous executable memory ([anon]) is replaced with a memfd-based virtual file descriptor. The injected payload will now perfectly disguise itself as a legitimate JIT-compiled cache (/memfd:jit-cache), completely eliminating the "Zygisk detection (1)" error.
+
+* **Implement Abstract Unix Domain Sockets**: The communication mechanism of the daemon process has been completely upgraded to abstract namespace sockets (abandoning the traditional physical .sock files), ensuring that no physical communication node traces are left in the physical file system.
+
+* **Smart IFUNC Resolver**: To address the crash issue of Android Bionic indirect functions (such as memcpy) encountered when bypassing dlopen, a new local symbol resolution and offset mapping algorithm has been added to ensure stable operation of the C++ virtual machine without the assistance of the official Linker.
+
+* **Bionic Crash Interception**: Intercepts and takes over the destruction and registration process of global variables in C++. This successfully prevents the Bionic system from triggering the ABRT(6) security self-destruct mechanism due to the detection of registration requests from unknown memory sources.
+
+* **Remote execution of native constructors**: CSOLoader can now precisely locate and safely execute DT_INIT_ARRAY within the target process, ensuring that C++ standard library components such as std::string and std::vector are correctly initialized without triggering a segmentation fault.
+
+* **Removal of redundant attexit memory scanner**: Thanks to the new CSOLoader hiding architecture, modules no longer need to brute-force scan and modify the internal structure of libc.so (g_array) at runtime to erase traces. This significantly reduces unnecessary memory operation noise, lowers the risk of being detected by heuristic scanning, and also removes the old clean_linker_trace.
+
+* **Massive Codebase Debloat & Future-Proofing**: Completely eradicated the highly unstable and fragile `solist` (linker soinfo parser) and `fossil` (memory scanner/spoofer) implementations. By relying purely on the new CSOLoader architecture, thousands of lines of obsolete code were purged. This guarantees extreme stability and makes the fork completely immune to future Android OS updates (e.g., Android 17 linker changes) that typically break traditional memory list parsers.
+
+* **Zero-Allocation I/O & Extreme Boot Performance**: Rewrote critical early-boot components (`seccomp` handling, file reading, and unmount parsing) to utilize pure C raw syscalls (`read()`) and fixed stack buffers. By completely eliminating dynamic heap allocations (`malloc`, `std::string`, `std::ifstream`) during Zygote's initialization, this prevents memory fragmentation, avoids allocator deadlocks, and drastically reduces the injection overhead, ensuring lightning-fast boot times.
+
+* **App Zygote Root Detection Bypass**: Addressed a critical vulnerability where `Isolated Services` (such as Chromium sandboxed renderers and banking app secure environments) inherited a dirty mount namespace. By enforcing a manual and surgical `umount` during `nativeSpecializeAppProcess`, the fork now successfully bypasses root detection in highly secure isolated processes and prevents kernel panics associated with leaked file descriptors.
+
+* **Improvements in Unmount**: Introduced a highly optimized, pure C parser for mount points, allowing the injector to clean up Magisk/KernelSU traces at maximum speed without relying on heavy C++ standard library wrappers.
