@@ -5,20 +5,7 @@
 
 #include "fossil.hpp"
 #include "logging.hpp"
-#include "solist.hpp"
 #include "zygisk.hpp"
-
-void clean_linker_trace(const char *path, size_t loaded_modules, size_t unloaded_modules,
-                        bool unload_soinfo) {
-    LOGV("cleaning linker trace for path %s", path);
-    Linker::dropSoPath(path, unload_soinfo);
-
-    if (unload_soinfo) {
-        Linker::resetCounters(loaded_modules, loaded_modules);
-    } else {
-        Linker::resetCounters(loaded_modules, unloaded_modules);
-    }
-}
 
 void spoof_virtual_maps(const char *path, bool clear_write_permission) {
     // spoofing map path names is futile in Android, we do it simply
