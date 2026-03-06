@@ -392,20 +392,6 @@ void ZygiskContext::nativeForkSystemServer_pre() {
     LOGV("pre forkSystemServer");
     flags |= SERVER_FORK_AND_SPECIALIZE;
 
-    for (auto &map : g_hook->cached_map_infos) {
-        if (map.dev == 0 && map.inode == 0 && map.offset == 0 && map.is_private &&
-            map.path == "[anon:stack_and_tls:main]") {
-            if ((map.perms & PROT_READ) == 0) {
-                LOGV("Skipping non-readable stack map at %p", reinterpret_cast<void *>(map.start));
-                continue;
-            }
-            auto search_from = reinterpret_cast<char *>(map.start);
-            auto search_to = reinterpret_cast<char *>(map.end);
-            spoof_zygote_fossil(search_from, search_to, "ref_profiles");
-            break;
-        }
-    }
-
     fork_pre();
     if (is_child()) {
         server_specialize_pre();
