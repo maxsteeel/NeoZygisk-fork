@@ -255,10 +255,6 @@ DCL_HOOK_FUNC(static int, pthread_attr_setstacksize, void *target, size_t size) 
             void *start_addr = g_hook->start_addr;
             size_t block_size = g_hook->block_size;
 
-            if (g_hook->should_spoof_maps) {
-                spoof_virtual_maps("zygisk-module", true);
-            }
-
             delete g_hook;
             // Because both `pthread_attr_setstacksize` and `munmap` have the same function
             // signature, we can use `musttail` to let the compiler reuse our stack frame and thus

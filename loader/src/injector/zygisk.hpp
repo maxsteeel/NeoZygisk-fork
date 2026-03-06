@@ -22,10 +22,6 @@ void hook_entry(void *start_addr, size_t block_size);
 
 void hookJniNativeMethods(JNIEnv *env, const char *clz, JNINativeMethod *methods, int numMethods);
 
-void spoof_virtual_maps(const char *path, bool clear_write_permission);
-
-void spoof_zygote_fossil(char *search_from, char *search_to, const char *anchor);
-
 void send_seccomp_event_if_needed();
 
 std::vector<mount_info> check_zygote_traces(uint32_t info_flags);
