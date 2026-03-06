@@ -322,8 +322,6 @@ void ZygiskContext::run_modules_post() {
 
     if (modules.size() > 0) {
         LOGV("modules unloaded: %zu/%zu", modules_unloaded, modules.size());
-        g_hook->should_spoof_maps =
-            (flags & APP_SPECIALIZE) && (modules.size() - modules_unloaded) > 0;
     }
 }
 
