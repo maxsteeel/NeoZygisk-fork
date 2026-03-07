@@ -373,19 +373,6 @@ void ZygiskContext::server_specialize_post() { run_modules_post(); }
 
 // -----------------------------------------------------------------
 
-void ZygiskContext::nativeSpecializeAppProcess_pre() {
-    process = env->GetStringUTFChars(args.app->nice_name, nullptr);
-    LOGV("pre specialize [%s]", process);
-    // App specialize does not check FD
-    flags |= SKIP_CLOSE_LOG_PIPE;
-    app_specialize_pre();
-}
-
-void ZygiskContext::nativeSpecializeAppProcess_post() {
-    LOGV("post specialize [%s]", process);
-    app_specialize_post();
-}
-
 void ZygiskContext::nativeForkSystemServer_pre() {
     LOGV("pre forkSystemServer");
     flags |= SERVER_FORK_AND_SPECIALIZE;
@@ -422,6 +409,42 @@ bool abort_zygote_unmount(const std::vector<mount_info> &traces, uint32_t info_f
         }
     }
     return false;
+}
+
+void ZygiskContext::nativeSpecializeAppProcess_pre() {
+    process = env->GetStringUTFChars(args.app->nice_name, nullptr);
+    LOGV("pre specialize [%s]", process);
+    // App specialize does not check FD
+    flags |= SKIP_CLOSE_LOG_PIPE;
+    app_specialize_pre();
+
+    // If parent Zygote has not yet been cleaned up, this App Zygote inherits the dirty namespace.
+    // The unshare() hook by default depends on a 'Clean' namespace in cache that is
+    // actually dirty (SystemServer cache). We must manually unmount here.
+    if (!g_hook->zygote_unmounted && (flags & DO_REVERT_UNMOUNT)) {
+        LOGI("AppZygote [%s] is on denylist, performing manual unmount", process);
+        auto traces = check_zygote_traces(info_flags);
+
+        if (!abort_zygote_unmount(traces, info_flags)) {
+            for (const auto &trace : traces) {
+                // Fix Magisk root loss: we omitted elements of "magisk"
+                if (trace.source == "magisk") continue;
+
+                LOGV("AppZygote unmounting %s", trace.target.c_str());
+                umount2(trace.target.c_str(), MNT_DETACH);
+            }
+            // After unmounting, we can clear the traces to prevent the SystemServer 
+            // from inheriting them, which may cause issues with the SystemServer's
+            // resource overlay (JingMatrix/NeoZygisk#26)
+            g_hook->zygote_unmounted = true;
+            g_hook->zygote_traces.clear();
+        }
+    }
+}
+
+void ZygiskContext::nativeSpecializeAppProcess_post() {
+    LOGV("post specialize [%s]", process);
+    app_specialize_post();
 }
 
 void ZygiskContext::nativeForkAndSpecialize_pre() {
