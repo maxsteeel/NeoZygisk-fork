@@ -33,7 +33,8 @@ val defaultCFlags = arrayOf(
     "-ffunction-sections", "-fdata-sections",
     "-fno-ident", "-fmerge-all-constants",
     "-fno-semantic-interposition", "-fno-plt",
-    "-Wno-builtin-macro-redefined", "-D__FILE__=__FILE_NAME__"
+    "-Wno-builtin-macro-redefined", "-D__FILE__=__FILE_NAME__",
+    "-DWORK_DIRECTORY='\"${workDirectory}\"'"
 )
 
 val releaseFlags = arrayOf(
