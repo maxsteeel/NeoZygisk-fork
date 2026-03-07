@@ -64,21 +64,26 @@ bool InitSharedMemory() {
         int mem_fd = socket_utils::recv_fd(fd);
         
         if (mem_fd >= 0) {
-            // 4. Map the shared memory into our address space
-            void* map = mmap(nullptr, sizeof(zygisk::ZygiskSharedData), PROT_READ, MAP_PRIVATE, mem_fd, 0);
-            
-            close(mem_fd); // Close our copy of the FD, the mapping will remain valid
+            // 4. We map purely anonymous memory
+            void* map = mmap(nullptr, sizeof(zygisk::ZygiskSharedData), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             
             if (map != MAP_FAILED) {
+                // Roll back the FD to the beginning just in case and copy the bytes to anonymous memory
+                lseek(mem_fd, 0, SEEK_SET);
+                read(mem_fd, map, sizeof(zygisk::ZygiskSharedData));
+                
+                close(mem_fd); // Destroy the FD as soon as possible to leave 0 traces in the process. The memory will remain valid because it's now purely anonymous.
+
+                // Return the memory to read-only for security
+                mprotect(map, sizeof(zygisk::ZygiskSharedData), PROT_READ);
+
                 g_shared_data = static_cast<zygisk::ZygiskSharedData*>(map);
-                
-                // 5. Optionally, we can set a name for the VMA for easier debugging (this is not strictly necessary)
-                prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, g_shared_data, sizeof(zygisk::ZygiskSharedData), "jit-cache");
-                
+
                 LOGI("Shared memory initialized successfully! Magic: 0x%X", g_shared_data->magic);
                 return true;
             } else {
-                LOGE("mmap failed for shared memory.");
+                close(mem_fd);
+                LOGE("mmap MAP_ANONYMOUS failed: %s", strerror(errno));
             }
         } else {
             LOGE("Failed to receive shared memory FD.");
