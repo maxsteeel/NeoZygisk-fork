@@ -6,11 +6,12 @@
 #include <stdio.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <array>
 #include <cstdint>
-#include <fstream>
 #include <string>
 
 #include "logging.hpp"
@@ -35,21 +36,27 @@
  */
 
 static bool should_skip_seccomp_injection() {
-    // Use std::ifstream for automatic resource management (RAII).
-    std::ifstream status_file("/proc/self/status");
-    if (!status_file.is_open()) {
+    int fd = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
         // Fail-safe: if we can't check, we skip the injection.
         return true;
     }
 
-    const std::string needle = "Seccomp_filters:";
-    std::string line;
+    // read buffer for /proc/self/status. 4096 bytes is typically enough to read the entire status.
+    char buf[4096]; 
+    ssize_t bytes_read = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
 
-    while (std::getline(status_file, line)) {
-        // C++20's starts_with is safer and more expressive than strncmp.
-        if (line.starts_with(needle)) {
-            return true;
-        }
+    if (bytes_read <= 0) {
+        return true;
+    }
+    
+    // ensure that it is a null-terminated string
+    buf[bytes_read] = '\0';
+
+    // search for the substring directly in the buffer
+    if (strstr(buf, "Seccomp_filters:") != nullptr) {
+        return true;
     }
 
     return false;
@@ -63,19 +70,20 @@ void send_seccomp_event_if_needed() {
     // Use std::array for type-safe, fixed-size arrays.
     std::array<uint32_t, 4> args{};
 
-    // Read random bytes to create a unique syscall signature.
-    {
-        std::ifstream random_file("/dev/urandom", std::ios::binary);
-        if (!random_file.is_open()) {
-            PLOGE("seccomp: open(/dev/urandom)");
-            return;
-        }
-        random_file.read(reinterpret_cast<char *>(args.data()), args.size() * sizeof(uint32_t));
-        if (!random_file) {
-            PLOGE("seccomp: read(random_file)");
-            return;
-        }
-    }  // random_file is automatically closed here by its destructor.
+    // Read random bytes to create a unique syscall signature
+    int random_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (random_fd < 0) {
+        PLOGE("seccomp: open(/dev/urandom)");
+        return;
+    }
+    
+    ssize_t read_res = read(random_fd, args.data(), args.size() * sizeof(uint32_t));
+    close(random_fd);
+    
+    if (read_res != static_cast<ssize_t>(args.size() * sizeof(uint32_t))) {
+        PLOGE("seccomp: read(random_file)");
+        return;
+    }
 
     // Modify a bit to ensure the signature is highly unlikely to occur naturally.
     args[0] |= 0x10000;
