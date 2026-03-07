@@ -42,6 +42,7 @@ struct Module {
 struct AppContext {
     modules: Vec<Module>,
     mount_manager: Arc<MountNamespaceManager>,
+    shared_mem_fd: Option<OwnedFd>,
 }
 
 // Global paths, initialized once at startup.
@@ -57,10 +58,13 @@ pub fn main() -> Result<()> {
     let modules = load_modules()?;
     send_startup_info(&modules)?;
 
+    let module_names: Vec<String> = modules.iter().map(|m| m.name.clone()).collect();
+    let shared_mem_fd = crate::shared_mem::create_shared_memory_fd(&module_names);
     let mount_manager = Arc::new(MountNamespaceManager::new());
     let context = Arc::new(AppContext {
         modules,
         mount_manager,
+        shared_mem_fd,
     });
     let listener = create_daemon_socket()?;
 
@@ -143,6 +147,17 @@ fn handle_threaded_action(
             handle_request_companion_socket(&mut stream, context)
         }
         DaemonSocketAction::GetModuleDir => handle_get_module_dir(&mut stream, context),
+        DaemonSocketAction::RequestSharedMemoryFd => {
+            if let Some(fd) = &context.shared_mem_fd {
+                stream.write_u8(1)?; // 1 = Success
+                stream.send_fd(fd.as_raw_fd())?;
+                trace!("Shared memory FD sent to injector.");
+            } else {
+                stream.write_u8(0)?; // 0 = Error/Not available
+                warn!("Injector requested shared memory FD, but it was not initialized.");
+            }
+            Ok(())
+        }
         // Other cases are handled synchronously and won't reach here.
         _ => unreachable!(),
     }

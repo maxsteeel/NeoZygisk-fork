@@ -44,6 +44,8 @@ pub const DAEMON_SET_INFO: i32 = 5;
 pub const DAEMON_SET_ERROR_INFO: i32 = 6;
 /// IPC code indicating that the Android system server has started.
 pub const SYSTEM_SERVER_STARTED: i32 = 7;
+/// IPC code for requesting the shared memory file descriptor.
+pub const REQUEST_SHARED_MEMORY_FD: i32 = 8;
 
 /// Defines the set of actions that can be requested from the daemon over its main Unix socket.
 #[derive(Debug, Eq, PartialEq, TryFromPrimitive, Copy, Clone)]
@@ -58,6 +60,7 @@ pub enum DaemonSocketAction {
     GetModuleDir,
     ZygoteRestart,
     SystemServerStarted,
+    RequestSharedMemoryFd,
 }
 
 bitflags! {

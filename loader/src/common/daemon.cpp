@@ -3,9 +3,19 @@
 #include <linux/un.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <sys/mman.h>  // mmap, PROT_READ, MAP_SHARED, MAP_FAILED
+#include <sys/prctl.h> // Prctl
 
 #include "logging.hpp"
 #include "socket_utils.hpp"
+#include "shared_memory.hpp"
+
+zygisk::ZygiskSharedData* g_shared_data = nullptr;
+
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#define PR_SET_VMA_ANON_NAME 0
+#endif
 
 namespace zygiskd {
 static std::string TMP_PATH;
@@ -34,6 +44,55 @@ int Connect(uint8_t retry) {
 
     close(fd);
     return -1;
+}
+
+bool InitSharedMemory() {
+    UniqueFd fd = Connect(1);
+    if (fd == -1) {
+        LOGE("Failed to connect to daemon for shared memory.");
+        return false;
+    }
+
+    // 1. Request the shared memory file descriptor from the daemon
+    socket_utils::write_u8(fd, static_cast<uint8_t>(SocketAction::RequestSharedMemoryFd));
+
+    // 2. Read a status byte to check if the daemon is willing to provide the shared memory FD
+    uint8_t status = socket_utils::read_u8(fd);
+    
+    if (status == 1) {
+        // 3. The daemon agreed to provide the shared memory FD, we read it from the socket
+        int mem_fd = socket_utils::recv_fd(fd);
+        
+        if (mem_fd >= 0) {
+            // 4. We map purely anonymous memory
+            void* map = mmap(nullptr, sizeof(zygisk::ZygiskSharedData), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            
+            if (map != MAP_FAILED) {
+                // Roll back the FD to the beginning just in case and copy the bytes to anonymous memory
+                lseek(mem_fd, 0, SEEK_SET);
+                read(mem_fd, map, sizeof(zygisk::ZygiskSharedData));
+                
+                close(mem_fd); // Destroy the FD as soon as possible to leave 0 traces in the process. The memory will remain valid because it's now purely anonymous.
+
+                // Return the memory to read-only for security
+                mprotect(map, sizeof(zygisk::ZygiskSharedData), PROT_READ);
+
+                g_shared_data = static_cast<zygisk::ZygiskSharedData*>(map);
+
+                LOGI("Shared memory initialized successfully! Magic: 0x%X", g_shared_data->magic);
+                return true;
+            } else {
+                close(mem_fd);
+                LOGE("mmap MAP_ANONYMOUS failed: %s", strerror(errno));
+            }
+        } else {
+            LOGE("Failed to receive shared memory FD.");
+        }
+    } else {
+        LOGE("Daemon refused to provide shared memory FD.");
+    }
+    
+    return false;
 }
 
 bool PingHeartbeat() {

@@ -77,6 +77,7 @@ mod mount;
 mod root_impl;
 mod utils;
 mod zygiskd;
+pub mod shared_mem;
 
 use crate::constants::ZKSU_VERSION;
 use log::error;

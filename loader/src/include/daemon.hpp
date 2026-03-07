@@ -65,11 +65,14 @@ enum class SocketAction {
     GetModuleDir,
     ZygoteRestart,
     SystemServerStarted,
+    RequestSharedMemoryFd,
 };
 
 enum class MountNamespace { Clean, Root };
 
 void Init(const char* path);
+
+bool InitSharedMemory();
 
 std::string GetTmpPath();
 

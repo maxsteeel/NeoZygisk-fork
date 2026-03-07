@@ -156,6 +156,13 @@ HookContext *g_hook;
 
 static ino_t g_art_inode = 0;
 static dev_t g_art_dev = 0;
+
+struct MemoryModule {
+    std::string name;
+    std::vector<char> buffer;
+};
+// global modules cache
+std::vector<MemoryModule> g_modules_cache;
 // -----------------------------------------------------------------
 
 #define DCL_HOOK_FUNC(ret, func, ...)                                                      \
@@ -517,6 +524,25 @@ void HookContext::restore_zygote_hook(JNIEnv *env) {
 void hook_entry(void *start_addr, size_t block_size) {
     LoadPropConfig();
     InitRandomVbmeta();
+
+    // 1. Ask the daemon for the modules
+    auto mods = zygiskd::ReadModules();
+
+    // 2. Extract the bytes and save them in RAM
+    for (auto& m : mods) {
+        MemoryModule mem_mod;
+        mem_mod.name = m.name;
+
+        lseek(m.memfd, 0, SEEK_SET);
+        char buf[4096];
+        ssize_t n;
+        while ((n = read(m.memfd, buf, sizeof(buf))) > 0) {
+            mem_mod.buffer.insert(mem_mod.buffer.end(), buf, buf + n);
+        }
+        g_modules_cache.push_back(std::move(mem_mod));
+        // m.memfd will close itself upon exiting this loop, leaving 0 traces.
+    }
+    LOGI("Cached %zu modules.", g_modules_cache.size());
 
     g_hook = new HookContext(start_addr, block_size);
     g_hook->hook_plt();
