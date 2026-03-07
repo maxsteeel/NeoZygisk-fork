@@ -65,7 +65,7 @@ bool InitSharedMemory() {
         
         if (mem_fd >= 0) {
             // 4. Map the shared memory into our address space
-            void* map = mmap(nullptr, sizeof(zygisk::ZygiskSharedData), PROT_READ, MAP_SHARED, mem_fd, 0);
+            void* map = mmap(nullptr, sizeof(zygisk::ZygiskSharedData), PROT_READ, MAP_PRIVATE, mem_fd, 0);
             
             close(mem_fd); // Close our copy of the FD, the mapping will remain valid
             

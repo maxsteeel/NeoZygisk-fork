@@ -24,6 +24,10 @@ void entry(void* addr, size_t size, const char* path, void (**init_array)(), siz
         return;
     }
 
+    if (!zygiskd::InitSharedMemory()) {
+        LOGE("Failed to initialize shared memory!");
+    }
+
     hook_entry(addr, size);
     send_seccomp_event_if_needed();
 }
