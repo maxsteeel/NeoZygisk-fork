@@ -10,6 +10,8 @@
 #include <sys/syscall.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/syscall.h>
+#include <linux/memfd.h>
 
 #include <lsplt.hpp>
 
@@ -37,6 +39,18 @@ static inline int fast_atoi(const char* str) {
     }
     return val;
 }
+
+#ifndef SYS_memfd_create
+#if defined(__aarch64__)
+#define SYS_memfd_create 279
+#elif defined(__x86_64__)
+#define SYS_memfd_create 319
+#elif defined(__arm__)
+#define SYS_memfd_create 385
+#elif defined(__i386__)
+#define SYS_memfd_create 356
+#endif
+#endif
 
 using namespace std;
 
@@ -369,15 +383,37 @@ void ZygiskContext::fork_post() {
     allowed_fds.shrink_to_fit();
 }
 
+extern struct MemoryModule {
+    std::string name;
+    std::vector<char> buffer;
+} g_modules_cache_struct;
+extern std::vector<MemoryModule> g_modules_cache;
+
 /* Zygisksu changed: Load module fds */
 void ZygiskContext::run_modules_pre() {
-    auto ms = zygiskd::ReadModules();
-    auto size = ms.size();
+    // Cache modules from zygiskd, we will dlopen them later in
+    // the process when needed. This is to avoid dlopen in zygote
+    // which may cause deadlock due to ART's classloader lock.
+    // Also, this allows us to bypass the fd limit in zygote since we only
+    // keep the fds in zygote and do the actual dlopen in app/server process after fork.
+    auto size = g_modules_cache.size();
+
     for (size_t i = 0; i < size; i++) {
-        auto &m = ms[i];
-        if (void *handle = DlopenMem(m.memfd, RTLD_NOW);
-            void *entry = handle ? dlsym(handle, "zygisk_module_entry") : nullptr) {
-            modules.emplace_back(i, handle, entry);
+        auto &m = g_modules_cache[i];
+
+        // Create an anonymous and temporary FD just for this application
+        int tmp_fd = syscall(SYS_memfd_create, "zygisk-module", MFD_CLOEXEC);
+        if (tmp_fd >= 0) {
+            write(tmp_fd, m.buffer.data(), m.buffer.size());
+            lseek(tmp_fd, 0, SEEK_SET);
+
+            if (void *handle = DlopenMem(tmp_fd, RTLD_NOW);
+                void *entry = handle ? dlsym(handle, "zygisk_module_entry") : nullptr) {
+                modules.emplace_back(i, handle, entry);
+            }
+
+            // Destroy the FD immediately to leave no trace
+            close(tmp_fd);
         }
 
         wipe_string(m.name);
