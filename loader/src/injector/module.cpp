@@ -233,7 +233,7 @@ bool ZygiskContext::plt_hook_commit() {
 // -----------------------------------------------------------------
 
 void ZygiskContext::sanitize_fds() {
-    if (!is_child()) {
+    if (unlikely(!is_child())) {
         return;
     }
 
@@ -273,7 +273,7 @@ void ZygiskContext::sanitize_fds() {
 
     // Close all forbidden fds using direct syscall
     int fd_dir = open("/proc/self/fd", O_RDONLY | O_DIRECTORY);
-    if (fd_dir >= 0) {
+    if (likely(fd_dir >= 0)) {
         char buf[4096];
         int nread;
         while ((nread = syscall(__NR_getdents64, fd_dir, buf, sizeof(buf))) > 0) {
@@ -281,7 +281,9 @@ void ZygiskContext::sanitize_fds() {
                 auto d = reinterpret_cast<struct linux_dirent64*>(buf + bpos);
                 if (d->d_name[0] >= '0' && d->d_name[0] <= '9') {
                     int fd = fast_atoi(d->d_name);
-                    if ((fd < 0 || static_cast<size_t>(fd) >= allowed_fds.size() || !allowed_fds[fd]) && fd != fd_dir) {
+                    if (unlikely((fd < 0 || 
+                                static_cast<size_t>(fd) >= allowed_fds.size() || 
+                                !allowed_fds[fd]) && fd != fd_dir)) {
                         close(fd);
                     }
                 }
@@ -323,11 +325,11 @@ void ZygiskContext::fork_pre() {
     sigmask(SIG_BLOCK, SIGCHLD);
     pid = old_fork();
 
-    if (!is_child()) return;
+    if (unlikely(!is_child())) return;
 
     // Record all open fds using direct syscall to avoid heap allocations
     int fd_dir = open("/proc/self/fd", O_RDONLY | O_DIRECTORY);
-    if (fd_dir >= 0) {
+    if (likely(fd_dir >= 0)) {
         char buf[4096];
         int nread;
         while ((nread = syscall(__NR_getdents64, fd_dir, buf, sizeof(buf))) > 0) {

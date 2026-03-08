@@ -4,6 +4,9 @@
 
 #include <string_view>
 
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#define likely(x)   __builtin_expect(!!(x), 1)
+
 // Constants for Android Isolated UID range.
 // Reference:
 // https://cs.android.com/android/platform/superproject/main/+/main:system/core/libcutils/include/private/android_filesystem_config.h
