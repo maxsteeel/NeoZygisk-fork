@@ -269,7 +269,9 @@ struct ZygiskContext {
     std::vector<int> exempted_fds;
 
     struct RegisterInfo {
+        bool is_regex;
         regex_t regex;
+        std::string literal;
         std::string symbol;
         void *callback;
         void **backup;

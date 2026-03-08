@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/syscall.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <lsplt.hpp>
@@ -157,13 +158,30 @@ void ZygiskModule::postServerSpecialize(const ServerSpecializeArgs_v1 *args) con
 
 // -----------------------------------------------------------------
 
+// Helper to determine if a string is a simple literal or a complex regex
+static inline bool is_simple_literal(const char* str) {
+    return strpbrk(str, ".*+?^$[]|()\\") == nullptr;
+}
+
 void ZygiskContext::plt_hook_register(const char *regex, const char *symbol, void *fn,
                                       void **backup) {
     if (regex == nullptr || symbol == nullptr || fn == nullptr) return;
-    regex_t re;
-    if (regcomp(&re, regex, REG_NOSUB) != 0) return;
+
+    RegisterInfo info;
+    info.symbol = symbol;
+    info.callback = fn;
+    info.backup = backup;
+
+    if (is_simple_literal(regex)) {
+        info.is_regex = false;
+        info.literal = regex;
+    } else {
+        info.is_regex = true;
+        if (regcomp(&info.regex, regex, REG_NOSUB) != 0) return;
+    }
+
     mutex_guard lock(hook_info_lock);
-    register_info.emplace_back(RegisterInfo{re, symbol, fn, backup});
+    register_info.emplace_back(std::move(info));
 }
 
 void ZygiskContext::plt_hook_exclude(const char *regex, const char *symbol) {
@@ -179,7 +197,12 @@ void ZygiskContext::plt_hook_process_regex() {
     for (auto &map : g_hook->cached_map_infos) {
         if (map.offset != 0 || !map.is_private || !(map.perms & PROT_READ)) continue;
         for (auto &reg : register_info) {
-            if (regexec(&reg.regex, map.path.data(), 0, nullptr, 0) != 0) continue;
+            // Execute fast sub-string search or fallback to heavy regex
+            if (!reg.is_regex) {
+                if (!strstr(map.path.data(), reg.literal.c_str())) continue;
+            } else {
+                if (regexec(&reg.regex, map.path.data(), 0, nullptr, 0) != 0) continue;
+            }
             bool ignored = false;
             for (auto &ign : ignore_info) {
                 if (!ign.symbol.empty() && ign.symbol != reg.symbol) continue;
