@@ -17,6 +17,7 @@
 
 #include "android_util.hpp"
 #include "daemon.hpp"
+#include "misc.hpp"
 #include "module.hpp"
 #include "zygisk.hpp"
 
@@ -166,7 +167,7 @@ DCL_HOOK_FUNC(static char *, strdup, const char *str) {
 
     static bool zygote_hooked = false;
 
-    if (!zygote_hooked && str != nullptr) {
+    if (unlikely(!zygote_hooked && str != nullptr)) {
         if (*str == 'c' && strcmp(kZygoteInit, str) == 0) {
             g_hook->hook_zygote_jni();
             g_hook->cached_map_infos = lsplt::MapInfo::Scan();
@@ -178,11 +179,17 @@ DCL_HOOK_FUNC(static char *, strdup, const char *str) {
 }
 
 // Skip actual fork and return cached result if applicable
-DCL_HOOK_FUNC(int, fork) { return (g_ctx && g_ctx->pid >= 0) ? g_ctx->pid : old_fork(); }
+DCL_HOOK_FUNC(int, fork) { 
+    // It is unlikely that we are providing a cached PID
+    if (unlikely(g_ctx && g_ctx->pid >= 0)) {
+        return g_ctx->pid;
+    }
+    return old_fork(); 
+}
 
 // Unmount stuffs in the process's private mount namespace
 DCL_HOOK_FUNC(static int, unshare, int flags) {
-    if (g_ctx && (flags & CLONE_NEWNS) && !(g_ctx->flags & SERVER_FORK_AND_SPECIALIZE)) {
+    if (unlikely(g_ctx && (flags & CLONE_NEWNS) && !(g_ctx->flags & SERVER_FORK_AND_SPECIALIZE))) {
         bool should_unmount = !(g_ctx->info_flags & (PROCESS_IS_MANAGER | PROCESS_GRANTED_ROOT)) &&
                               g_ctx->flags & DO_REVERT_UNMOUNT;
         if (!should_unmount && g_hook->zygote_unmounted) {
@@ -216,7 +223,7 @@ DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *defau
 
     static bool unloader_triggered = false;
 
-    if (!unloader_triggered) {
+    if (unlikely(!unloader_triggered)) {
         unloader_triggered = true;
 
         if (!g_hook->skip_hooking_unloader) {
@@ -247,7 +254,7 @@ DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *defau
 DCL_HOOK_FUNC(static int, pthread_attr_setstacksize, void *target, size_t size) {
     int res = old_pthread_attr_setstacksize((pthread_attr_t *) target, size);
 
-    if (g_hook->should_unmap && gettid() == getpid()) {
+    if (unlikely(g_hook != nullptr && g_hook->should_unmap)) {
         // Only perform unloading on the main thread
 
         g_hook->restore_plt_hook();
@@ -256,6 +263,8 @@ DCL_HOOK_FUNC(static int, pthread_attr_setstacksize, void *target, size_t size) 
             size_t block_size = g_hook->block_size;
 
             delete g_hook;
+            g_hook = nullptr; // Safety null-pointer assignment
+
             // Because both `pthread_attr_setstacksize` and `munmap` have the same function
             // signature, we can use `musttail` to let the compiler reuse our stack frame and thus
             // `munmap` will directly return to the caller of `pthread_attr_setstacksize`.
