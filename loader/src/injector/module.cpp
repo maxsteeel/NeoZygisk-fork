@@ -224,6 +224,8 @@ bool ZygiskContext::plt_hook_commit() {
         plt_hook_process_regex();
         register_info.clear();
         ignore_info.clear();
+        register_info.shrink_to_fit();
+        ignore_info.shrink_to_fit();
     }
     return lsplt::CommitHook(g_hook->cached_map_infos);
 }
@@ -288,6 +290,12 @@ void ZygiskContext::sanitize_fds() {
         }
         close(fd_dir);
     }
+
+    // Clear exempted fds to free memory
+    exempted_fds.clear();
+    exempted_fds.shrink_to_fit();
+    allowed_fds.clear();
+    allowed_fds.shrink_to_fit();
 }
 
 bool ZygiskContext::exempt_fd(int fd) {
@@ -346,6 +354,12 @@ void ZygiskContext::fork_pre() {
 void ZygiskContext::fork_post() {
     // Unblock SIGCHLD in case the original method didn't
     sigmask(SIG_UNBLOCK, SIGCHLD);
+
+    // Clear exempted fds to free memory
+    exempted_fds.clear();
+    exempted_fds.shrink_to_fit();
+    allowed_fds.clear();
+    allowed_fds.shrink_to_fit();
 }
 
 /* Zygisksu changed: Load module fds */
