@@ -11,9 +11,11 @@ val verCode: Int by rootProject.extra
 val verName: String by rootProject.extra
 val commitHash: String by rootProject.extra
 
-android.buildFeatures {
-    androidResources = false
-    buildConfig = false
+android {
+    buildFeatures {
+        buildConfig = false
+    }
+    androidResources.enable = false
 }
 
 cargo {
@@ -22,7 +24,7 @@ cargo {
     targetIncludes = arrayOf("zygiskd")
     targets = listOf("arm64", "arm", "x86", "x86_64")
     targetDirectory = "build/intermediates/rust"
-    val isDebug = gradle.startParameter.taskNames.any { it.toLowerCase().contains("debug") }
+    val isDebug = gradle.startParameter.taskNames.any { it.lowercase().contains("debug") }
     profile = if (isDebug) "debug" else "release"
     exec = { spec, _ ->
         spec.environment("ANDROID_NDK_HOME", android.ndkDirectory.path)
@@ -35,14 +37,14 @@ cargo {
 }
 
 afterEvaluate {
-    task<Task>("buildAndStrip") {
+    tasks.register("buildAndStrip") {
         dependsOn(":zygiskd:cargoBuild")
-        val isDebug = gradle.startParameter.taskNames.any { it.toLowerCase().contains("debug") }
+        val isDebug = gradle.startParameter.taskNames.any { it.lowercase().contains("debug") }
         doLast {
-            val dir = File(buildDir, "rustJniLibs/android")
+            val dir = layout.buildDirectory.dir("rustJniLibs/android").get().asFile
             val prebuilt = File(android.ndkDirectory, "toolchains/llvm/prebuilt").listFiles()!!.first()
             val binDir = File(prebuilt, "bin")
-            val symbolDir = File(buildDir, "symbols/${if (isDebug) "debug" else "release"}")
+            val symbolDir = layout.buildDirectory.dir("symbols/${if (isDebug) "debug" else "release"}").get().asFile
             symbolDir.mkdirs()
             val suffix = if (prebuilt.name.contains("windows")) ".exe" else ""
             val strip = File(binDir, "llvm-strip$suffix")
@@ -51,18 +53,18 @@ afterEvaluate {
                 if (!it.isDirectory) return@forEach
                 val symbolPath = File(symbolDir, "${it.name}/zygiskd.debug")
                 symbolPath.parentFile.mkdirs()
-                exec {
+                providers.exec {
                     workingDir = it
                     commandLine(objcopy, "--only-keep-debug", "zygiskd", symbolPath)
-                }
-                exec {
+                }.result.get()
+                providers.exec {
                     workingDir = it
                     commandLine(strip, "--strip-all", "zygiskd")
-                }
-                exec {
+                }.result.get()
+                providers.exec {
                     workingDir = it
                     commandLine(objcopy, "--add-gnu-debuglink", symbolPath, "zygiskd")
-                }
+                }.result.get()
             }
         }
     }

@@ -1,18 +1,14 @@
 import com.android.build.gradle.LibraryExtension
-import java.io.ByteArrayOutputStream
 
 plugins {
     alias(libs.plugins.agp.lib) apply false
 }
 
 fun String.execute(currentWorkingDir: File = file("./")): String {
-    val byteOut = ByteArrayOutputStream()
-    project.exec {
+    return providers.exec {
         workingDir = currentWorkingDir
-        commandLine = split("\\s".toRegex())
-        standardOutput = byteOut
-    }
-    return String(byteOut.toByteArray()).trim()
+        commandLine = this@execute.split("\\s".toRegex())
+    }.standardOutput.asText.get().trim()
 }
 
 val gitCommitCount = "git rev-list HEAD --count".execute().toInt()
@@ -42,7 +38,7 @@ val androidSourceCompatibility by extra(JavaVersion.VERSION_21)
 val androidTargetCompatibility by extra(JavaVersion.VERSION_21)
 
 tasks.register("Delete", Delete::class) {
-    delete(rootProject.buildDir)
+    delete(rootProject.layout.buildDirectory)
 }
 
 fun Project.configureBaseExtension() {
@@ -54,7 +50,6 @@ fun Project.configureBaseExtension() {
 
         defaultConfig {
             minSdk = androidMinSdkVersion
-            targetSdk = androidTargetSdkVersion
         }
 
         lint {

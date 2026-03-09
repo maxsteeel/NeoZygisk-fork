@@ -65,4 +65,4 @@ int __cxa_atexit(void (*func)(void*), void* arg, void* dso) {
 }
 
 extern "C" [[gnu::visibility("default")]] 
-void __cxa_finalize(void * d) {}
+void __cxa_finalize([[maybe_unused]] void * d) {}

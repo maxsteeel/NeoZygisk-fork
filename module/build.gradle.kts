@@ -33,9 +33,11 @@ val workDirectory: String by rootProject.extra
 val commitHash: String by rootProject.extra
 val updateJson: String by rootProject.extra
 
-android.buildFeatures {
-    androidResources = false
-    buildConfig = false
+android {
+    buildFeatures {
+        buildConfig = false
+    }
+    androidResources.enable = false
 }
 
 androidComponents.onVariants { variant ->
@@ -46,7 +48,7 @@ androidComponents.onVariants { variant ->
     val moduleDir = layout.buildDirectory.dir("outputs/module/$variantLowered")
     val zipFileName = "$moduleName-$verName-$verCode-$commitHash-$buildTypeLowered.zip".replace(' ', '-')
 
-    val prepareModuleFilesTask = task<Sync>("prepareModuleFiles$variantCapped") {
+    val prepareModuleFilesTask = tasks.register<Sync>("prepareModuleFiles$variantCapped") {
         group = "module"
         dependsOn(
             ":loader:assemble$variantCapped",
@@ -102,7 +104,7 @@ androidComponents.onVariants { variant ->
         }
     }
 
-    val zipTask = task<Zip>("zip$variantCapped") {
+    val zipTask = tasks.register<Zip>("zip$variantCapped") {
         group = "module"
         dependsOn(prepareModuleFilesTask)
         archiveFileName.set(zipFileName)
@@ -110,63 +112,63 @@ androidComponents.onVariants { variant ->
         from(moduleDir)
     }
 
-    val pushTask = task<Exec>("push$variantCapped") {
+    val pushTask = tasks.register<Exec>("push$variantCapped") {
         group = "module"
         dependsOn(zipTask)
-        commandLine("adb", "push", zipTask.outputs.files.singleFile.path, "/data/local/tmp")
+        commandLine("adb", "push", zipTask.get().outputs.files.singleFile.path, "/data/local/tmp")
     }
 
-    val installAPatchTask = task("installAPatch$variantCapped") {
+    val installAPatchTask = tasks.register("installAPatch$variantCapped") {
         group = "module"
         dependsOn(pushTask)
         doLast {
-            exec {
+            providers.exec {
                 commandLine(
                     "adb", "shell", "echo",
                     "/data/adb/apd module install /data/local/tmp/$zipFileName",
                     "> /data/local/tmp/install.sh"
                 )
-            }
-            exec { commandLine("adb", "shell", "chmod", "755", "/data/local/tmp/install.sh") }
-            exec { commandLine("adb", "shell", "su", "-c", "/data/local/tmp/install.sh") }
+            }.result.get()
+            providers.exec { commandLine("adb", "shell", "chmod", "755", "/data/local/tmp/install.sh") }.result.get()
+            providers.exec { commandLine("adb", "shell", "su", "-c", "/data/local/tmp/install.sh") }.result.get()
         }
     }
 
-    val installKsuTask = task("installKsu$variantCapped") {
+    val installKsuTask = tasks.register("installKsu$variantCapped") {
         group = "module"
         dependsOn(pushTask)
         doLast {
-            exec {
+            providers.exec {
                 commandLine(
                     "adb", "shell", "echo",
                     "/data/adb/ksud module install /data/local/tmp/$zipFileName",
                     "> /data/local/tmp/install.sh"
                 )
-            }
-            exec { commandLine("adb", "shell", "chmod", "755", "/data/local/tmp/install.sh") }
-            exec { commandLine("adb", "shell", "su", "-c", "/data/local/tmp/install.sh") }
+            }.result.get()
+            providers.exec { commandLine("adb", "shell", "chmod", "755", "/data/local/tmp/install.sh") }.result.get()
+            providers.exec { commandLine("adb", "shell", "su", "-c", "/data/local/tmp/install.sh") }.result.get()
         }
     }
 
-    val installMagiskTask = task<Exec>("installMagisk$variantCapped") {
+    val installMagiskTask = tasks.register<Exec>("installMagisk$variantCapped") {
         group = "module"
         dependsOn(pushTask)
         commandLine("adb", "shell", "su", "-M", "-c", "magisk --install-module /data/local/tmp/$zipFileName")
     }
 
-    task<Exec>("installAPatchAndReboot$variantCapped") {
+    tasks.register<Exec>("installAPatchAndReboot$variantCapped") {
         group = "module"
         dependsOn(installAPatchTask)
         commandLine("adb", "reboot")
     }
 
-    task<Exec>("installKsuAndReboot$variantCapped") {
+    tasks.register<Exec>("installKsuAndReboot$variantCapped") {
         group = "module"
         dependsOn(installKsuTask)
         commandLine("adb", "reboot")
     }
 
-    task<Exec>("installMagiskAndReboot$variantCapped") {
+    tasks.register<Exec>("installMagiskAndReboot$variantCapped") {
         group = "module"
         dependsOn(installMagiskTask)
         commandLine("adb", "reboot")
