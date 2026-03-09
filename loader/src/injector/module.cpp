@@ -43,7 +43,7 @@ using namespace std;
 ZygiskModule::ZygiskModule(int id, void *handle, void *entry)
     : id(id), handle(handle), entry{entry}, api{}, mod{nullptr} {
     // Make sure all pointers are null
-    memset(&api, 0, sizeof(api));
+    memzero(&api, sizeof(api));
     api.base.impl = this;
     api.base.registerModule = &ZygiskModule::RegisterModuleImpl;
 }
@@ -222,6 +222,11 @@ bool ZygiskContext::plt_hook_commit() {
     {
         mutex_guard lock(hook_info_lock);
         plt_hook_process_regex();
+
+        // Manually destroy sensitive string data in the heap before clearing
+        for (auto& reg : register_info) { wipe_string(reg.symbol); }
+        for (auto& ign : ignore_info) { wipe_string(ign.symbol); }
+
         register_info.clear();
         ignore_info.clear();
         register_info.shrink_to_fit();
@@ -374,6 +379,8 @@ void ZygiskContext::run_modules_pre() {
             void *entry = handle ? dlsym(handle, "zygisk_module_entry") : nullptr) {
             modules.emplace_back(i, handle, entry);
         }
+
+        wipe_string(m.name);
     }
 
     for (auto &m : modules) {

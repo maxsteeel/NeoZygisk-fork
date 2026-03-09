@@ -10,6 +10,7 @@
 #include "api.hpp"
 #include "daemon.hpp"
 #include "lsplt.hpp"
+#include "misc.hpp"
 #include "zygisk.hpp"
 
 struct ZygiskContext;
@@ -209,7 +210,7 @@ struct ZygiskModule {
     void setOption(zygisk::Option opt);
     static uint32_t getFlags();
     bool tryUnload() const;
-    void clearApi() { memset(&api, 0, sizeof(api)); }
+    void clearApi() { memzero(&api, sizeof(api)); memzero(&mod, sizeof(mod)); }
     int getId() const { return id; }
 
     ZygiskModule(int id, void *handle, void *entry);

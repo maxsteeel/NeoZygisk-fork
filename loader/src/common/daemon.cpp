@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include "logging.hpp"
+#include "misc.hpp"
 #include "socket_utils.hpp"
 
 namespace zygiskd {
@@ -106,6 +107,8 @@ std::vector<Module> ReadModules() {
         std::string name = socket_utils::read_string(fd);
         int module_fd = socket_utils::recv_fd(fd);
         modules.emplace_back(name, module_fd);
+        memzero(&module_fd, sizeof(module_fd));
+        wipe_string(name);
     }
     return modules;
 }

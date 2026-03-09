@@ -128,10 +128,10 @@ bool write_usize(int fd, size_t val) { return write_exact<size_t>(fd, val); }
 
 std::string read_string(int fd) {
     auto len = read_usize(fd);
-    char* buf = new char[len + 1];
-    buf[len] = '\0';
-    xread(fd, buf, len);
-    return buf;
+    std::string result;
+    result.resize(len);
+    xread(fd, result.data(), len);
+    return result;
 }
 
 bool write_u8(int fd, uint8_t val) { return write_exact<uint8_t>(fd, val); }

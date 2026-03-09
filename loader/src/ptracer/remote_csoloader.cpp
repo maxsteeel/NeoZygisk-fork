@@ -395,7 +395,8 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     void *open_addr = find_func_addr(local_map, remote_map, libc_path, "open");
     void *close_addr = find_func_addr(local_map, remote_map, libc_path, "close");
     void *syscall_addr = find_func_addr(local_map, remote_map, libc_path, "syscall");
-    if (!mmap_addr || !mprotect_addr || !open_addr || !close_addr || !syscall_addr) { close(fd); return false; }
+    void *munmap_addr = find_func_addr(local_map, remote_map, libc_path, "munmap");
+    if (!mmap_addr || !mprotect_addr || !open_addr || !close_addr || !syscall_addr || !munmap_addr) { close(fd); return false; }
 
     size_t path_len = strlen(lib_path) + 1;
     std::vector<long> args = {0, (long)path_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
@@ -407,6 +408,14 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     args = {(long)remote_path, O_RDONLY | O_CLOEXEC, 0};
     call_regs = regs_saved;
     long remote_fd = (long)remote_call(pid, call_regs, (uintptr_t)open_addr, libc_return_addr, args);
+
+    std::vector<char> zeros(path_len, 0);
+    write_proc(pid, remote_path, zeros.data(), path_len);
+
+    args = {(long)remote_path, (long)path_len};
+    call_regs = regs_saved;
+    remote_call(pid, call_regs, (uintptr_t)munmap_addr, libc_return_addr, args);
+
     if (remote_fd < 0) { close(fd); return false; }
 
     long memfd_syscall_num = 0;
@@ -423,7 +432,7 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     args = {0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
     call_regs = regs_saved;
     uintptr_t name_addr = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args);
-    const char* fake_name = "jit-cache";
+    const char* fake_name = "zygote_ext";
     write_proc(pid, name_addr, fake_name, strlen(fake_name) + 1);
 
     args = {memfd_syscall_num, (long)name_addr, MFD_CLOEXEC};
@@ -431,7 +440,6 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     long memfd = (long)remote_call(pid, call_regs, (uintptr_t)syscall_addr, libc_return_addr, args);
 
     args = {(long)name_addr, 4096};
-    void *munmap_addr = find_func_addr(local_map, remote_map, libc_path, "munmap");
     if (munmap_addr) {
         call_regs = regs_saved;
         remote_call(pid, call_regs, (uintptr_t)munmap_addr, libc_return_addr, args);

@@ -3,9 +3,31 @@
 #include <pthread.h>
 
 #include <string_view>
+#include <string>
 
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #define likely(x)   __builtin_expect(!!(x), 1)
+
+// Force the compiler to execute the memory wipeping code,
+// even if it thinks the memory is not used afterward.
+static inline void memzero(void *s, size_t n) {
+    volatile char *p = static_cast<volatile char *>(s);
+    while (n--) {
+        *p++ = 0;
+    }
+}
+
+// Securely wipe a std::string's internal buffer from the heap
+static inline void wipe_string(std::string& str) {
+    if (!str.empty()) {
+        volatile char *p = static_cast<volatile char *>(str.data());
+        size_t n = str.size();
+        while (n--) {
+            *p++ = 0;
+        }
+        str.clear();
+    }
+}
 
 // Constants for Android Isolated UID range.
 // Reference:

@@ -170,6 +170,11 @@ DCL_HOOK_FUNC(static char *, strdup, const char *str) {
     if (unlikely(!zygote_hooked && str != nullptr)) {
         if (*str == 'c' && strcmp(kZygoteInit, str) == 0) {
             g_hook->hook_zygote_jni();
+
+            // Wipe the old map paths populated by hook_plt() before overwriting them.
+            // The new scan will repopulate the map info with the same paths, but they 
+            // will be wiped again in hook_zygote_jni() after we are done with hooking.
+            for (auto &map : g_hook->cached_map_infos) { wipe_string(map.path); }
             g_hook->cached_map_infos = lsplt::MapInfo::Scan();
             
             zygote_hooked = true;
@@ -394,6 +399,7 @@ void HookContext::hook_plt() {
 }
 
 void HookContext::hook_unloader() {
+    for (auto &map : cached_map_infos) { wipe_string(map.path); }
     cached_map_infos = lsplt::MapInfo::Scan();
     if (g_art_inode == 0 || g_art_dev == 0) {
         for (auto &map : cached_map_infos) {
@@ -409,6 +415,7 @@ void HookContext::hook_unloader() {
     if (!lsplt::CommitHook(cached_map_infos)) {
         LOGE("HookContext::hook_unloader failed");
     }
+    for (auto &map : cached_map_infos) { wipe_string(map.path); }
 }
 
 void HookContext::restore_plt_hook() {
@@ -423,6 +430,11 @@ void HookContext::restore_plt_hook() {
         LOGE("failed to restore plt_hook");
         should_unmap = false;
     }
+
+    // Clear cached map info
+    for (auto& map : cached_map_infos) { wipe_string(map.path); }
+    cached_map_infos.clear();
+    cached_map_infos.shrink_to_fit();
 }
 
 // -----------------------------------------------------------------

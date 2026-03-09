@@ -23,4 +23,6 @@ add_executable(libzygisk_ptrace.so ${PTRACER_SRC_LIST})
 target_include_directories(libzygisk_ptrace.so PRIVATE include)
 target_link_libraries(libzygisk_ptrace.so log common)
 
+set_target_properties(zygisk PROPERTIES NO_SONAME TRUE)
+set_target_properties(libzygisk_ptrace.so PROPERTIES NO_SONAME TRUE)
 add_subdirectory(external)
