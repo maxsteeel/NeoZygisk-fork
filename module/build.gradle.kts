@@ -1,20 +1,8 @@
 import android.databinding.tool.ext.capitalizeUS
 import java.security.MessageDigest
 import org.apache.tools.ant.filters.ReplaceTokens
-
 import org.apache.tools.ant.filters.FixCrLfFilter
-
 import org.apache.commons.codec.binary.Hex
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.security.KeyFactory
-import java.security.KeyPairGenerator
-import java.security.Signature
-import java.security.interfaces.EdECPrivateKey
-import java.security.interfaces.EdECPublicKey
-import java.security.spec.EdECPrivateKeySpec
-import java.security.spec.NamedParameterSpec
-import java.util.TreeSet
 
 plugins {
     alias(libs.plugins.agp.lib)
@@ -34,9 +22,7 @@ val commitHash: String by rootProject.extra
 val updateJson: String by rootProject.extra
 
 android {
-    buildFeatures {
-        buildConfig = false
-    }
+    buildFeatures { buildConfig = false }
     androidResources.enable = false
 }
 
@@ -52,7 +38,7 @@ androidComponents.onVariants { variant ->
         group = "module"
         dependsOn(
             ":loader:assemble$variantCapped",
-            ":zygiskd:buildAndStrip",
+            ":zygiskd:buildAndStrip$variantCapped", 
         )
         into(moduleDir)
         from("${rootProject.projectDir}/README.md")
@@ -85,20 +71,18 @@ androidComponents.onVariants { variant ->
             filter<FixCrLfFilter>("eol" to FixCrLfFilter.CrLf.newInstance("lf"))
         }
         into("bin") {
-            from(project(":zygiskd").layout.buildDirectory.file("rustJniLibs/android"))
+            from(project(":zygiskd").layout.buildDirectory.dir("intermediates/rust/$buildTypeLowered/jniLibs"))
             include("**/zygiskd")
         }
         into("lib") {
-            from(project(":loader").layout.buildDirectory.file("intermediates/stripped_native_libs/$variantLowered/strip${variantCapped}DebugSymbols/out/lib"))
+            from(project(":loader").layout.buildDirectory.dir("intermediates/stripped_native_libs/$variantLowered/strip${variantCapped}DebugSymbols/out/lib"))
         }
 
         doLast {
             fileTree(moduleDir).visit {
                 if (isDirectory) return@visit
                 val md = MessageDigest.getInstance("SHA-256")
-                file.forEachBlock(4096) { bytes, size ->
-                    md.update(bytes, 0, size)
-                }
+                file.forEachBlock(4096) { bytes, size -> md.update(bytes, 0, size) }
                 file(file.path + ".sha256").writeText(Hex.encodeHexString(md.digest()))
             }
         }
@@ -108,7 +92,7 @@ androidComponents.onVariants { variant ->
         group = "module"
         dependsOn(prepareModuleFilesTask)
         archiveFileName.set(zipFileName)
-        destinationDirectory.set(layout.buildDirectory.file("outputs/release").get().asFile)
+        destinationDirectory.set(layout.buildDirectory.dir("outputs/release").get().asFile)
         from(moduleDir)
     }
 
@@ -122,13 +106,7 @@ androidComponents.onVariants { variant ->
         group = "module"
         dependsOn(pushTask)
         doLast {
-            providers.exec {
-                commandLine(
-                    "adb", "shell", "echo",
-                    "/data/adb/apd module install /data/local/tmp/$zipFileName",
-                    "> /data/local/tmp/install.sh"
-                )
-            }.result.get()
+            providers.exec { commandLine("adb", "shell", "echo", "/data/adb/apd module install /data/local/tmp/$zipFileName", "> /data/local/tmp/install.sh") }.result.get()
             providers.exec { commandLine("adb", "shell", "chmod", "755", "/data/local/tmp/install.sh") }.result.get()
             providers.exec { commandLine("adb", "shell", "su", "-c", "/data/local/tmp/install.sh") }.result.get()
         }
@@ -138,13 +116,7 @@ androidComponents.onVariants { variant ->
         group = "module"
         dependsOn(pushTask)
         doLast {
-            providers.exec {
-                commandLine(
-                    "adb", "shell", "echo",
-                    "/data/adb/ksud module install /data/local/tmp/$zipFileName",
-                    "> /data/local/tmp/install.sh"
-                )
-            }.result.get()
+            providers.exec { commandLine("adb", "shell", "echo", "/data/adb/ksud module install /data/local/tmp/$zipFileName", "> /data/local/tmp/install.sh") }.result.get()
             providers.exec { commandLine("adb", "shell", "chmod", "755", "/data/local/tmp/install.sh") }.result.get()
             providers.exec { commandLine("adb", "shell", "su", "-c", "/data/local/tmp/install.sh") }.result.get()
         }
@@ -156,21 +128,7 @@ androidComponents.onVariants { variant ->
         commandLine("adb", "shell", "su", "-M", "-c", "magisk --install-module /data/local/tmp/$zipFileName")
     }
 
-    tasks.register<Exec>("installAPatchAndReboot$variantCapped") {
-        group = "module"
-        dependsOn(installAPatchTask)
-        commandLine("adb", "reboot")
-    }
-
-    tasks.register<Exec>("installKsuAndReboot$variantCapped") {
-        group = "module"
-        dependsOn(installKsuTask)
-        commandLine("adb", "reboot")
-    }
-
-    tasks.register<Exec>("installMagiskAndReboot$variantCapped") {
-        group = "module"
-        dependsOn(installMagiskTask)
-        commandLine("adb", "reboot")
-    }
+    tasks.register<Exec>("installAPatchAndReboot$variantCapped") { group = "module"; dependsOn(installAPatchTask); commandLine("adb", "reboot") }
+    tasks.register<Exec>("installKsuAndReboot$variantCapped") { group = "module"; dependsOn(installKsuTask); commandLine("adb", "reboot") }
+    tasks.register<Exec>("installMagiskAndReboot$variantCapped") { group = "module"; dependsOn(installMagiskTask); commandLine("adb", "reboot") }
 }

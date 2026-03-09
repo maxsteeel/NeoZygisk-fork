@@ -1,4 +1,4 @@
-import com.android.build.gradle.LibraryExtension
+import com.android.build.api.dsl.LibraryExtension
 
 plugins {
     alias(libs.plugins.agp.lib) apply false
