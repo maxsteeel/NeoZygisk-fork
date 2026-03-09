@@ -30,21 +30,30 @@ val defaultCFlags = arrayOf(
     "-Wall", "-Wextra",
     "-fno-rtti", "-fno-exceptions",
     "-fno-stack-protector", "-fomit-frame-pointer",
-    "-Wno-builtin-macro-redefined", "-D__FILE__=__FILE_NAME__",
-    "-DWORK_DIRECTORY='\"${workDirectory}\"'"
+    "-ffunction-sections", "-fdata-sections",
+    "-fno-ident", "-fmerge-all-constants",
+    "-fno-semantic-interposition", "-fno-plt",
+    "-Wno-builtin-macro-redefined", "-D__FILE__=__FILE_NAME__"
 )
 
 val releaseFlags = arrayOf(
-    "-Oz", "-flto",
+    "-O3", "-flto",
     "-Wno-unused", "-Wno-unused-parameter",
     "-fvisibility=hidden", "-fvisibility-inlines-hidden",
-    "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
-    "-Wl,--exclude-libs,ALL", "-Wl,--gc-sections", "-Wl,--strip-all"
+    "-fno-unwind-tables", "-fno-asynchronous-unwind-tables"
+)
+
+val linkerFlags = arrayOf(
+    "-Wl,--exclude-libs,ALL", "-Wl,--gc-sections", 
+    "-Wl,--strip-all", "-Wl,--lto-O3",
+    "-Wl,--build-id=none", "-Wl,-s",
+    "-Wl,--icf=all", "-Wl,--as-needed",
+    "-Wl,-Bsymbolic", "-Wl,--hash-style=gnu"
 )
 
 android {
     buildFeatures {
-        androidResources = false
+        android.androidResources.enable = false
         buildConfig = false
         prefab = true
     }
@@ -74,6 +83,8 @@ android {
             externalNativeBuild.cmake {
                 cFlags += releaseFlags
                 cppFlags += releaseFlags
+                arguments += "-DCMAKE_SHARED_LINKER_FLAGS=${linkerFlags.joinToString(" ")}"
+                arguments += "-DCMAKE_EXE_LINKER_FLAGS=${linkerFlags.joinToString(" ")}"
                 arguments += "-DZKSU_VERSION=$verName-$verCode-$commitHash-release"
             }
         }

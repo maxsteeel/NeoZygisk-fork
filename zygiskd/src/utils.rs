@@ -9,13 +9,12 @@
 
 use anyhow::Result;
 use rustix::net::{
-    AddressFamily, SendFlags, SocketAddrUnix, SocketType, bind, connect, listen, sendto, socket,
+    AddressFamily, SendFlags, SocketAddrUnix, SocketType, connect, sendto, socket
 };
 use rustix::thread as rustix_thread;
 use std::ffi::{CString, c_char};
 use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::process::Command;
+use std::os::unix::net::UnixStream;
 use std::{
     fs,
     io::{Read, Write},
@@ -77,12 +76,6 @@ pub fn set_socket_create_context(context: &str) -> Result<()> {
 pub fn get_current_attr() -> Result<String> {
     let s = fs::read_to_string("/proc/self/attr/current")?;
     Ok(s.trim().to_string())
-}
-
-/// Changes the SELinux context of a file using the `chcon` command.
-pub fn chcon(path: &str, context: &str) -> Result<()> {
-    Command::new("chcon").arg(context).arg(path).status()?;
-    Ok(())
 }
 
 /// Retrieves an Android system property value.
@@ -157,17 +150,6 @@ impl UnixStreamExt for UnixStream {
         self.write_all(value.as_bytes())?;
         Ok(())
     }
-}
-
-/// Creates a `UnixListener` bound to a given path, handling file cleanup and SELinux contexts.
-pub fn unix_listener_from_path(path: &str) -> Result<UnixListener> {
-    let _ = fs::remove_file(path);
-    let addr = SocketAddrUnix::new(path)?;
-    let socket = socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
-    bind(&socket, &addr)?;
-    listen(&socket, 10)?; // Backlog of 10
-    chcon(path, "u:object_r:zygisk_file:s0")?;
-    Ok(UnixListener::from(socket))
 }
 
 /// Sends a datagram packet to a Unix socket path.
