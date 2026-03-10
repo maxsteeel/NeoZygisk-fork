@@ -1,13 +1,30 @@
-# NeoZygisk-fork v2.3-300 Update Released
+# NeoZygisk-fork v2.3-308 Update Released
 
 I created this fork because I'm tired of all the detections in the original NeoZygisk, which persist despite NkBe's changes. For now, this fork will only prioritize hiding Zygisk (aside from this, there won't be any other advantages over the original NeoZygisk at the moment).
 
+## Changes since latest version:
+
+* **Bleeding-Edge Toolchain**: Completely migrated to Gradle 9.4.0, Android Gradle Plugin (AGP) 9.0.1, and Kotlin 2.3.10. Also migrated the build script to Gradle's Lazy Configuration API to support Configuration Cache, and relocated Cargo's target cache for cleaner workspace management.
+
+* **Raw NDK Integration**: Eradicated the deprecated rust-android-gradle plugin. Implemented a custom, raw NDK integration linking Android C++ toolchains directly with Cargo. Module .zip size heavily reduced by ~32% due to strict build environment control and stripped unneeded artifacts.
+
+* **Aggressive Memory Sterilization**: Implemented custom memzero and wipe_string routines utilizing volatile pointers to successfully bypass compiler Dead Store Elimination (DSE) caused by -O3/LTO. Also i've optimized plt_hook regex evaluation to save CPU cycles, alongside global optimizations to C/C++ CFLAGS and Rust compilation flags.
+
+* **Remote Memory Leak Fix**: Resolved a critical remote leak in remote_csoloader.cpp by aggressively zeroing and unmapping the injected library path immediately after the open syscall.
+
+* **ELF String Stripping**: Set NO_SONAME in CMake to strip libzygisk.so from the dynamic string table.
+
+* **Zero-Allocation Zygote Forking**: Replaced standard opendir/readdir calls with direct getdents64 syscalls and implemented inline fast_atoi to drastically reduce CPU overhead during process creation. Also injected branch prediction hints (likely/unlikely) into hot paths to reduce CPU pipeline stalls.
+
+* **Aggressive RAM Reclamation**: Forced OS physical RAM reclamation using shrink_to_fit() before forks, and aggressively cleared file descriptors (FDs) across Zygote to eliminate memory bloat.
+
+
 ### Latest detailed changes of my fork:
 
-* **Completely abandons dlopen, introducing a native CSO Loader**: The injection core has been completely restructured, replacing it with a Custom Shared Object (CSO) Loader written natively in C++. Through manual mapping and ELF relocation, "zero linker traces" are achieved, making the injected module completely invisible in the system's soinfo tracking list.
+* **Abandons dlopen, introducing a native CSO Loader**: The injection core of zygisk has been completely restructured, replacing it with a Custom Shared Object (CSO) Loader written natively in C++. Through manual mapping and ELF relocation, "zero linker traces" are achieved, making the injected module completely invisible in the system's soinfo tracking list.
 *Credits to **@ThePedroo** for C implementation of CSOLoader, base for this implementation*
 
-* **Deep Memory Disguise (memfd_create)**: Targeting high-strength root detectors scans such as Native Detector, the originally easily detectable anonymous executable memory ([anon]) is replaced with a memfd-based virtual file descriptor. The injected payload will now perfectly disguise itself as a legitimate JIT-compiled cache (/memfd:jit-cache), completely eliminating the "Zygisk detection (1)" error.
+* **Deep Memory Disguise (memfd_create)**: Targeting high-strength root detectors scans such as Native Detector, the originally easily detectable anonymous executable memory ([anon]) is replaced with a memfd-based virtual file descriptor. The injected payload will now perfectly disguise itself as a legitimate JIT-compiled cache (/memfd:jit-cache).
 
 * **Implement Abstract Unix Domain Sockets**: The communication mechanism of the daemon process has been completely upgraded to abstract namespace sockets (abandoning the traditional physical .sock files), ensuring that no physical communication node traces are left in the physical file system.
 
