@@ -405,24 +405,39 @@ uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_add
         return 0;
     }
 
-    ptrace(PTRACE_CONT, pid, 0, 0);
-    int status;
-    wait_for_trace(pid, &status, __WALL);  // wait_for_trace handles intermediate stops
+    int sig = 0;
+    while (true) {
+        if (ptrace(PTRACE_CONT, pid, 0, sig) == -1) {
+            LOGE("remote_call: ptrace cont failed");
+            return 0;
+        }
 
-    if (!get_regs(pid, regs)) {
-        LOGE("remote_call: failed to get registers after call");
-        return 0;
-    }
+        int status;
+        wait_for_trace(pid, &status, __WALL);
 
-    // We expect the tracee to stop at our fake return address.
-    if (WIFSTOPPED(status) && static_cast<uintptr_t>(regs.REG_IP) == return_addr) {
-        LOGV("remote call returned, result: 0x%" PRIXPTR, (uintptr_t) regs.REG_RET);
-        return regs.REG_RET;
-    } else {
-        LOGE("process stopped unexpectedly after remote call: %s at ip=0x%" PRIXPTR
-             ", expected stop at 0x%" PRIXPTR,
-             parse_status(status).c_str(), (uintptr_t) regs.REG_IP, return_addr);
-        return 0;
+        if (!get_regs(pid, regs)) {
+            LOGE("remote_call: failed to get registers after call");
+            return 0;
+        }
+
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            LOGE("process died unexpectedly after remote call: %s", parse_status(status).c_str());
+            return 0;
+        }
+
+        if (WIFSTOPPED(status)) {
+            if (static_cast<uintptr_t>(regs.REG_IP) == return_addr) {
+                LOGV("remote call returned, result: 0x%" PRIXPTR, (uintptr_t) regs.REG_RET);
+                return regs.REG_RET;
+            }
+
+            sig = WSTOPSIG(status);
+            if (sig == SIGTRAP || sig == SIGSTOP) {
+                sig = 0;
+            } else {
+                LOGV("remote_call: intercepted natural signal %d, passing to tracee", sig);
+            }
+        }
     }
 }
 

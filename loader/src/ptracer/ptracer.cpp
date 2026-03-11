@@ -129,10 +129,11 @@ bool inject_on_main(int pid, const char *lib_path) {
     }
 
     int status;
+    int sig = 0;
 
     while (true) {
         // Resume execution. We pass 0 to signal to suppress any pending SIGSTOPs.
-        if (ptrace(PTRACE_CONT, pid, 0, 0) == -1) {
+        if (ptrace(PTRACE_CONT, pid, 0, sig) == -1) {
             PLOGE("ptrace(PTRACE_CONT) failed");
             return false;
         }
@@ -147,18 +148,19 @@ bool inject_on_main(int pid, const char *lib_path) {
 
         // 2. Handle Stops
         if (WIFSTOPPED(status)) {
-            int sig = WSTOPSIG(status);
+            sig = WSTOPSIG(status);
 
             if (sig == SIGSEGV) {
                 // SUCCESS: We hit our trap.
                 break;
-            } else if (sig == SIGSTOP) {
+            } else if (sig == SIGSTOP || sig == SIGTRAP) {
                 // NOISE: Spurious stop from PTRACE_ATTACH. Ignore and continue.
+                sig = 0;
                 continue;
             } else {
-                // ERROR: Unexpected signal (e.g., SIGILL, SIGBUS). Abort.
-                LOGE("process stopped for unexpected signal: %d", sig);
-                return false;
+                // Normal signal (e.g. SIGCHLD). We pass it to Zygote so it doesn't crash.
+                LOGV("intercepted normal signal: %d, passing to tracee", sig);
+                continue;
             }
         }
     }
