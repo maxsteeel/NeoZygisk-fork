@@ -126,12 +126,22 @@ size_t read_usize(int fd) { return read_exact_or<size_t>(fd, 0); }
 
 bool write_usize(int fd, size_t val) { return write_exact<size_t>(fd, val); }
 
-std::string read_string(int fd) {
+void read_string(int fd, char* buf, size_t buf_size) {
     auto len = read_usize(fd);
-    std::string result;
-    result.resize(len);
-    xread(fd, result.data(), len);
-    return result;
+    size_t read_len = (len < buf_size) ? len : (buf_size - 1);
+    if (read_len > 0) {
+        xread(fd, buf, read_len);
+    }
+    buf[read_len] = '\0';
+    if (len > read_len) {
+        char trash[256];
+        size_t remain = len - read_len;
+        while (remain > 0) {
+            size_t to_read = (remain < sizeof(trash)) ? remain : sizeof(trash);
+            xread(fd, trash, to_read);
+            remain -= to_read;
+        }
+    }
 }
 
 bool write_u8(int fd, uint8_t val) { return write_exact<uint8_t>(fd, val); }

@@ -110,11 +110,12 @@ std::vector<Module> ReadModules() {
     socket_utils::write_u8(fd, (uint8_t) SocketAction::ReadModules);
     size_t len = socket_utils::read_usize(fd);
     for (size_t i = 0; i < len; i++) {
-        std::string name = socket_utils::read_string(fd);
+        char name_buf[256];
+        socket_utils::read_string(fd, name_buf, sizeof(name_buf));
         int module_fd = socket_utils::recv_fd(fd);
-        modules.emplace_back(name, module_fd);
+        modules.emplace_back(name_buf, module_fd);
         memzero(&module_fd, sizeof(module_fd));
-        wipe_string(name);
+        memzero(name_buf, sizeof(name_buf));
     }
     return modules;
 }

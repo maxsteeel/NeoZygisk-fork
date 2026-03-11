@@ -49,10 +49,12 @@ private:
 namespace zygiskd {
 
 struct Module {
-    std::string name;
+    char name[256];
     UniqueFd memfd;
 
-    inline explicit Module(std::string name, int memfd) : name(name), memfd(memfd) {}
+    inline explicit Module(const char* n, int fd) : memfd(fd) {
+        strlcpy(name, n ? n : "", sizeof(name));
+    }
 };
 
 enum class SocketAction {

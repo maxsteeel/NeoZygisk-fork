@@ -17,18 +17,6 @@ static inline void memzero(void *s, size_t n) {
     }
 }
 
-// Securely wipe a std::string's internal buffer from the heap
-static inline void wipe_string(std::string& str) {
-    if (!str.empty()) {
-        volatile char *p = static_cast<volatile char *>(str.data());
-        size_t n = str.size();
-        while (n--) {
-            *p++ = 0;
-        }
-        str.clear();
-    }
-}
-
 // Constants for Android Isolated UID range.
 // Reference:
 // https://cs.android.com/android/platform/superproject/main/+/main:system/core/libcutils/include/private/android_filesystem_config.h
