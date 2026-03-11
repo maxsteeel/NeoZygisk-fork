@@ -380,7 +380,7 @@ void ZygiskContext::run_modules_pre() {
             modules.emplace_back(i, handle, entry);
         }
 
-        wipe_string(m.name);
+        memzero(m.name, sizeof(m.name));
     }
 
     for (auto &m : modules) {

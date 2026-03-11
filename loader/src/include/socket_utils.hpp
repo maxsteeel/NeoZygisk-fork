@@ -15,7 +15,7 @@ namespace socket_utils {
 
     size_t read_usize(int fd);
 
-    std::string read_string(int fd);
+    void read_string(int fd, char* buf, size_t buf_size);
 
     bool write_u8(int fd, uint8_t val);
 
