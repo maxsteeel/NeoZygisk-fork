@@ -281,7 +281,7 @@ static bool wait_for_process(int pid, int *status) {
  * Shared logic between Seize and Attach methods.
  */
 static bool perform_injection(int pid) {
-    std::string lib_path = zygiskd::GetTmpPath();
+    std::string lib_path = zygiskd::GetModDir();
     lib_path += "/lib" LP_SELECT("", "64") "/libzygisk.so";
 
     if (!inject_on_main(pid, lib_path.c_str())) {

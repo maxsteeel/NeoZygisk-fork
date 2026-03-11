@@ -69,9 +69,10 @@ enum class SocketAction {
 
 enum class MountNamespace { Clean, Root };
 
-void Init(const char* path);
+void Init(const char *path, const char *mod_dir);
 
 std::string GetTmpPath();
+std::string GetModDir();
 
 bool PingHeartbeat();
 

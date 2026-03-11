@@ -17,7 +17,7 @@ void entry(void* addr, size_t size, const char* path, void (**init_array)(), siz
 
     LOGI("CSOLoader: zygisk library natively initialized, version %s", ZKSU_VERSION);
 
-    zygiskd::Init(path);
+    zygiskd::Init(path, nullptr);
 
     if (!zygiskd::PingHeartbeat()) {
         LOGE("zygisk daemon is not running");
