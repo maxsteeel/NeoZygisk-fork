@@ -10,14 +10,18 @@
 
 namespace zygiskd {
 static std::string TMP_PATH;
+static std::string MODULE_DIR;
 std::string kCPSocketName = (sizeof(void*) == 8) ? "cp64.sock" : "cp32.sock";
 
-void Init(const char *path) {
+void Init(const char *path, const char *mod_dir) {
     TMP_PATH = path;
+    MODULE_DIR = mod_dir ? mod_dir : "";
     setenv("TMP_PATH", TMP_PATH.data(), 0);
+    setenv("ZYGISK_MODDIR", MODULE_DIR.data(), 0);
 }
 
 std::string GetTmpPath() { return TMP_PATH; }
+std::string GetModDir() { return MODULE_DIR; }
 
 int Connect(uint8_t retry) {
     int fd = socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);

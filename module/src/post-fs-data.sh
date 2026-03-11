@@ -34,17 +34,7 @@ fi
 
 create_sys_perm $TMP_PATH
 
-if [ -f $MODDIR/lib64/libzygisk.so ];then
-  create_sys_perm $TMP_PATH/lib64
-  cp $MODDIR/lib64/libzygisk.so $TMP_PATH/lib64/libzygisk.so
-  chcon u:object_r:system_file:s0 $TMP_PATH/lib64/libzygisk.so
-fi
-
-if [ -f $MODDIR/lib/libzygisk.so ];then
-  create_sys_perm $TMP_PATH/lib
-  cp $MODDIR/lib/libzygisk.so $TMP_PATH/lib/libzygisk.so
-  chcon u:object_r:system_file:s0 $TMP_PATH/lib/libzygisk.so
-fi
+export ZYGISK_MODDIR="$MODDIR"
 
 [ "$DEBUG" = true ] && export RUST_BACKTRACE=1
 

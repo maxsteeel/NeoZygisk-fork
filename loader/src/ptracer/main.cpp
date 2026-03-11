@@ -74,7 +74,7 @@ static int handle_version();
  */
 int main(int argc, char **argv) {
     // This initialization is for the daemon's internal logic, not for CLI output.
-    zygiskd::Init(kWorkDirectory);
+    zygiskd::Init(kWorkDirectory, getenv("ZYGISK_MODDIR")); // Pass module directory to daemon
 
     if (argc < 2) {
         print_usage(argv[0]);
