@@ -224,8 +224,8 @@ bool ZygiskContext::plt_hook_commit() {
         plt_hook_process_regex();
 
         // Manually destroy sensitive string data in the heap before clearing
-        for (auto& reg : register_info) { memset(reg.symbol, 0, sizeof(reg.symbol)); }
-        for (auto& ign : ignore_info) { memset(ign.symbol, 0, sizeof(ign.symbol)); }
+        for (auto& reg : register_info) { memzero(reg.symbol, sizeof(reg.symbol)); }
+        for (auto& ign : ignore_info) { memzero(ign.symbol, sizeof(ign.symbol)); }
 
         register_info.clear();
         ignore_info.clear();
