@@ -413,17 +413,52 @@ void ZygiskContext::run_modules_post() {
 
 void ZygiskContext::app_specialize_pre() {
     uid_t uid = args.app->uid;
-    // Correct uid for isolated services
-    if (uid >= AID_ISOLATED_START && uid <= AID_ISOLATED_END && args.app->app_data_dir) {
-        const char *data_dir = nullptr;
-        data_dir = env->GetStringUTFChars(args.app->app_data_dir, nullptr);
-        if (data_dir != nullptr) {
-            struct stat st;
-            if (stat(data_dir, &st) != -1) {
-                uid = st.st_uid;
-                LOGV("identify isolated service [uid:%d, data_dir:%s]", uid, data_dir);
+    uid_t app_id = uid % 100000; // Support for Work Profiles / Multi-User
+
+    // Total range: Standard Isolated Services (99000-99999) and AppZygote (90000-98999)
+    if (app_id >= 90000 && app_id <= 99999) {
+        bool found_parent = false;
+
+        // 1. Try to get the parent's UID using app_data_dir (If Android sends it)
+        if (args.app->app_data_dir) {
+            const char *data_dir = env->GetStringUTFChars(args.app->app_data_dir, nullptr);
+            if (data_dir != nullptr) {
+                struct stat st;
+                if (stat(data_dir, &st) == 0) {
+                    uid = st.st_uid;
+                    found_parent = true;
+                    LOGV("identify isolated service via app_data_dir [uid:%d, data_dir:%s]", uid, data_dir);
+                }
+                env->ReleaseStringUTFChars(args.app->app_data_dir, data_dir);
             }
-            env->ReleaseStringUTFChars(args.app->app_data_dir, data_dir);
+        }
+
+        // 2. If failed or null, extract directory from pkg_data_info_list (Android 10+)
+        if (!found_parent && args.app->pkg_data_info_list && *args.app->pkg_data_info_list) {
+            jobjectArray pkg_array = *args.app->pkg_data_info_list; // Dereference pointer
+            jint count = env->GetArrayLength(pkg_array);
+            if (count > 0) {
+                jstring pkg_data_info = (jstring) env->GetObjectArrayElement(pkg_array, 0);
+                if (pkg_data_info) {
+                    const char *info_str = env->GetStringUTFChars(pkg_data_info, nullptr);
+                    if (info_str) {
+                        // string format is: "packageName,volumeUuid,inode,dataDir"
+                        const char *comma1 = strchr(info_str, ',');
+                        const char *comma2 = comma1 ? strchr(comma1 + 1, ',') : nullptr;
+                        const char *comma3 = comma2 ? strchr(comma2 + 1, ',') : nullptr;
+                        if (comma3 && *(comma3 + 1) != '\0') {
+                            const char *data_dir = comma3 + 1;
+                            struct stat st;
+                            if (stat(data_dir, &st) == 0) {
+                                uid = st.st_uid;
+                                LOGV("identify isolated service via pkg_data_info [uid:%d, data_dir:%s]", uid, data_dir);
+                            }
+                        }
+                        env->ReleaseStringUTFChars(pkg_data_info, info_str);
+                    }
+                    env->DeleteLocalRef(pkg_data_info);
+                }
+            }
         }
     }
 
