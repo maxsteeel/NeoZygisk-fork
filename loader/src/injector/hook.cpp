@@ -176,7 +176,7 @@ DCL_HOOK_FUNC(static char *, strdup, const char *str) {
             // Wipe the old map paths populated by hook_plt() before overwriting them.
             // The new scan will repopulate the map info with the same paths, but they 
             // will be wiped again in hook_zygote_jni() after we are done with hooking.
-            for (auto &map : g_hook->cached_map_infos) { wipe_string(map.path); }
+            for (auto &map : g_hook->cached_map_infos) { memset(map.path, 0, sizeof(map.path)); }
             g_hook->cached_map_infos = lsplt::MapInfo::Scan();
             
             zygote_hooked = true;
@@ -371,12 +371,12 @@ void HookContext::hook_plt() {
     bool found_art = false;
 
     for (const auto &map : cached_map_infos) {
-        if (!found_runtime && map.path.ends_with("/libandroid_runtime.so")) {
+        if (!found_runtime && std::string_view(map.path).ends_with("/libandroid_runtime.so")) {
             android_runtime_inode = map.inode;
             android_runtime_dev = map.dev;
             found_runtime = true;
         } 
-        else if (!found_art && map.path.ends_with("/libart.so")) {
+        else if (!found_art && std::string_view(map.path).ends_with("/libart.so")) {
             g_art_inode = map.inode;
             g_art_dev = map.dev;
             found_art = true;
@@ -401,11 +401,11 @@ void HookContext::hook_plt() {
 }
 
 void HookContext::hook_unloader() {
-    for (auto &map : cached_map_infos) { wipe_string(map.path); }
+    for (auto &map : cached_map_infos) { memset(map.path, 0, sizeof(map.path)); }
     cached_map_infos = lsplt::MapInfo::Scan();
     if (g_art_inode == 0 || g_art_dev == 0) {
         for (auto &map : cached_map_infos) {
-            if (map.path.ends_with("/libart.so")) {
+            if (std::string_view(map.path).ends_with("/libart.so")) {
                 g_art_inode = map.inode;
                 g_art_dev = map.dev;
                 break;
@@ -417,7 +417,7 @@ void HookContext::hook_unloader() {
     if (!lsplt::CommitHook(cached_map_infos)) {
         LOGE("HookContext::hook_unloader failed");
     }
-    for (auto &map : cached_map_infos) { wipe_string(map.path); }
+    for (auto &map : cached_map_infos) { memset(map.path, 0, sizeof(map.path)); }
 }
 
 void HookContext::restore_plt_hook() {
@@ -434,7 +434,7 @@ void HookContext::restore_plt_hook() {
     }
 
     // Clear cached map info
-    for (auto& map : cached_map_infos) { wipe_string(map.path); }
+    for (auto& map : cached_map_infos) { memset(map.path, 0, sizeof(map.path)); }
     cached_map_infos.clear();
     cached_map_infos.shrink_to_fit();
 }
@@ -490,8 +490,8 @@ void HookContext::hook_zygote_jni() {
         dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs"));
     if (!get_created_java_vms) {
         for (auto &map : cached_map_infos) {
-            if (!map.path.ends_with("/libnativehelper.so")) continue;
-            void *h = dlopen(map.path.data(), RTLD_LAZY);
+            if (!std::string_view(map.path).ends_with("/libnativehelper.so")) continue;
+            void *h = dlopen(map.path, RTLD_LAZY);
             if (!h) {
                 LOGW("cannot dlopen libnativehelper.so: %s", dlerror());
                 break;

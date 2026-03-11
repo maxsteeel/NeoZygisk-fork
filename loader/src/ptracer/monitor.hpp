@@ -1,6 +1,5 @@
 #pragma once
 
-#include <set>
 #include <string>
 #include <vector>
 
@@ -163,8 +162,8 @@ private:
         AppMonitor &monitor_;
         int signal_fd_ = -1;
         int status_ = 0;
-        std::set<pid_t> process_;
-        std::set<pid_t> stub_processes_;
+        std::vector<int> process_;
+        std::vector<int> stub_processes_;
     };
 
     void set_tracing_state(TracingState state);

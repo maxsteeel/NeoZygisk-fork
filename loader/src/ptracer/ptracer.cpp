@@ -194,8 +194,8 @@ bool inject_on_main(int pid, const char *lib_path) {
     std::string libc_path_str = "";
     for (const auto &info : map) {
         // Strict check: make sure the filename is exactly libc.so
-        const char *filename = strrchr(info.path.c_str(), '/');
-        filename = filename ? filename + 1 : info.path.c_str();
+        const char *filename = strrchr(info.path, '/');
+        filename = filename ? filename + 1 : info.path;
         if (strcmp(filename, "libc.so") == 0) {
             libc_path_str = info.path;
             break;

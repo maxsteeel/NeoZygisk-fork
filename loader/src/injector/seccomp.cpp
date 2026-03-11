@@ -2,17 +2,11 @@
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
-#include <stdbool.h>
-#include <stdio.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include <array>
-#include <cstdint>
-#include <string>
 
 #include "logging.hpp"
 #include "zygisk.hpp"

@@ -3,8 +3,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <csignal>
-
 #include "logging.hpp"
 #include "monitor.hpp"
 #include "utils.hpp"

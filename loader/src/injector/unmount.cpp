@@ -1,18 +1,8 @@
-#include <sys/sysmacros.h>
-#include <sys/types.h>
 #include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
-#include <cerrno>
-#include <cstdio>
-#include <cstring>
-#include <string>
-#include <vector>
 
 #include "logging.hpp"
 #include "module.hpp"
-#include "zygisk.hpp"
 
 static bool starts_with(const std::string& str, const std::string& prefix) {
     return str.rfind(prefix, 0) == 0;

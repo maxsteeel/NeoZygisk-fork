@@ -5,9 +5,9 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <algorithm>
 
 #include <csignal>
-#include <sstream>
 
 #include "daemon.hpp"
 #include "files.hpp"
@@ -380,7 +380,7 @@ void AppMonitor::SigChldHandler::HandleEvent(EventLoop &, uint32_t) {
 void AppMonitor::SigChldHandler::handleChildEvent(int pid, int &status) {
     // Role 1: Process Factories (Init and Stub Zygotes)
     // These processes are monitored for PTRACE_EVENT_FORK to discover new children.
-    if (pid == 1 || stub_processes_.count(pid)) {
+    if (pid == 1 || std::find(stub_processes_.begin(), stub_processes_.end(), pid) != stub_processes_.end()) {
         handleParentEvent(pid, status);
         return;
     }
@@ -394,7 +394,7 @@ void AppMonitor::SigChldHandler::handleChildEvent(int pid, int &status) {
     // Role 3 & 4: Transitioning Candidates and New Discoveries
     // If the process is known to be in the pre-exec stage, evaluate its state.
     // Otherwise, treat it as a newly discovered process.
-    if (process_.count(pid)) {
+    if (std::find(process_.begin(), process_.end(), pid) != process_.end()) {
         handleTracedProcess(pid, status);
     } else {
         handleNewProcess(pid);
@@ -429,7 +429,8 @@ void AppMonitor::SigChldHandler::handleParentEvent(int pid, int &status) {
     // Case 3: An intermediate stub process died naturally or crashed.
     else if (pid != 1 && (WIFEXITED(status) || WIFSIGNALED(status))) {
         LOGI("stub process %d exited (status: %d)", pid, status);
-        stub_processes_.erase(pid);
+        auto it = std::find(stub_processes_.begin(), stub_processes_.end(), pid);
+        if (it != stub_processes_.end()) stub_processes_.erase(it);
         return;
     }
 
@@ -471,7 +472,7 @@ void AppMonitor::SigChldHandler::handleParentEvent(int pid, int &status) {
  */
 void AppMonitor::SigChldHandler::handleNewProcess(int pid) {
     LOGV("new process %d discovered and attached", pid);
-    process_.emplace(pid);
+    process_.push_back(pid);
 
     // Instruct the kernel to stop this process and notify us when it calls execve().
     if (ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACEEXEC) == -1) {
@@ -518,13 +519,16 @@ void AppMonitor::SigChldHandler::handleTracedProcess(int pid, int &status) {
         // If handleExecEvent promoted it to a stub or initiated injection,
         // it no longer belongs in the pre-exec candidate pool.
         if (stopped_with(status, SIGTRAP, PTRACE_EVENT_EXEC)) {
-            process_.erase(pid);
+            auto it = std::find(process_.begin(), process_.end(), pid);
+            if (it != process_.end()) process_.erase(it);
         }
         return;
     }
 
     // If the process is irrelevant (e.g., a random system daemon), clean up and detach.
-    process_.erase(pid);
+    auto it2 = std::find(process_.begin(), process_.end(), pid);
+    if (it2 != process_.end()) process_.erase(it2);
+
     if (WIFSTOPPED(status)) {
         LOGV("detaching irrelevant process %d", pid);
         ptrace(PTRACE_DETACH, pid, 0, 0);
@@ -549,7 +553,7 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
         // It will remain attached forever so we can shield it from SIGCHLD.
         if (program.find("stub_zygote") != std::string::npos) {
             LOGI("detected stub zygote at %d, promoting to parent monitor", pid);
-            stub_processes_.insert(pid);
+            stub_processes_.push_back(pid);
 
             // Upgrade tracing options to catch when it forks the real zygote.
             ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACEFORK | PTRACE_O_TRACEEXEC);

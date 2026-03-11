@@ -1,10 +1,4 @@
 #pragma once
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <sys/user.h>
-#include <vector>
-#include <string>
 #include "utils.hpp" 
 
 bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *regs,

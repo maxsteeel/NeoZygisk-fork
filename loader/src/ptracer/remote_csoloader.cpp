@@ -1,15 +1,10 @@
 #include "remote_csoloader.hpp"
 
-#include <errno.h>
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <inttypes.h>
-#include <limits.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <elf.h>
 #include <link.h>
 #include <vector>
 #include <string>
@@ -81,9 +76,9 @@ static bool vaddr_to_offset(const std::vector<ElfW(Phdr)>& phdr, ElfW(Addr) vadd
 static const char *find_remote_module_path(const std::vector<MapInfo>& remote_map, const char *soname) {
     for (const auto& m : remote_map) {
         if (m.offset != 0) continue;
-        const char *filename = strrchr(m.path.c_str(), '/');
-        filename = filename ? filename + 1 : m.path.c_str();
-        if (strcmp(filename, soname) == 0) return m.path.c_str();
+        const char *filename = strrchr(m.path, '/');
+        filename = filename ? filename + 1 : m.path;
+        if (strcmp(filename, soname) == 0) return m.path;
     }
     return nullptr;
 }

@@ -272,15 +272,15 @@ struct ZygiskContext {
     struct RegisterInfo {
         bool is_regex;
         regex_t regex;
-        std::string literal;
-        std::string symbol;
+        char literal[128]; 
+        char symbol[128];
         void *callback;
         void **backup;
     };
 
     struct IgnoreInfo {
         regex_t regex;
-        std::string symbol;
+        char symbol[128];
     };
 
     pthread_mutex_t hook_info_lock;

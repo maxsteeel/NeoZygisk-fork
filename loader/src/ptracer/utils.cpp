@@ -66,7 +66,8 @@ std::vector<MapInfo> MapInfo::Scan(const std::string &pid) {
 
         auto &ref = info.emplace_back(MapInfo{start, end, 0, perm[3] == 'p', off,
                                               static_cast<dev_t>(makedev(dev_major, dev_minor)),
-                                              inode, line + path_off});
+                                              inode, {0}});
+        strlcpy(ref.path, line + path_off, sizeof(ref.path));
         if (perm[0] == 'r') ref.perms |= PROT_READ;
         if (perm[1] == 'w') ref.perms |= PROT_WRITE;
         if (perm[2] == 'x') ref.perms |= PROT_EXEC;
@@ -173,7 +174,7 @@ std::string get_addr_mem_region(const std::vector<MapInfo> &info, uintptr_t addr
     for (const auto &map : info) {
         if (map.start <= addr && map.end > addr) {
             std::string result;
-            result.reserve(map.path.size() + 5);
+            result.reserve(strlen(map.path) + 5);
             result += map.path;
             result += " ";
             result += ((map.perms & PROT_READ) ? 'r' : '-');
@@ -193,7 +194,7 @@ std::string get_addr_mem_region(const std::vector<MapInfo> &info, uintptr_t addr
  */
 void *find_module_return_addr(const std::vector<MapInfo> &info, std::string_view suffix) {
     for (const auto &map : info) {
-        if ((map.perms & PROT_EXEC) == 0 && map.path.ends_with(suffix)) {
+        if ((map.perms & PROT_EXEC) == 0 && std::string_view(map.path).ends_with(suffix)) {
             return (void *) map.start;
         }
     }
@@ -205,7 +206,7 @@ void *find_module_return_addr(const std::vector<MapInfo> &info, std::string_view
  */
 void *find_module_base(const std::vector<MapInfo> &info, std::string_view suffix) {
     for (const auto &map : info) {
-        if (map.offset == 0 && map.path.ends_with(suffix)) {
+        if (map.offset == 0 && std::string_view(map.path).ends_with(suffix)) {
             return (void *) map.start;
         }
     }

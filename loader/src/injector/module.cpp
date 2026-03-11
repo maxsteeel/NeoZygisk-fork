@@ -1,14 +1,11 @@
 #include "module.hpp"
 
 #include <android/dlext.h>
-#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <sys/syscall.h>
-#include <string.h>
 #include <unistd.h>
 
 #include <lsplt.hpp>
@@ -168,13 +165,13 @@ void ZygiskContext::plt_hook_register(const char *regex, const char *symbol, voi
     if (regex == nullptr || symbol == nullptr || fn == nullptr) return;
 
     RegisterInfo info;
-    info.symbol = symbol;
+    strlcpy(info.symbol, symbol ? symbol : "", sizeof(info.symbol));
     info.callback = fn;
     info.backup = backup;
 
     if (is_simple_literal(regex)) {
         info.is_regex = false;
-        info.literal = regex;
+        strlcpy(info.literal, regex ? regex : "", sizeof(info.literal));
     } else {
         info.is_regex = true;
         if (regcomp(&info.regex, regex, REG_NOSUB) != 0) return;
@@ -189,7 +186,10 @@ void ZygiskContext::plt_hook_exclude(const char *regex, const char *symbol) {
     regex_t re;
     if (regcomp(&re, regex, REG_NOSUB) != 0) return;
     mutex_guard lock(hook_info_lock);
-    ignore_info.emplace_back(IgnoreInfo{re, symbol ?: ""});
+    IgnoreInfo ign;
+    ign.regex = re;
+    strlcpy(ign.symbol, symbol ? symbol : "", sizeof(ign.symbol));
+    ignore_info.push_back(ign);
 }
 
 void ZygiskContext::plt_hook_process_regex() {
@@ -199,14 +199,14 @@ void ZygiskContext::plt_hook_process_regex() {
         for (auto &reg : register_info) {
             // Execute fast sub-string search or fallback to heavy regex
             if (!reg.is_regex) {
-                if (!strstr(map.path.data(), reg.literal.c_str())) continue;
+                if (!strstr(map.path, reg.literal)) continue;
             } else {
-                if (regexec(&reg.regex, map.path.data(), 0, nullptr, 0) != 0) continue;
+                if (regexec(&reg.regex, map.path, 0, nullptr, 0) != 0) continue;
             }
             bool ignored = false;
             for (auto &ign : ignore_info) {
-                if (!ign.symbol.empty() && ign.symbol != reg.symbol) continue;
-                if (regexec(&ign.regex, map.path.data(), 0, nullptr, 0) == 0) {
+                if (ign.symbol[0] != '\0' && strcmp(ign.symbol, reg.symbol) != 0) continue;
+                if (regexec(&ign.regex, map.path, 0, nullptr, 0) == 0) {
                     ignored = true;
                     break;
                 }
@@ -224,8 +224,8 @@ bool ZygiskContext::plt_hook_commit() {
         plt_hook_process_regex();
 
         // Manually destroy sensitive string data in the heap before clearing
-        for (auto& reg : register_info) { wipe_string(reg.symbol); }
-        for (auto& ign : ignore_info) { wipe_string(ign.symbol); }
+        for (auto& reg : register_info) { memset(reg.symbol, 0, sizeof(reg.symbol)); }
+        for (auto& ign : ignore_info) { memset(ign.symbol, 0, sizeof(ign.symbol)); }
 
         register_info.clear();
         ignore_info.clear();

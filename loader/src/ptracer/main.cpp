@@ -3,12 +3,7 @@
 #include <err.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <unistd.h>
 
-#include <cerrno>
-#include <csignal>
-#include <cstdio>
-#include <cstdlib>
 #include <string_view>
 
 #include "daemon.hpp"  // For GetTmpPath

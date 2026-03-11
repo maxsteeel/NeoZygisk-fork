@@ -2,7 +2,6 @@
 
 #include <linux/un.h>
 #include <sys/socket.h>
-#include <unistd.h>
 
 #include "logging.hpp"
 #include "misc.hpp"

@@ -1,8 +1,6 @@
 #pragma once
 
 #include <jni.h>
-#include <sys/types.h>
-
 #include <string>
 
 struct mount_info {
