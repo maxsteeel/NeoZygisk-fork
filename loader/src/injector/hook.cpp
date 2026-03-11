@@ -7,8 +7,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unwind.h>
-#include <fstream>
-#include <sstream>
 #include <string>
 #include <vector>
 #include <fcntl.h>
@@ -65,26 +63,30 @@ void InitRandomVbmeta() {
 
 void LoadPropConfig() {
     string config_path = string("/data/adb/modules/") + moduleId + "/spoof.prop";
-    chmod(config_path.c_str(), 0744);
-    ifstream file(config_path);
+    int fd = open(config_path.c_str(), O_RDONLY);
+    if (fd < 0) return;
 
-    if (!file.is_open()) {
-        return;
-    }
-    string line;
-    while (getline(file, line)) {
-        line = trim(line);
-        if (line.empty() || line[0] == '#') continue;
-
-        istringstream is_line(line);
-        string key;
-        if (getline(is_line, key, '=')) {
-            string value;
-            if (getline(is_line, value)) {
-                g_spoof_props.push_back({trim(key), trim(value)});
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size > 0) {
+        vector<char> buffer(st.st_size + 1, 0);
+        if (read(fd, buffer.data(), st.st_size) == st.st_size) {
+            char* saveptr;
+            char* line = strtok_r(buffer.data(), "\n", &saveptr);
+            while (line != nullptr) {
+                string sLine = trim(line);
+                if (!sLine.empty() && sLine[0] != '#') {
+                    size_t eq_pos = sLine.find('=');
+                    if (eq_pos != string::npos) {
+                        string key = trim(sLine.substr(0, eq_pos));
+                        string value = trim(sLine.substr(eq_pos + 1));
+                        g_spoof_props.push_back({key, value});
+                    }
+                }
+                line = strtok_r(nullptr, "\n", &saveptr);
             }
         }
     }
+    close(fd);
 }
 
 // *********************

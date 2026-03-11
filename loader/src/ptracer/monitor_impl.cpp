@@ -95,16 +95,23 @@ void AppMonitor::update_status() {
         status_text += ")";
     }
 
-    // Build the full content in a single stringstream for clarity.
-    std::stringstream ss;
-    ss << pre_section_ << "\n" << status_text << "\n\n";
-
+    // Build the ABI-specific status section
     std::string abi_section;
     write_abi_status_section(abi_section, zygote_.get_status());
 
-    ss << abi_section << "\n\n" << post_section_;
+    // reservation of the final output string to avoid multiple reallocations
+    std::string final_output;
+    final_output.reserve(pre_section_.size() + status_text.size() + abi_section.size() + post_section_.size() + 6);
 
-    std::string final_output = ss.str();
+    // concatenate all sections into the final output
+    final_output += pre_section_;
+    final_output += "\n";
+    final_output += status_text;
+    final_output += "\n\n";
+    final_output += abi_section;
+    final_output += "\n\n";
+    final_output += post_section_;
+
     fwrite(final_output.c_str(), 1, final_output.length(), prop_file.get());
 }
 

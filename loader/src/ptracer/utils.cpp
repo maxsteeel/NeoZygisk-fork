@@ -19,8 +19,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ios>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -174,12 +172,14 @@ bool set_regs(int pid, struct user_regs_struct &regs) {
 std::string get_addr_mem_region(const std::vector<MapInfo> &info, uintptr_t addr) {
     for (const auto &map : info) {
         if (map.start <= addr && map.end > addr) {
-            std::ostringstream ss;
-            ss << map.path << " ";
-            ss << ((map.perms & PROT_READ) ? 'r' : '-');
-            ss << ((map.perms & PROT_WRITE) ? 'w' : '-');
-            ss << ((map.perms & PROT_EXEC) ? 'x' : '-');
-            return ss.str();
+            std::string result;
+            result.reserve(map.path.size() + 5);
+            result += map.path;
+            result += " ";
+            result += ((map.perms & PROT_READ) ? 'r' : '-');
+            result += ((map.perms & PROT_WRITE) ? 'w' : '-');
+            result += ((map.perms & PROT_EXEC) ? 'x' : '-');
+            return result;
         }
     }
     return "<unknown>";
@@ -566,21 +566,30 @@ void wait_for_trace(int pid, int *status, int flags) {
 }
 
 std::string parse_status(int status) {
-    std::ostringstream os;
-    os << "0x" << std::hex << status << std::dec << " ";
+    char buf[256];
+
+    int len = snprintf(buf, sizeof(buf), "0x%x ", status);
+    std::string result(buf, len);
+
     if (WIFEXITED(status)) {
-        os << "exited with " << WEXITSTATUS(status);
+        snprintf(buf, sizeof(buf), "exited with %d", WEXITSTATUS(status));
+        result += buf;
     } else if (WIFSIGNALED(status)) {
-        os << "signaled with " << sigabbrev_np(WTERMSIG(status)) << "(" << WTERMSIG(status) << ")";
+        int term_sig = WTERMSIG(status);
+        const char* sig_name = sigabbrev_np(term_sig);
+        snprintf(buf, sizeof(buf), "signaled with %s(%d)", sig_name ? sig_name : "UNKNOWN", term_sig);
+        result += buf;
     } else if (WIFSTOPPED(status)) {
-        os << "stopped by ";
-        auto stop_sig = WSTOPSIG(status);
-        os << "signal=" << sigabbrev_np(stop_sig) << "(" << stop_sig << "),";
-        os << "event=" << parse_ptrace_event(status);
+        int stop_sig = WSTOPSIG(status);
+        const char* sig_name = sigabbrev_np(stop_sig);
+        snprintf(buf, sizeof(buf), "stopped by signal=%s(%d),event=%s", 
+                 sig_name ? sig_name : "UNKNOWN", stop_sig, parse_ptrace_event(status));
+        result += buf;
     } else {
-        os << "unknown";
+        result += "unknown";
     }
-    return os.str();
+
+    return result;
 }
 
 /**
@@ -588,12 +597,11 @@ std::string parse_status(int status) {
  * @return The path to the executable, or an empty string on failure.
  */
 std::string get_program(int pid) {
-    std::string path = "/proc/";
-    path += std::to_string(pid);
-    path += "/exe";
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/exe", pid);
     constexpr const auto SIZE = 256;
     char buf[SIZE + 1];
-    auto sz = readlink(path.c_str(), buf, SIZE);
+    auto sz = readlink(path, buf, SIZE);
     if (sz == -1) {
         PLOGE("readlink /proc/%d/exe", pid);
         return "";
