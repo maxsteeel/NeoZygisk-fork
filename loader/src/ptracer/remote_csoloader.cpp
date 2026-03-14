@@ -204,19 +204,32 @@ static uintptr_t smart_resolve_symbol(const char* sym_name, const std::vector<Ma
     if (!local_addr) return 0;
 
     std::string actual_path;
+    uintptr_t local_base = 0;
+    uintptr_t last_base = 0;
+    const char* last_path = nullptr;
+
     for (const auto& m : local_map) {
+        if (m.offset == 0) {
+            last_base = m.start;
+            last_path = m.path;
+        }
         if ((uintptr_t)local_addr >= m.start && (uintptr_t)local_addr < m.end) {
             actual_path = m.path;
+            if (last_path && strcmp(last_path, m.path) == 0) {
+                local_base = last_base;
+            }
             break;
         }
     }
+
     if (actual_path.empty()) return 0;
 
-    uintptr_t local_base = 0;
-    for (const auto& m : local_map) {
-        if (m.path == actual_path && m.offset == 0) {
-            local_base = m.start;
-            break;
+    if (local_base == 0) {
+        for (const auto& m : local_map) {
+            if (m.offset == 0 && actual_path == m.path) {
+                local_base = m.start;
+                break;
+            }
         }
     }
     if (local_base == 0) return 0;
