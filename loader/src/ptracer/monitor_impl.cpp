@@ -5,8 +5,8 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <algorithm>
 
+#include <algorithm>
 #include <csignal>
 
 #include "daemon.hpp"
@@ -32,8 +32,6 @@ AppMonitor::AppMonitor()
 ZygoteAbiManager &AppMonitor::get_abi_manager() { return zygote_; }
 
 TracingState AppMonitor::get_tracing_state() const { return tracing_state_; }
-
-void AppMonitor::set_tracing_state(TracingState state) { tracing_state_ = state; }
 
 void AppMonitor::write_abi_status_section(std::string &status_text, const Status &daemon_status) {
     auto abi_name = this->zygote_.abi_name_;
@@ -101,7 +99,8 @@ void AppMonitor::update_status() {
 
     // reservation of the final output string to avoid multiple reallocations
     std::string final_output;
-    final_output.reserve(pre_section_.size() + status_text.size() + abi_section.size() + post_section_.size() + 6);
+    final_output.reserve(pre_section_.size() + status_text.size() + abi_section.size() +
+                         post_section_.size() + 6);
 
     // concatenate all sections into the final output
     final_output += pre_section_;
@@ -195,9 +194,8 @@ bool AppMonitor::SocketHandler::Init() {
         PLOGE("socket create");
         return false;
     }
-    struct sockaddr_un addr{
-        .sun_family = AF_UNIX,
-        .sun_path = {0},
+    struct sockaddr_un addr {
+        .sun_family = AF_UNIX, .sun_path = {0},
     };
     sprintf(addr.sun_path, "%s/%s", zygiskd::GetTmpPath().c_str(), AppMonitor::SOCKET_NAME);
     socklen_t socklen = sizeof(sa_family_t) + strlen(addr.sun_path);
@@ -380,7 +378,8 @@ void AppMonitor::SigChldHandler::HandleEvent(EventLoop &, uint32_t) {
 void AppMonitor::SigChldHandler::handleChildEvent(int pid, int &status) {
     // Role 1: Process Factories (Init and Stub Zygotes)
     // These processes are monitored for PTRACE_EVENT_FORK to discover new children.
-    if (pid == 1 || std::find(stub_processes_.begin(), stub_processes_.end(), pid) != stub_processes_.end()) {
+    if (pid == 1 ||
+        std::find(stub_processes_.begin(), stub_processes_.end(), pid) != stub_processes_.end()) {
         handleParentEvent(pid, status);
         return;
     }
