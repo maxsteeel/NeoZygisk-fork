@@ -6,12 +6,17 @@ use crate::constants::MIN_APATCH_VERSION;
 use anyhow::{Context, Result};
 use log::debug;
 use std::{
+    fs,
     fs::File,
     io::{BufRead, BufReader},
     process::{Command, Stdio},
+    sync::Mutex,
+    time::SystemTime,
 };
 
 const CONFIG_FILE: &str = "/data/adb/ap/package_config";
+
+static CONFIG_CACHE: Mutex<Option<(SystemTime, Vec<PackageInfo>)>> = Mutex::new(None);
 
 /// Represents the detected version status of APatch.
 pub enum Version {
@@ -20,7 +25,7 @@ pub enum Version {
 }
 
 /// Represents a single entry in the APatch configuration file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PackageInfo {
     uid: i32,
     exclude: bool, // Corresponds to denylist
@@ -44,6 +49,30 @@ pub fn detect_version() -> Option<Version> {
                 Version::TooOld
             }
         })
+}
+
+/// Gets the parsed APatch configuration, caching it based on file modification time.
+fn get_config() -> Result<Vec<PackageInfo>> {
+    let metadata = fs::metadata(CONFIG_FILE).context("Failed to get APatch config metadata")?;
+    let mtime = metadata
+        .modified()
+        .context("Failed to get APatch config mtime")?;
+
+    if let Ok(cache) = CONFIG_CACHE.lock() {
+        if let Some((cached_mtime, cached_config)) = cache.as_ref() {
+            if *cached_mtime == mtime {
+                return Ok(cached_config.clone());
+            }
+        }
+    }
+
+    let config = parse_config_file()?;
+
+    if let Ok(mut cache) = CONFIG_CACHE.lock() {
+        *cache = Some((mtime, config.clone()));
+    }
+
+    Ok(config)
 }
 
 /// Parses the APatch package configuration file.
@@ -79,7 +108,7 @@ fn parse_config_file() -> Result<Vec<PackageInfo>> {
 
 /// Checks if a UID is configured to have root access in APatch.
 pub fn uid_granted_root(uid: i32) -> bool {
-    match parse_config_file() {
+    match get_config() {
         Ok(packages) => packages.iter().any(|pkg| pkg.uid == uid && pkg.allow),
         Err(e) => {
             debug!("Could not check APatch root grant status: {}", e);
@@ -90,7 +119,7 @@ pub fn uid_granted_root(uid: i32) -> bool {
 
 /// Checks if a UID is on the denylist in APatch.
 pub fn uid_should_umount(uid: i32) -> bool {
-    match parse_config_file() {
+    match get_config() {
         Ok(packages) => packages.iter().any(|pkg| pkg.uid == uid && pkg.exclude),
         Err(e) => {
             debug!("Could not check APatch denylist status: {}", e);
