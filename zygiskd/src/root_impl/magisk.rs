@@ -83,10 +83,11 @@ pub fn uid_should_umount(uid: i32) -> bool {
         None => return false,
     };
 
-    let pkg_name = packages_list
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("package:"))
-        .and_then(|pkg| pkg.split(' ').next());
+    let pkg_name = packages_list.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("package:")
+            .map(|pkg| pkg.split_once(' ').map_or(pkg, |(p, _)| p))
+    });
 
     let pkg_name = match pkg_name {
         Some(name) => name,
