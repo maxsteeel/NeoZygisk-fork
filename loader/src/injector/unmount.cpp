@@ -1,11 +1,12 @@
 #include <fcntl.h>
 #include <algorithm>
+#include <string_view>
 
 #include "logging.hpp"
 #include "module.hpp"
 
-static bool starts_with(const std::string& str, const std::string& prefix) {
-    return str.rfind(prefix, 0) == 0;
+static bool starts_with(std::string_view str, std::string_view prefix) {
+    return str.starts_with(prefix);
 }
 
 std::vector<mount_info> check_zygote_traces(uint32_t info_flags) {
