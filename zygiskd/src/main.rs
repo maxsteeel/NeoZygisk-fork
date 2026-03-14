@@ -92,10 +92,10 @@ fn init_android_logger(tag: &str) {
 
 /// Parses command-line arguments and dispatches to the correct logic.
 fn start() {
-    let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
+    let mut args = std::env::args();
+    match args.nth(1).as_deref() {
         Some("companion") => {
-            if let Some(fd_str) = args.get(2) {
+            if let Some(fd_str) = args.next() {
                 if let Ok(fd) = fd_str.parse() {
                     companion::entry(fd);
                 } else {
