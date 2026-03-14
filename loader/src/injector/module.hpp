@@ -346,6 +346,7 @@ struct HookContext {
     void hook_zygote_jni();
     void restore_zygote_hook(JNIEnv *env);
     void hook_jni_methods(JNIEnv *env, const char *clz, JNIMethods methods);
+    void clear_map_paths();
 
 private:
     void register_hook(dev_t dev, ino_t inode, const char *symbol, void *new_func, void **old_func);
