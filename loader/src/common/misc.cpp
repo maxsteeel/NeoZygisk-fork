@@ -1,6 +1,6 @@
 #include "misc.hpp"
 
-#include <charconv>
+#include <cstdint>
 #include <string_view>
 
 #include "logging.hpp"
@@ -8,25 +8,43 @@
 /**
  * @brief Parses an integer from a string_view.
  *
- * This function uses std::from_chars for safe, high-performance conversion.
+ * This function uses a highly optimized manual parser.
  * It adheres to the original signature, returning an integer value.
  *
  * @param s The string_view to parse.
- * @return The parsed integer on success. Returns -1 on failure (e.g., invalid
- * format, overflow, or non-numeric characters). Note the ambiguity: a
- * successful parse of "-1" cannot be distinguished from a failure.
+ * @return The parsed integer on success. Returns -1 on failure.
  */
 int parse_int(std::string_view s) {
-    int value{};
+    const char* p = s.data();
+    size_t len = s.size();
 
-    // std::from_chars attempts to parse an integer from the provided character range.
-    auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), value);
+    if (unlikely(len == 0)) return -1;
 
-    // A successful parse must have no error code and consume the entire string.
-    if (ec == std::errc() && ptr == s.data() + s.size()) {
-        return value;
+    bool neg = false;
+    if (*p == '-') {
+        neg = true;
+        p++;
+        len--;
+        if (unlikely(len == 0)) return -1;
     }
 
-    // Return the designated error value if parsing fails.
-    return -1;
+    // Max length for a 32-bit integer (including sign) is 11,
+    // so max digits is 10.
+    if (unlikely(len > 10)) return -1;
+
+    uint64_t val = 0;
+    const char* const end = p + len;
+    while (p != end) {
+        uint32_t digit = static_cast<uint32_t>(*p++) - '0';
+        if (unlikely(digit > 9)) return -1;
+        val = val * 10 + digit;
+    }
+
+    if (neg) {
+        if (unlikely(val > 2147483648ULL)) return -1;
+        return -static_cast<int>(val);
+    } else {
+        if (unlikely(val > 2147483647ULL)) return -1;
+        return static_cast<int>(val);
+    }
 }
