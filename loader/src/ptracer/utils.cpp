@@ -44,7 +44,7 @@ std::vector<MapInfo> MapInfo::Scan(const std::string &pid) {
     // of reallocations significantly.
     info.reserve(256);
 
-    char buffer[4096];
+    char buffer[8196];
     while (fgets(buffer, sizeof(buffer), maps.get())) {
         char* p = buffer;
 
