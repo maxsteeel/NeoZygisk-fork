@@ -64,9 +64,14 @@ std::vector<MapInfo> MapInfo::Scan(const std::string &pid) {
             *nl = '\0';
         }
 
-        auto &ref = info.emplace_back(MapInfo{start, end, 0, perm[3] == 'p', off,
+        auto &ref = info.emplace_back(MapInfo{start,
+                                              end,
+                                              0,
+                                              perm[3] == 'p',
+                                              off,
                                               static_cast<dev_t>(makedev(dev_major, dev_minor)),
-                                              inode, {0}});
+                                              inode,
+                                              {0}});
         strlcpy(ref.path, line + path_off, sizeof(ref.path));
         if (perm[0] == 'r') ref.perms |= PROT_READ;
         if (perm[1] == 'w') ref.perms |= PROT_WRITE;
@@ -83,8 +88,12 @@ std::vector<MapInfo> MapInfo::Scan(const std::string &pid) {
 ssize_t write_proc(int pid, uintptr_t remote_addr, const void *buf, size_t len) {
     // The iovec struct's iov_base is a non-const void*, so we must cast away constness.
     // This is safe as process_vm_writev treats the local iovec as a source.
-    struct iovec local{.iov_base = const_cast<void *>(buf), .iov_len = len};
-    struct iovec remote{.iov_base = (void *) remote_addr, .iov_len = len};
+    struct iovec local {
+        .iov_base = const_cast<void *>(buf), .iov_len = len
+    };
+    struct iovec remote {
+        .iov_base = (void *) remote_addr, .iov_len = len
+    };
 
     ssize_t bytes_written = process_vm_writev(pid, &local, 1, &remote, 1, 0);
 
@@ -102,8 +111,12 @@ ssize_t write_proc(int pid, uintptr_t remote_addr, const void *buf, size_t len) 
  * @return The number of bytes read, or -1 on error.
  */
 ssize_t read_proc(int pid, uintptr_t remote_addr, void *buf, size_t len) {
-    struct iovec local{.iov_base = buf, .iov_len = len};
-    struct iovec remote{.iov_base = (void *) remote_addr, .iov_len = len};
+    struct iovec local {
+        .iov_base = buf, .iov_len = len
+    };
+    struct iovec remote {
+        .iov_base = (void *) remote_addr, .iov_len = len
+    };
 
     ssize_t bytes_read = process_vm_readv(pid, &local, 1, &remote, 1, 0);
 
@@ -162,28 +175,6 @@ bool set_regs(int pid, struct user_regs_struct &regs) {
     }
 #endif
     return true;
-}
-
-/**
- * @brief Finds the memory region containing an address and formats its details.
- * @param info A vector of memory maps for the process. Should be const.
- * @param addr The address to look for.
- * @return A formatted string like "/path/to/lib.so r-x", or "<unknown>".
- */
-std::string get_addr_mem_region(const std::vector<MapInfo> &info, uintptr_t addr) {
-    for (const auto &map : info) {
-        if (map.start <= addr && map.end > addr) {
-            std::string result;
-            result.reserve(strlen(map.path) + 5);
-            result += map.path;
-            result += " ";
-            result += ((map.perms & PROT_READ) ? 'r' : '-');
-            result += ((map.perms & PROT_WRITE) ? 'w' : '-');
-            result += ((map.perms & PROT_EXEC) ? 'x' : '-');
-            return result;
-        }
-    }
-    return "<unknown>";
 }
 
 /**
@@ -592,13 +583,14 @@ std::string parse_status(int status) {
         result += buf;
     } else if (WIFSIGNALED(status)) {
         int term_sig = WTERMSIG(status);
-        const char* sig_name = sigabbrev_np(term_sig);
-        snprintf(buf, sizeof(buf), "signaled with %s(%d)", sig_name ? sig_name : "UNKNOWN", term_sig);
+        const char *sig_name = sigabbrev_np(term_sig);
+        snprintf(buf, sizeof(buf), "signaled with %s(%d)", sig_name ? sig_name : "UNKNOWN",
+                 term_sig);
         result += buf;
     } else if (WIFSTOPPED(status)) {
         int stop_sig = WSTOPSIG(status);
-        const char* sig_name = sigabbrev_np(stop_sig);
-        snprintf(buf, sizeof(buf), "stopped by signal=%s(%d),event=%s", 
+        const char *sig_name = sigabbrev_np(stop_sig);
+        snprintf(buf, sizeof(buf), "stopped by signal=%s(%d),event=%s",
                  sig_name ? sig_name : "UNKNOWN", stop_sig, parse_ptrace_event(status));
         result += buf;
     } else {

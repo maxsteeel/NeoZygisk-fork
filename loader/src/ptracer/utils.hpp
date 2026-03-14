@@ -64,8 +64,6 @@ bool get_regs(int pid, struct user_regs_struct &regs);
 
 bool set_regs(int pid, struct user_regs_struct &regs);
 
-std::string get_addr_mem_region(std::vector<MapInfo> &info, uintptr_t addr);
-
 void *find_module_base(const std::vector<MapInfo> &info, std::string_view suffix);
 
 void *find_func_addr(const std::vector<MapInfo> &local_info,
