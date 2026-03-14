@@ -11,17 +11,22 @@ namespace socket_utils {
 
 ssize_t xread(int fd, void* buf, size_t count) {
     if (count == 0) [[unlikely]] return 0;
-    size_t read_sz = 0;
-    ssize_t ret;
-    do {
-        ret = read(fd, (std::byte*) buf + read_sz, count - read_sz);
-        if (ret < 0) [[unlikely]] {
-            if (errno == EINTR) continue;
+    std::byte* ptr = static_cast<std::byte*>(buf);
+    std::byte* const end = ptr + count;
+
+    while (ptr < end) {
+        ssize_t ret = read(fd, ptr, end - ptr);
+        if (ret > 0) [[likely]] {
+            ptr += ret;
+        } else if (ret == 0) [[unlikely]] {
+            break;
+        } else if (errno != EINTR) [[unlikely]] {
             PLOGE("read");
-            return ret;
+            return -1;
         }
-        read_sz += ret;
-    } while (read_sz != count && ret != 0);
+    }
+
+    size_t read_sz = ptr - static_cast<std::byte*>(buf);
     if (read_sz != count) [[unlikely]] {
         PLOGE("read (%zu != %zu)", count, read_sz);
     }
@@ -30,17 +35,22 @@ ssize_t xread(int fd, void* buf, size_t count) {
 
 size_t xwrite(int fd, const void* buf, size_t count) {
     if (count == 0) [[unlikely]] return 0;
-    size_t write_sz = 0;
-    ssize_t ret;
-    do {
-        ret = write(fd, (std::byte*) buf + write_sz, count - write_sz);
-        if (ret < 0) [[unlikely]] {
-            if (errno == EINTR) continue;
+    const std::byte* ptr = static_cast<const std::byte*>(buf);
+    const std::byte* const end = ptr + count;
+
+    while (ptr < end) {
+        ssize_t ret = write(fd, ptr, end - ptr);
+        if (ret > 0) [[likely]] {
+            ptr += ret;
+        } else if (ret == 0) [[unlikely]] {
+            break;
+        } else if (errno != EINTR) [[unlikely]] {
             PLOGE("write");
-            return write_sz;
+            return ptr - static_cast<const std::byte*>(buf);
         }
-        write_sz += ret;
-    } while (write_sz != count && ret != 0);
+    }
+
+    size_t write_sz = ptr - static_cast<const std::byte*>(buf);
     if (write_sz != count) [[unlikely]] {
         PLOGE("write (%zu != %zu)", count, write_sz);
     }
