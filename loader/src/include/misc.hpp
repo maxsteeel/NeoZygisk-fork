@@ -1,6 +1,7 @@
 #pragma once
 
 #include <pthread.h>
+#include <string.h>
 
 #include <string_view>
 #include <string>
@@ -8,12 +9,12 @@
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #define likely(x)   __builtin_expect(!!(x), 1)
 
-// Force the compiler to execute the memory wipeping code,
+// Force the compiler to execute the memory wiping code,
 // even if it thinks the memory is not used afterward.
 static inline void memzero(void *s, size_t n) {
-    volatile char *p = static_cast<volatile char *>(s);
-    while (n--) {
-        *p++ = 0;
+    if (n > 0) {
+        memset(s, 0, n);
+        __asm__ volatile("" : : "r"(s) : "memory");
     }
 }
 
