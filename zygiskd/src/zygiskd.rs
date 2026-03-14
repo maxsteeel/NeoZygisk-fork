@@ -293,9 +293,12 @@ fn create_daemon_socket() -> Result<UnixListener> {
 fn spawn_companion(name: &str, lib_fd: RawFd) -> Result<Option<UnixStream>> {
     let (mut daemon_sock, companion_sock) = UnixStream::pair()?;
 
-    // FIXME: A more robust way to get the current executable path is desirable.
-    let self_exe = std::env::args().next().unwrap();
-    let nice_name = self_exe.split('/').last().unwrap_or("zygiskd");
+    // A more robust way to get the current executable path.
+    let self_exe = std::env::current_exe().context("Failed to get current executable path")?;
+    let nice_name = self_exe
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_else(|| "zygiskd".into());
 
     // The fork/exec logic is now handled directly here.
     // # Safety
