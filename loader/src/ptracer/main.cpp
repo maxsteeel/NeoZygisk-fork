@@ -38,7 +38,10 @@ void send_control_command(Command cmd) {
         .sun_family = AF_UNIX,
         .sun_path = {0},
     };
-    sprintf(addr.sun_path, "%s/%s", zygiskd::GetTmpPath().c_str(), AppMonitor::SOCKET_NAME);
+    if (snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/%s", zygiskd::GetTmpPath().c_str(),
+                 AppMonitor::SOCKET_NAME) >= static_cast<int>(sizeof(addr.sun_path))) {
+        errx(EXIT_FAILURE, "UNIX domain socket path too long");
+    }
     socklen_t socklen = sizeof(sa_family_t) + strlen(addr.sun_path);
 
     auto nsend = sendto(sockfd, (void *) &cmd, sizeof(cmd), 0, (sockaddr *) &addr, socklen);

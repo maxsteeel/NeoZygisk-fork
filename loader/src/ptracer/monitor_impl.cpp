@@ -197,7 +197,11 @@ bool AppMonitor::SocketHandler::Init() {
     struct sockaddr_un addr {
         .sun_family = AF_UNIX, .sun_path = {0},
     };
-    sprintf(addr.sun_path, "%s/%s", zygiskd::GetTmpPath().c_str(), AppMonitor::SOCKET_NAME);
+    if (snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/%s", zygiskd::GetTmpPath().c_str(),
+                 AppMonitor::SOCKET_NAME) >= static_cast<int>(sizeof(addr.sun_path))) {
+        PLOGE("UNIX domain socket path too long");
+        return false;
+    }
     socklen_t socklen = sizeof(sa_family_t) + strlen(addr.sun_path);
     if (bind(sock_fd_, (struct sockaddr *) &addr, socklen) == -1) {
         PLOGE("bind socket");
