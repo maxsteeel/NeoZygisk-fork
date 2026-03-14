@@ -39,45 +39,111 @@ std::vector<MapInfo> MapInfo::Scan(const std::string &pid) {
         return info;
     }
 
-    char *line = nullptr;
-    size_t len = 0;
-    while (getline(&line, &len, maps.get()) > 0) {
-        // Line format: start-end perms offset dev:minor inode pathname
-        uintptr_t start, end, off;
-        ino_t inode;
-        unsigned int dev_major, dev_minor;
-        std::array<char, 5> perm{};  // rwxp\0
-        int path_off;
+    // A typical maps file can contain hundreds or thousands of lines.
+    // By reserving a reasonable amount of space, we reduce the number
+    // of reallocations significantly.
+    info.reserve(256);
 
-        if (sscanf(line, "%" PRIxPTR "-%" PRIxPTR " %4s %" PRIxPTR " %x:%x %lu %n", &start, &end,
-                   perm.data(), &off, &dev_major, &dev_minor, &inode, &path_off) != 7) {
-            continue;
+    char buffer[4096];
+    while (fgets(buffer, sizeof(buffer), maps.get())) {
+        char* p = buffer;
+
+        // Inline hex parsing
+        uintptr_t start = 0;
+        while (true) {
+            char c = *p;
+            if (c >= '0' && c <= '9') start = (start << 4) | (c - '0');
+            else if (c >= 'a' && c <= 'f') start = (start << 4) | (c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') start = (start << 4) | (c - 'A' + 10);
+            else break;
+            p++;
+        }
+        if (*p++ != '-') continue;
+
+        uintptr_t end = 0;
+        while (true) {
+            char c = *p;
+            if (c >= '0' && c <= '9') end = (end << 4) | (c - '0');
+            else if (c >= 'a' && c <= 'f') end = (end << 4) | (c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') end = (end << 4) | (c - 'A' + 10);
+            else break;
+            p++;
+        }
+        if (*p++ != ' ') continue;
+
+        char perm[4];
+        perm[0] = *p++;
+        perm[1] = *p++;
+        perm[2] = *p++;
+        bool is_private = (*p++ == 'p');
+        if (*p++ != ' ') continue;
+
+        uintptr_t off = 0;
+        while (true) {
+            char c = *p;
+            if (c >= '0' && c <= '9') off = (off << 4) | (c - '0');
+            else if (c >= 'a' && c <= 'f') off = (off << 4) | (c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') off = (off << 4) | (c - 'A' + 10);
+            else break;
+            p++;
+        }
+        if (*p++ != ' ') continue;
+
+        unsigned int dev_major = 0;
+        while (true) {
+            char c = *p;
+            if (c >= '0' && c <= '9') dev_major = (dev_major << 4) | (c - '0');
+            else if (c >= 'a' && c <= 'f') dev_major = (dev_major << 4) | (c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') dev_major = (dev_major << 4) | (c - 'A' + 10);
+            else break;
+            p++;
+        }
+        if (*p++ != ':') continue;
+
+        unsigned int dev_minor = 0;
+        while (true) {
+            char c = *p;
+            if (c >= '0' && c <= '9') dev_minor = (dev_minor << 4) | (c - '0');
+            else if (c >= 'a' && c <= 'f') dev_minor = (dev_minor << 4) | (c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') dev_minor = (dev_minor << 4) | (c - 'A' + 10);
+            else break;
+            p++;
+        }
+        if (*p++ != ' ') continue;
+
+        ino_t inode = 0;
+        while (true) {
+            char c = *p;
+            if (c >= '0' && c <= '9') inode = inode * 10 + (c - '0');
+            else break;
+            p++;
         }
 
-        // Find the start of the pathname, skipping spaces.
-        while (path_off > 0 && isspace(line[path_off])) {
-            path_off++;
-        }
+        while (*p == ' ') p++;
 
-        // Trim trailing newline from path.
-        if (auto nl = strchr(line + path_off, '\n'); nl != nullptr) {
-            *nl = '\0';
-        }
+        uint8_t perms = 0;
+        if (perm[0] == 'r') perms |= PROT_READ;
+        if (perm[1] == 'w') perms |= PROT_WRITE;
+        if (perm[2] == 'x') perms |= PROT_EXEC;
 
         auto &ref = info.emplace_back(MapInfo{start,
                                               end,
-                                              0,
-                                              perm[3] == 'p',
+                                              perms,
+                                              is_private,
                                               off,
                                               static_cast<dev_t>(makedev(dev_major, dev_minor)),
                                               inode,
                                               {0}});
-        strlcpy(ref.path, line + path_off, sizeof(ref.path));
-        if (perm[0] == 'r') ref.perms |= PROT_READ;
-        if (perm[1] == 'w') ref.perms |= PROT_WRITE;
-        if (perm[2] == 'x') ref.perms |= PROT_EXEC;
+
+        size_t i = 0;
+        while (char c = *p++) {
+            if (c == '\n') break;
+            if (i < sizeof(ref.path) - 1) {
+                ref.path[i++] = c;
+            }
+        }
+        ref.path[i] = '\0';
     }
-    free(line);
     return info;
 }
 
