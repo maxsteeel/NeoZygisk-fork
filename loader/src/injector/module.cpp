@@ -19,15 +19,15 @@
 
 // Structure for the getdents64 syscall
 struct linux_dirent64 {
-    uint64_t         d_ino;
-    int64_t          d_off;
-    unsigned short   d_reclen;
-    unsigned char    d_type;
-    char             d_name[];
+    uint64_t d_ino;
+    int64_t d_off;
+    unsigned short d_reclen;
+    unsigned char d_type;
+    char d_name[];
 };
 
 // Extremely fast inline string-to-int parser (avoids atoi overhead)
-static inline int fast_atoi(const char* str) {
+static inline int fast_atoi(const char *str) {
     int val = 0;
     while (*str >= '0' && *str <= '9') {
         val = val * 10 + (*str++ - '0');
@@ -156,7 +156,7 @@ void ZygiskModule::postServerSpecialize(const ServerSpecializeArgs_v1 *args) con
 // -----------------------------------------------------------------
 
 // Helper to determine if a string is a simple literal or a complex regex
-static inline bool is_simple_literal(const char* str) {
+static inline bool is_simple_literal(const char *str) {
     return strpbrk(str, ".*+?^$[]|()\\") == nullptr;
 }
 
@@ -183,12 +183,19 @@ void ZygiskContext::plt_hook_register(const char *regex, const char *symbol, voi
 
 void ZygiskContext::plt_hook_exclude(const char *regex, const char *symbol) {
     if (!regex) return;
-    regex_t re;
-    if (regcomp(&re, regex, REG_NOSUB) != 0) return;
-    mutex_guard lock(hook_info_lock);
+
     IgnoreInfo ign;
-    ign.regex = re;
     strlcpy(ign.symbol, symbol ? symbol : "", sizeof(ign.symbol));
+
+    if (is_simple_literal(regex)) {
+        ign.is_regex = false;
+        strlcpy(ign.literal, regex ? regex : "", sizeof(ign.literal));
+    } else {
+        ign.is_regex = true;
+        if (regcomp(&ign.regex, regex, REG_NOSUB) != 0) return;
+    }
+
+    mutex_guard lock(hook_info_lock);
     ignore_info.push_back(ign);
 }
 
@@ -196,6 +203,18 @@ void ZygiskContext::plt_hook_process_regex() {
     if (register_info.empty()) return;
     for (auto &map : g_hook->cached_map_infos) {
         if (map.offset != 0 || !map.is_private || !(map.perms & PROT_READ)) continue;
+
+        // Pre-evaluate ignore rules that only depend on map.path
+        std::vector<bool> ign_matches(ignore_info.size());
+        for (size_t i = 0; i < ignore_info.size(); ++i) {
+            auto &ign = ignore_info[i];
+            if (!ign.is_regex) {
+                ign_matches[i] = (strstr(map.path, ign.literal) != nullptr);
+            } else {
+                ign_matches[i] = (regexec(&ign.regex, map.path, 0, nullptr, 0) == 0);
+            }
+        }
+
         for (auto &reg : register_info) {
             // Execute fast sub-string search or fallback to heavy regex
             if (!reg.is_regex) {
@@ -204,9 +223,10 @@ void ZygiskContext::plt_hook_process_regex() {
                 if (regexec(&reg.regex, map.path, 0, nullptr, 0) != 0) continue;
             }
             bool ignored = false;
-            for (auto &ign : ignore_info) {
+            for (size_t i = 0; i < ignore_info.size(); ++i) {
+                auto &ign = ignore_info[i];
                 if (ign.symbol[0] != '\0' && strcmp(ign.symbol, reg.symbol) != 0) continue;
-                if (regexec(&ign.regex, map.path, 0, nullptr, 0) == 0) {
+                if (ign_matches[i]) {
                     ignored = true;
                     break;
                 }
@@ -224,8 +244,12 @@ bool ZygiskContext::plt_hook_commit() {
         plt_hook_process_regex();
 
         // Manually destroy sensitive string data in the heap before clearing
-        for (auto& reg : register_info) { memzero(reg.symbol, sizeof(reg.symbol)); }
-        for (auto& ign : ignore_info) { memzero(ign.symbol, sizeof(ign.symbol)); }
+        for (auto &reg : register_info) {
+            memzero(reg.symbol, sizeof(reg.symbol));
+        }
+        for (auto &ign : ignore_info) {
+            memzero(ign.symbol, sizeof(ign.symbol));
+        }
 
         register_info.clear();
         ignore_info.clear();
@@ -283,12 +307,12 @@ void ZygiskContext::sanitize_fds() {
         int nread;
         while ((nread = syscall(__NR_getdents64, fd_dir, buf, sizeof(buf))) > 0) {
             for (int bpos = 0; bpos < nread;) {
-                auto d = reinterpret_cast<struct linux_dirent64*>(buf + bpos);
+                auto d = reinterpret_cast<struct linux_dirent64 *>(buf + bpos);
                 if (d->d_name[0] >= '0' && d->d_name[0] <= '9') {
                     int fd = fast_atoi(d->d_name);
-                    if (unlikely((fd < 0 || 
-                                static_cast<size_t>(fd) >= allowed_fds.size() || 
-                                !allowed_fds[fd]) && fd != fd_dir)) {
+                    if (unlikely((fd < 0 || static_cast<size_t>(fd) >= allowed_fds.size() ||
+                                  !allowed_fds[fd]) &&
+                                 fd != fd_dir)) {
                         close(fd);
                     }
                 }
@@ -339,8 +363,8 @@ void ZygiskContext::fork_pre() {
         int nread;
         while ((nread = syscall(__NR_getdents64, fd_dir, buf, sizeof(buf))) > 0) {
             for (int bpos = 0; bpos < nread;) {
-                auto d = reinterpret_cast<struct linux_dirent64*>(buf + bpos);
-                
+                auto d = reinterpret_cast<struct linux_dirent64 *>(buf + bpos);
+
                 // Only parse if it starts with a number (valid FD)
                 if (d->d_name[0] >= '0' && d->d_name[0] <= '9') {
                     int fd = fast_atoi(d->d_name);
@@ -413,7 +437,7 @@ void ZygiskContext::run_modules_post() {
 
 void ZygiskContext::app_specialize_pre() {
     uid_t uid = args.app->uid;
-    uid_t app_id = uid % 100000; // Support for Work Profiles / Multi-User
+    uid_t app_id = uid % 100000;  // Support for Work Profiles / Multi-User
 
     // Total range: Standard Isolated Services (99000-99999) and AppZygote (90000-98999)
     if (app_id >= 90000 && app_id <= 99999) {
@@ -427,7 +451,8 @@ void ZygiskContext::app_specialize_pre() {
                 if (stat(data_dir, &st) == 0) {
                     uid = st.st_uid;
                     found_parent = true;
-                    LOGV("identify isolated service via app_data_dir [uid:%d, data_dir:%s]", uid, data_dir);
+                    LOGV("identify isolated service via app_data_dir [uid:%d, data_dir:%s]", uid,
+                         data_dir);
                 }
                 env->ReleaseStringUTFChars(args.app->app_data_dir, data_dir);
             }
@@ -435,7 +460,7 @@ void ZygiskContext::app_specialize_pre() {
 
         // 2. If failed or null, extract directory from pkg_data_info_list (Android 10+)
         if (!found_parent && args.app->pkg_data_info_list && *args.app->pkg_data_info_list) {
-            jobjectArray pkg_array = *args.app->pkg_data_info_list; // Dereference pointer
+            jobjectArray pkg_array = *args.app->pkg_data_info_list;  // Dereference pointer
             jint count = env->GetArrayLength(pkg_array);
             if (count > 0) {
                 jstring pkg_data_info = (jstring) env->GetObjectArrayElement(pkg_array, 0);
@@ -451,7 +476,9 @@ void ZygiskContext::app_specialize_pre() {
                             struct stat st;
                             if (stat(data_dir, &st) == 0) {
                                 uid = st.st_uid;
-                                LOGV("identify isolated service via pkg_data_info [uid:%d, data_dir:%s]", uid, data_dir);
+                                LOGV(
+                                    "identify isolated service via pkg_data_info [uid:%d, data_dir:%s]",
+                                    uid, data_dir);
                             }
                         }
                         env->ReleaseStringUTFChars(pkg_data_info, info_str);
@@ -554,7 +581,7 @@ void ZygiskContext::nativeSpecializeAppProcess_pre() {
                 LOGV("AppZygote unmounting %s", trace.target.c_str());
                 umount2(trace.target.c_str(), MNT_DETACH);
             }
-            // After unmounting, we can clear the traces to prevent the SystemServer 
+            // After unmounting, we can clear the traces to prevent the SystemServer
             // from inheriting them, which may cause issues with the SystemServer's
             // resource overlay (JingMatrix/NeoZygisk#26)
             g_hook->zygote_unmounted = true;
@@ -584,7 +611,7 @@ void ZygiskContext::nativeForkAndSpecialize_pre() {
                 if (trace.source == "magisk") {
                     LOGV("skip magisk specific mounts for compatibility: %s",
                          trace.raw_info.c_str());
-                    return false; // Return false to keep this trace in the vector/mount list
+                    return false;  // Return false to keep this trace in the vector/mount list
                 }
                 LOGV("unmounting %s (mnt_id: %u)", trace.target.c_str(), trace.id);
                 if (umount2(trace.target.c_str(), MNT_DETACH) == 0) {

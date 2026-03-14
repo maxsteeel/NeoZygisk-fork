@@ -210,7 +210,10 @@ struct ZygiskModule {
     void setOption(zygisk::Option opt);
     static uint32_t getFlags();
     bool tryUnload() const;
-    void clearApi() { memzero(&api, sizeof(api)); memzero(&mod, sizeof(mod)); }
+    void clearApi() {
+        memzero(&api, sizeof(api));
+        memzero(&mod, sizeof(mod));
+    }
     int getId() const { return id; }
 
     ZygiskModule(int id, void *handle, void *entry);
@@ -272,14 +275,16 @@ struct ZygiskContext {
     struct RegisterInfo {
         bool is_regex;
         regex_t regex;
-        char literal[128]; 
+        char literal[128];
         char symbol[128];
         void *callback;
         void **backup;
     };
 
     struct IgnoreInfo {
+        bool is_regex;
         regex_t regex;
+        char literal[128];
         char symbol[128];
     };
 
