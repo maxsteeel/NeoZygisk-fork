@@ -521,8 +521,8 @@ bool abort_zygote_unmount(const std::vector<mount_info> &traces, uint32_t info_f
     }
     bool is_magisk = info_flags & PROCESS_ROOT_IS_MAGISK;
     for (const auto &trace : traces) {
-        if (trace.target.rfind("/product", 0) == 0) {
-            if (trace.target.rfind("/product/bin", 0) == 0) continue;
+        if (trace.target.starts_with("/product")) {
+            if (trace.target.starts_with("/product/bin")) continue;
             if (!is_magisk && trace.target != "/product") continue;
             // workaround for zygote resource overlay (JingMatrix/NeoZygisk#26)
             LOGV("abort unmounting zygote due to prohibited target: [%s]", trace.raw_info.c_str());
