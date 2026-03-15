@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstring>
 #include <unistd.h>
+#include <fcntl.h>
+#include "daemon.hpp"
 
 using sFILE = std::unique_ptr<FILE, decltype(&fclose)>;
 using sDIR = std::unique_ptr<DIR, decltype(&closedir)>;
@@ -31,13 +33,10 @@ static inline sFILE xopen_file(const char *path, const char *mode) {
 static inline sFILE xopen_file(int fd, const char *mode) { return make_file(fdopen(fd, mode)); }
 
 template <typename Func>
-inline void file_readline(bool trim, FILE *fp, Func fn) {
-    if (!fp) return;
-
-    char buf[4096]; 
-    int fd = fileno(fp);
+inline void file_readline(bool trim, int fd, Func fn) {
     if (fd < 0) return;
 
+    char buf[4096]; 
     ssize_t bytes_read;
     size_t current_pos = 0;
 
@@ -81,8 +80,14 @@ inline void file_readline(bool trim, FILE *fp, Func fn) {
 }
 
 template <typename Func>
+inline void file_readline(bool trim, FILE *fp, Func fn) {
+    if (fp) file_readline(trim, fileno(fp), fn);
+}
+
+template <typename Func>
 inline void file_readline(bool trim, const char *file, Func fn) {
-    if (auto fp = open_file(file, "re")) file_readline(trim, fp.get(), fn);
+    UniqueFd fd(open(file, O_RDONLY | O_CLOEXEC));
+    file_readline(trim, fd, fn);
 }
 
 template <typename Func>
