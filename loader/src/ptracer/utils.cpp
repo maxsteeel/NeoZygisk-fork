@@ -24,6 +24,107 @@
 
 #include "logging.hpp"
 
+static bool ParseMapLine(const char* buffer, MapInfo& ref) {
+    const char* p = buffer;
+
+    // Inline hex parsing
+    uintptr_t start = 0;
+    while (true) {
+        char c = *p;
+        if (c >= '0' && c <= '9') start = (start << 4) | (c - '0');
+        else if (c >= 'a' && c <= 'f') start = (start << 4) | (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') start = (start << 4) | (c - 'A' + 10);
+        else break;
+        p++;
+    }
+    if (*p++ != '-') return false;
+
+    uintptr_t end = 0;
+    while (true) {
+        char c = *p;
+        if (c >= '0' && c <= '9') end = (end << 4) | (c - '0');
+        else if (c >= 'a' && c <= 'f') end = (end << 4) | (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') end = (end << 4) | (c - 'A' + 10);
+        else break;
+        p++;
+    }
+    if (*p++ != ' ') return false;
+
+    char perm[4];
+    perm[0] = *p++;
+    perm[1] = *p++;
+    perm[2] = *p++;
+    bool is_private = (*p++ == 'p');
+    if (*p++ != ' ') return false;
+
+    uintptr_t off = 0;
+    while (true) {
+        char c = *p;
+        if (c >= '0' && c <= '9') off = (off << 4) | (c - '0');
+        else if (c >= 'a' && c <= 'f') off = (off << 4) | (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') off = (off << 4) | (c - 'A' + 10);
+        else break;
+        p++;
+    }
+    if (*p++ != ' ') return false;
+
+    unsigned int dev_major = 0;
+    while (true) {
+        char c = *p;
+        if (c >= '0' && c <= '9') dev_major = (dev_major << 4) | (c - '0');
+        else if (c >= 'a' && c <= 'f') dev_major = (dev_major << 4) | (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') dev_major = (dev_major << 4) | (c - 'A' + 10);
+        else break;
+        p++;
+    }
+    if (*p++ != ':') return false;
+
+    unsigned int dev_minor = 0;
+    while (true) {
+        char c = *p;
+        if (c >= '0' && c <= '9') dev_minor = (dev_minor << 4) | (c - '0');
+        else if (c >= 'a' && c <= 'f') dev_minor = (dev_minor << 4) | (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') dev_minor = (dev_minor << 4) | (c - 'A' + 10);
+        else break;
+        p++;
+    }
+    if (*p++ != ' ') return false;
+
+    ino_t inode = 0;
+    while (true) {
+        char c = *p;
+        if (c >= '0' && c <= '9') inode = inode * 10 + (c - '0');
+        else break;
+        p++;
+    }
+
+    while (*p == ' ') p++;
+
+    uint8_t perms = 0;
+    if (perm[0] == 'r') perms |= PROT_READ;
+    if (perm[1] == 'w') perms |= PROT_WRITE;
+    if (perm[2] == 'x') perms |= PROT_EXEC;
+
+    ref.start = start;
+    ref.end = end;
+    ref.perms = perms;
+    ref.is_private = is_private;
+    ref.offset = off;
+    ref.dev = static_cast<dev_t>(makedev(dev_major, dev_minor));
+    ref.inode = inode;
+
+    size_t i = 0;
+    while (char c = *p++) {
+        if (c == '\n') break;
+        if (i < sizeof(ref.path) - 1) {
+            ref.path[i++] = c;
+        }
+    }
+    ref.path[i] = '\0';
+
+    return true;
+}
+
 /**
  * @brief Scans and parses the /proc/[pid]/maps file for a given process.
  * @param pid The process ID to scan, or -1 for "self".
@@ -51,103 +152,10 @@ std::vector<MapInfo> MapInfo::Scan(int pid) {
 
     char buffer[8196];
     while (fgets(buffer, sizeof(buffer), maps.get())) {
-        char* p = buffer;
-
-        // Inline hex parsing
-        uintptr_t start = 0;
-        while (true) {
-            char c = *p;
-            if (c >= '0' && c <= '9') start = (start << 4) | (c - '0');
-            else if (c >= 'a' && c <= 'f') start = (start << 4) | (c - 'a' + 10);
-            else if (c >= 'A' && c <= 'F') start = (start << 4) | (c - 'A' + 10);
-            else break;
-            p++;
+        info.emplace_back(); 
+        if (!ParseMapLine(buffer, info.back())) {
+            info.pop_back(); 
         }
-        if (*p++ != '-') continue;
-
-        uintptr_t end = 0;
-        while (true) {
-            char c = *p;
-            if (c >= '0' && c <= '9') end = (end << 4) | (c - '0');
-            else if (c >= 'a' && c <= 'f') end = (end << 4) | (c - 'a' + 10);
-            else if (c >= 'A' && c <= 'F') end = (end << 4) | (c - 'A' + 10);
-            else break;
-            p++;
-        }
-        if (*p++ != ' ') continue;
-
-        char perm[4];
-        perm[0] = *p++;
-        perm[1] = *p++;
-        perm[2] = *p++;
-        bool is_private = (*p++ == 'p');
-        if (*p++ != ' ') continue;
-
-        uintptr_t off = 0;
-        while (true) {
-            char c = *p;
-            if (c >= '0' && c <= '9') off = (off << 4) | (c - '0');
-            else if (c >= 'a' && c <= 'f') off = (off << 4) | (c - 'a' + 10);
-            else if (c >= 'A' && c <= 'F') off = (off << 4) | (c - 'A' + 10);
-            else break;
-            p++;
-        }
-        if (*p++ != ' ') continue;
-
-        unsigned int dev_major = 0;
-        while (true) {
-            char c = *p;
-            if (c >= '0' && c <= '9') dev_major = (dev_major << 4) | (c - '0');
-            else if (c >= 'a' && c <= 'f') dev_major = (dev_major << 4) | (c - 'a' + 10);
-            else if (c >= 'A' && c <= 'F') dev_major = (dev_major << 4) | (c - 'A' + 10);
-            else break;
-            p++;
-        }
-        if (*p++ != ':') continue;
-
-        unsigned int dev_minor = 0;
-        while (true) {
-            char c = *p;
-            if (c >= '0' && c <= '9') dev_minor = (dev_minor << 4) | (c - '0');
-            else if (c >= 'a' && c <= 'f') dev_minor = (dev_minor << 4) | (c - 'a' + 10);
-            else if (c >= 'A' && c <= 'F') dev_minor = (dev_minor << 4) | (c - 'A' + 10);
-            else break;
-            p++;
-        }
-        if (*p++ != ' ') continue;
-
-        ino_t inode = 0;
-        while (true) {
-            char c = *p;
-            if (c >= '0' && c <= '9') inode = inode * 10 + (c - '0');
-            else break;
-            p++;
-        }
-
-        while (*p == ' ') p++;
-
-        uint8_t perms = 0;
-        if (perm[0] == 'r') perms |= PROT_READ;
-        if (perm[1] == 'w') perms |= PROT_WRITE;
-        if (perm[2] == 'x') perms |= PROT_EXEC;
-
-        auto &ref = info.emplace_back(MapInfo{start,
-                                              end,
-                                              perms,
-                                              is_private,
-                                              off,
-                                              static_cast<dev_t>(makedev(dev_major, dev_minor)),
-                                              inode,
-                                              {0}});
-
-        size_t i = 0;
-        while (char c = *p++) {
-            if (c == '\n') break;
-            if (i < sizeof(ref.path) - 1) {
-                ref.path[i++] = c;
-            }
-        }
-        ref.path[i] = '\0';
     }
     return info;
 }
