@@ -55,7 +55,7 @@ bool inject_on_main(int pid, const char *lib_path) {
 
     // Backup of the target's registers, to be restored before detaching.
     struct user_regs_struct regs{}, backup{};
-    auto map = MapInfo::Scan(std::to_string(pid));
+    auto map = MapInfo::Scan(pid);
     if (!get_regs(pid, regs)) {
         LOGE("failed to get registers for PID %d, injection aborted", pid);
         return false;
@@ -188,12 +188,12 @@ bool inject_on_main(int pid, const char *lib_path) {
 
     // Backup the current registers before we start making remote calls.
     memcpy(&backup, &regs, sizeof(regs));
-    map = MapInfo::Scan(std::to_string(pid));  // Re-scan maps as they may have changed.
+    map = MapInfo::Scan(pid);  // Re-scan maps as they may have changed.
     auto local_map = MapInfo::Scan();
     
     // Find libc.so return address and path for CSOLoader
     auto libc_return_addr = find_module_return_addr(map, "libc.so");
-    std::string libc_path_str = "";
+    const char* libc_path_str = nullptr;
     for (const auto &info : map) {
         // Strict check: make sure the filename is exactly libc.so
         const char *filename = strrchr(info.path, '/');
@@ -204,7 +204,7 @@ bool inject_on_main(int pid, const char *lib_path) {
         }
     }
 
-    if (libc_path_str.empty()) {
+    if (libc_path_str == nullptr) {
         LOGE("could not locate libc.so in remote maps");
         return false;
     }
@@ -216,7 +216,7 @@ bool inject_on_main(int pid, const char *lib_path) {
     size_t init_count = 0;
 
     if (!remote_csoloader_load_and_resolve_entry(pid, &regs, (uintptr_t)libc_return_addr, 
-                                                 local_map, map, libc_path_str.c_str(), 
+                                                 local_map, map, libc_path_str,
                                                  lib_path, &remote_base, &remote_size, &injector_entry,
                                                  &init_array, &init_count)) {
         LOGE("CSOLoader failed to map the library remotely");
@@ -227,15 +227,16 @@ bool inject_on_main(int pid, const char *lib_path) {
 
     LOGI("CSOLoader success. entry: 0x%" PRIxPTR, injector_entry);
 
-    std::vector<long> args;
-    args.push_back((long)remote_base);
-    args.push_back((long)remote_size);
     auto remote_tmp_path = push_string(pid, regs, zygiskd::GetTmpPath().c_str());
-    args.push_back((long)remote_tmp_path);
-    args.push_back((long)init_array); // Argumento 4
-    args.push_back((long)init_count); // Argumento 5
+    long args[] = {
+        (long)remote_base,
+        (long)remote_size,
+        (long)remote_tmp_path,
+        (long)init_array, // Argument 4
+        (long)init_count  // Argument 5
+    };
 
-    remote_call(pid, regs, injector_entry, (uintptr_t)libc_return_addr, args);
+    remote_call(pid, regs, injector_entry, (uintptr_t)libc_return_addr, args, 5);
 
     bool injector_ok = false;
 #if defined(__arm__)

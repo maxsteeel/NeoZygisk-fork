@@ -26,16 +26,21 @@
 
 /**
  * @brief Scans and parses the /proc/[pid]/maps file for a given process.
- * @param pid The process ID to scan, as a string ("self" is also valid).
+ * @param pid The process ID to scan, or -1 for "self".
  * @return A vector of MapInfo structs, each representing a memory mapping.
  */
-std::vector<MapInfo> MapInfo::Scan(const std::string &pid) {
+std::vector<MapInfo> MapInfo::Scan(int pid) {
     std::vector<MapInfo> info;
-    std::string file_name = "/proc/" + pid + "/maps";
-    auto maps = std::unique_ptr<FILE, decltype(&fclose)>{fopen(file_name.c_str(), "r"), &fclose};
+    char file_name[64];
+    if (pid == -1) {
+        strcpy(file_name, "/proc/self/maps");
+    } else {
+        snprintf(file_name, sizeof(file_name), "/proc/%d/maps", pid);
+    }
+    auto maps = std::unique_ptr<FILE, decltype(&fclose)>{fopen(file_name, "r"), &fclose};
 
     if (!maps) {
-        PLOGE("fopen %s", file_name.c_str());
+        PLOGE("fopen %s", file_name);
         return info;
     }
 
@@ -357,23 +362,23 @@ uintptr_t push_string(int pid, struct user_regs_struct &regs, const char *str) {
  * @return The return value of the remote function, or 0 on failure.
  */
 uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr,
-                      uintptr_t return_addr, std::vector<long> &args) {
+                      uintptr_t return_addr, const long *args, size_t argc) {
     align_stack(regs);
     LOGV("calling remote function 0x%" PRIxPTR " with %zu args, return to 0x%" PRIxPTR, func_addr,
-         args.size(), return_addr);
+         argc, return_addr);
 
 #if defined(__x86_64__)
     // ABI: rdi, rsi, rdx, rcx, r8, r9, then stack
-    if (args.size() > 0) regs.rdi = args[0];
-    if (args.size() > 1) regs.rsi = args[1];
-    if (args.size() > 2) regs.rdx = args[2];
-    if (args.size() > 3) regs.rcx = args[3];
-    if (args.size() > 4) regs.r8 = args[4];
-    if (args.size() > 5) regs.r9 = args[5];
-    if (args.size() > 6) {
-        size_t stack_args_size = (args.size() - 6) * sizeof(long);
+    if (argc > 0) regs.rdi = args[0];
+    if (argc > 1) regs.rsi = args[1];
+    if (argc > 2) regs.rdx = args[2];
+    if (argc > 3) regs.rcx = args[3];
+    if (argc > 4) regs.r8 = args[4];
+    if (argc > 5) regs.r9 = args[5];
+    if (argc > 6) {
+        size_t stack_args_size = (argc - 6) * sizeof(long);
         regs.REG_SP -= stack_args_size;
-        if (write_proc(pid, regs.REG_SP, args.data() + 6, stack_args_size) !=
+        if (write_proc(pid, regs.REG_SP, args + 6, stack_args_size) !=
             (ssize_t) stack_args_size) {
             LOGE("failed to push stack arguments for x86_64 call");
             return 0;
@@ -390,10 +395,10 @@ uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_add
 #elif defined(__i386__)
     // ABI: All arguments on stack, pushed in reverse order.
     // Our vector is already in the correct order to write in one block.
-    if (!args.empty()) {
-        size_t stack_args_size = args.size() * sizeof(long);
+    if (argc > 0) {
+        size_t stack_args_size = argc * sizeof(long);
         regs.REG_SP -= stack_args_size;
-        if (write_proc(pid, regs.REG_SP, args.data(), stack_args_size) !=
+        if (write_proc(pid, regs.REG_SP, args, stack_args_size) !=
             (ssize_t) stack_args_size) {
             LOGE("failed to push arguments for i386 call");
             return 0;
@@ -409,13 +414,13 @@ uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_add
 
 #elif defined(__aarch64__)
     // ABI: x0-x7, then stack
-    for (size_t i = 0; i < args.size() && i < 8; i++) {
+    for (size_t i = 0; i < argc && i < 8; i++) {
         regs.regs[i] = args[i];
     }
-    if (args.size() > 8) {
-        size_t stack_args_size = (args.size() - 8) * sizeof(long);
+    if (argc > 8) {
+        size_t stack_args_size = (argc - 8) * sizeof(long);
         regs.REG_SP -= stack_args_size;
-        if (write_proc(pid, regs.REG_SP, args.data() + 8, stack_args_size) !=
+        if (write_proc(pid, regs.REG_SP, args + 8, stack_args_size) !=
             (ssize_t) stack_args_size) {
             LOGE("failed to push stack arguments for aarch64 call");
             return 0;
@@ -426,13 +431,13 @@ uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_add
 
 #elif defined(__arm__)
     // ABI: r0-r3, then stack
-    for (size_t i = 0; i < args.size() && i < 4; i++) {
+    for (size_t i = 0; i < argc && i < 4; i++) {
         regs.uregs[i] = args[i];
     }
-    if (args.size() > 4) {
-        size_t stack_args_size = (args.size() - 4) * sizeof(long);
+    if (argc > 4) {
+        size_t stack_args_size = (argc - 4) * sizeof(long);
         regs.REG_SP -= stack_args_size;
-        if (write_proc(pid, (uintptr_t) regs.REG_SP, args.data() + 4, stack_args_size) !=
+        if (write_proc(pid, (uintptr_t) regs.REG_SP, args + 4, stack_args_size) !=
             (ssize_t) stack_args_size) {
             LOGE("failed to push stack arguments for arm call");
             return 0;
@@ -668,18 +673,16 @@ std::string parse_status(int status) {
 
 /**
  * @brief Gets the executable path of a process from /proc/[pid]/exe.
- * @return The path to the executable, or an empty string on failure.
+ * @return true on success, false on failure.
  */
-std::string get_program(int pid) {
+bool get_program(int pid, char* buf, size_t buf_size) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/exe", pid);
-    constexpr const auto SIZE = 256;
-    char buf[SIZE + 1];
-    auto sz = readlink(path, buf, SIZE);
+    auto sz = readlink(path, buf, buf_size - 1);
     if (sz == -1) {
         PLOGE("readlink /proc/%d/exe", pid);
-        return "";
+        return false;
     }
     buf[sz] = 0;
-    return buf;
+    return true;
 }

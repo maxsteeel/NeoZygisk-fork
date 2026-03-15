@@ -35,7 +35,7 @@ public:
     void set_daemon_crashed(std::string_view error);
 
     const char* const abi_name_;
-    const std::string program_path_;
+    const char* const program_path_;
 
 private:
     bool is_in_crash_loop();
