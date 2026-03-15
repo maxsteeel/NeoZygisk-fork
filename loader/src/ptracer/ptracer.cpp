@@ -50,17 +50,8 @@
  * @param lib_path The absolute path to the shared library to be injected.
  * @return True on successful injection, false otherwise.
  */
-bool inject_on_main(int pid, const char *lib_path) {
-    LOGI("starting library injection for PID: %d, library: %s", pid, lib_path);
-
-    // Backup of the target's registers, to be restored before detaching.
-    struct user_regs_struct regs{}, backup{};
-    auto map = MapInfo::Scan(pid);
-    if (!get_regs(pid, regs)) {
-        LOGE("failed to get registers for PID %d, injection aborted", pid);
-        return false;
-    }
-
+static bool find_entry_point(int pid, const struct user_regs_struct &regs, uintptr_t &entry_addr,
+                             uintptr_t &addr_of_entry_addr) {
     // --- Step 1 & 2: Parse Kernel Argument Block to Find Entry Point ---
     // The stack pointer (SP) at process startup points to the Kernel Argument Block.
     // We parse this structure to locate argc, argv, envp, and the auxiliary vector (auxv).
@@ -93,8 +84,8 @@ bool inject_on_main(int pid, const char *lib_path) {
 
     // Now, scan the auxiliary vector to find AT_ENTRY. This gives us the program's
     // entry address, which is where execution will begin.
-    uintptr_t entry_addr = 0;
-    uintptr_t addr_of_entry_addr = 0;
+    entry_addr = 0;
+    addr_of_entry_addr = 0;
     auto v = auxv;
     while (true) {
         ElfW(auxv_t) buf;
@@ -116,7 +107,11 @@ bool inject_on_main(int pid, const char *lib_path) {
         return false;
     }
     LOGI("found program entry point at 0x%" PRIxPTR, entry_addr);
+    return true;
+}
 
+static bool hijack_and_wait(int pid, uintptr_t entry_addr, uintptr_t addr_of_entry_addr,
+                            struct user_regs_struct &regs) {
     // --- Step 3: Hijack Execution Flow ---
     // We replace the program's entry point with an invalid address. This causes a SIGSEGV
     // as soon as we resume the process, allowing us to regain control at the perfect time.
@@ -178,7 +173,12 @@ bool inject_on_main(int pid, const char *lib_path) {
     }
 
     LOGI("successfully intercepted process %d at its entry point", pid);
+    return true;
+}
 
+static bool execute_remote_injection(int pid, const char *lib_path, uintptr_t entry_addr,
+                                     uintptr_t addr_of_entry_addr, struct user_regs_struct &regs,
+                                     struct user_regs_struct &backup) {
     // --- Step 4: Remote Code Execution ---
     // First, restore the original entry point in memory.
     if (!write_proc(pid, addr_of_entry_addr, &entry_addr, sizeof(entry_addr))) {
@@ -188,7 +188,7 @@ bool inject_on_main(int pid, const char *lib_path) {
 
     // Backup the current registers before we start making remote calls.
     memcpy(&backup, &regs, sizeof(regs));
-    map = MapInfo::Scan(pid);  // Re-scan maps as they may have changed.
+    auto map = MapInfo::Scan(pid);  // Re-scan maps as they may have changed.
     auto local_map = MapInfo::Scan();
     
     // Find libc.so return address and path for CSOLoader
@@ -249,6 +249,33 @@ bool inject_on_main(int pid, const char *lib_path) {
         LOGE("injector entry faulted at unexpected IP: %p", (void*)regs.REG_IP);
         backup.REG_IP = (long) entry_addr;
         set_regs(pid, backup);
+        return false;
+    }
+
+    return true;
+}
+
+bool inject_on_main(int pid, const char *lib_path) {
+    LOGI("starting library injection for PID: %d, library: %s", pid, lib_path);
+
+    // Backup of the target's registers, to be restored before detaching.
+    struct user_regs_struct regs{}, backup{};
+    if (!get_regs(pid, regs)) {
+        LOGE("failed to get registers for PID %d, injection aborted", pid);
+        return false;
+    }
+
+    uintptr_t entry_addr = 0;
+    uintptr_t addr_of_entry_addr = 0;
+    if (!find_entry_point(pid, regs, entry_addr, addr_of_entry_addr)) {
+        return false;
+    }
+
+    if (!hijack_and_wait(pid, entry_addr, addr_of_entry_addr, regs)) {
+        return false;
+    }
+
+    if (!execute_remote_injection(pid, lib_path, entry_addr, addr_of_entry_addr, regs, backup)) {
         return false;
     }
 
