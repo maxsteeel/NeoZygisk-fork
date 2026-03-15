@@ -247,7 +247,7 @@ static uintptr_t smart_resolve_symbol(const char* sym_name, const std::vector<Ma
 static bool resolve_symbol_addr(int fd, const elf_dyn_info *info,
                                 const std::vector<MapInfo>& local_map,
                                 const std::vector<MapInfo>& remote_map,
-                                const std::vector<std::string>& needed_paths,
+                                const std::vector<const char*>& needed_paths,
                                 uintptr_t load_bias, size_t sym_idx, uintptr_t *out_addr) {
     ElfW(Sym) sym;
     if (!read_loop_offset(fd, &sym, sizeof(sym), info->symtab_off + (off_t)(sym_idx * info->syment))) return false;
@@ -275,8 +275,8 @@ static bool resolve_symbol_addr(int fd, const elf_dyn_info *info,
     }
 
     for (const auto& mod_path : needed_paths) {
-        if (mod_path.empty()) continue;
-        void *addr = find_func_addr(local_map, remote_map, mod_path.c_str(), name);
+        if (!mod_path || !*mod_path) continue;
+        void *addr = find_func_addr(local_map, remote_map, mod_path, name);
         if (addr) { *out_addr = (uintptr_t)addr; return true; }
     }
     
@@ -289,7 +289,7 @@ static bool write_remote_addr(int pid, uintptr_t addr, ElfW(Addr) value) { retur
 static bool apply_rela_section(int pid, int fd, [[maybe_unused]] const elf_dyn_info *info,
                                [[maybe_unused]] const std::vector<MapInfo>& local_map,
                                [[maybe_unused]] const std::vector<MapInfo>& remote_map,
-                               [[maybe_unused]] const std::vector<std::string>& needed_paths,
+                               [[maybe_unused]] const std::vector<const char*>& needed_paths,
                                uintptr_t load_bias, off_t rela_off, size_t rela_sz) {
     size_t count = rela_sz / sizeof(ElfW(Rela));
     for (size_t i = 0; i < count; i++) {
@@ -327,7 +327,7 @@ static bool apply_rela_section(int pid, int fd, [[maybe_unused]] const elf_dyn_i
 static bool apply_rel_section(int pid, int fd, [[maybe_unused]] const elf_dyn_info *info,
                               [[maybe_unused]] const std::vector<MapInfo>& local_map,
                               [[maybe_unused]] const std::vector<MapInfo>& remote_map,
-                              [[maybe_unused]] const std::vector<std::string>& needed_paths,
+                              [[maybe_unused]] const std::vector<const char*>& needed_paths,
                               uintptr_t load_bias, off_t rel_off, size_t rel_sz) {
     size_t count = rel_sz / sizeof(ElfW(Rel));
     for (size_t i = 0; i < count; i++) {
@@ -407,22 +407,25 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     if (!mmap_addr || !mprotect_addr || !open_addr || !close_addr || !syscall_addr || !munmap_addr) { close(fd); return false; }
 
     size_t path_len = strlen(lib_path) + 1;
-    std::vector<long> args = {0, (long)path_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
+    long args_mmap1[] = {0, (long)path_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
     struct user_regs_struct call_regs = regs_saved;
-    uintptr_t remote_path = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args);
+    uintptr_t remote_path = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args_mmap1, 6);
     if (!remote_path || remote_path == (uintptr_t)MAP_FAILED) { close(fd); return false; }
     write_proc(pid, remote_path, lib_path, path_len);
 
-    args = {(long)remote_path, O_RDONLY | O_CLOEXEC, 0};
+    long args_open[] = {(long)remote_path, O_RDONLY | O_CLOEXEC, 0};
     call_regs = regs_saved;
-    long remote_fd = (long)remote_call(pid, call_regs, (uintptr_t)open_addr, libc_return_addr, args);
+    long remote_fd = (long)remote_call(pid, call_regs, (uintptr_t)open_addr, libc_return_addr, args_open, 3);
 
-    std::vector<char> zeros(path_len, 0);
-    write_proc(pid, remote_path, zeros.data(), path_len);
+    char zeros[512] = {0};
+    for (size_t offset = 0; offset < path_len; offset += sizeof(zeros)) {
+        size_t chunk = (path_len - offset < sizeof(zeros)) ? (path_len - offset) : sizeof(zeros);
+        write_proc(pid, remote_path + offset, zeros, chunk);
+    }
 
-    args = {(long)remote_path, (long)path_len};
+    long args_munmap1[] = {(long)remote_path, (long)path_len};
     call_regs = regs_saved;
-    remote_call(pid, call_regs, (uintptr_t)munmap_addr, libc_return_addr, args);
+    remote_call(pid, call_regs, (uintptr_t)munmap_addr, libc_return_addr, args_munmap1, 2);
 
     if (remote_fd < 0) { close(fd); return false; }
 
@@ -437,20 +440,20 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     memfd_syscall_num = 356;
 #endif
 
-    args = {0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
+    long args_mmap2[] = {0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
     call_regs = regs_saved;
-    uintptr_t name_addr = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args);
-    const char* fake_name = "zygote_ext";
+    uintptr_t name_addr = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args_mmap2, 6);
+    const char* fake_name = "jit-cache";
     write_proc(pid, name_addr, fake_name, strlen(fake_name) + 1);
 
-    args = {memfd_syscall_num, (long)name_addr, MFD_CLOEXEC};
+    long args_syscall_memfd[] = {memfd_syscall_num, (long)name_addr, MFD_CLOEXEC};
     call_regs = regs_saved;
-    long memfd = (long)remote_call(pid, call_regs, (uintptr_t)syscall_addr, libc_return_addr, args);
+    long memfd = (long)remote_call(pid, call_regs, (uintptr_t)syscall_addr, libc_return_addr, args_syscall_memfd, 3);
 
-    args = {(long)name_addr, 4096};
+    long args_munmap2[] = {(long)name_addr, 4096};
     if (munmap_addr) {
         call_regs = regs_saved;
-        remote_call(pid, call_regs, (uintptr_t)munmap_addr, libc_return_addr, args);
+        remote_call(pid, call_regs, (uintptr_t)munmap_addr, libc_return_addr, args_munmap2, 2);
     }
 
     uintptr_t remote_base = 0;
@@ -466,22 +469,22 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
 #elif defined(__i386__)
         ftruncate_syscall = 93;
 #endif
-        args = {ftruncate_syscall, memfd, (long)map_size};
+        long args_syscall_ftruncate[] = {ftruncate_syscall, memfd, (long)map_size};
         call_regs = regs_saved;
-        remote_call(pid, call_regs, (uintptr_t)syscall_addr, libc_return_addr, args);
+        remote_call(pid, call_regs, (uintptr_t)syscall_addr, libc_return_addr, args_syscall_ftruncate, 3);
 
-        args = {0, (long)map_size, PROT_NONE, MAP_SHARED, memfd, 0};
+        long args_mmap_shared[] = {0, (long)map_size, PROT_NONE, MAP_SHARED, memfd, 0};
         call_regs = regs_saved;
-        remote_base = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args);
+        remote_base = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args_mmap_shared, 6);
 
-        args = {memfd};
+        long args_close[] = {memfd};
         call_regs = regs_saved;
-        remote_call(pid, call_regs, (uintptr_t)close_addr, libc_return_addr, args);
+        remote_call(pid, call_regs, (uintptr_t)close_addr, libc_return_addr, args_close, 1);
     } else {
         LOGW("CSOLoader: memfd_create failed, falling back to anonymous memory");
-        args = {0, (long)map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
+        long args_mmap_anon[] = {0, (long)map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
         call_regs = regs_saved;
-        remote_base = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args);
+        remote_base = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args_mmap_anon, 6);
     }
 
     if (!remote_base || remote_base == (uintptr_t)MAP_FAILED) { close(fd); return false; }
@@ -505,20 +508,23 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
 
         if (phdr[i].p_filesz > 0) {
             call_regs = regs_saved;
-            args = {(long)seg_page, (long)(file_page_end - seg_page), PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, remote_fd, (long)file_page_offset};
-            uintptr_t seg_map = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args);
+            long args_mmap_seg[] = {(long)seg_page, (long)(file_page_end - seg_page), PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, remote_fd, (long)file_page_offset};
+            uintptr_t seg_map = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args_mmap_seg, 6);
             if (!seg_map || seg_map == (uintptr_t)MAP_FAILED) return false;
 
             if (is_writable && file_page_end > file_end) {
                 size_t tail_len = (size_t)(file_page_end - file_end);
-                std::vector<char> zeros(tail_len, 0);
-                write_proc(pid, file_end, zeros.data(), tail_len);
+                char zeros[512] = {0};
+                for (size_t offset = 0; offset < tail_len; offset += sizeof(zeros)) {
+                    size_t chunk = (tail_len - offset < sizeof(zeros)) ? (tail_len - offset) : sizeof(zeros);
+                    write_proc(pid, file_end + offset, zeros, chunk);
+                }
             }
         }
         if (seg_page_end > file_page_end) {
             call_regs = regs_saved;
-            args = {(long)file_page_end, (long)(seg_page_end - file_page_end), PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
-            uintptr_t bss_map = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args);
+            long args_mmap_bss[] = {(long)file_page_end, (long)(seg_page_end - file_page_end), PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
+            uintptr_t bss_map = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args_mmap_bss, 6);
             if (!bss_map || bss_map == (uintptr_t)MAP_FAILED) return false;
         }
         int prot = 0;
@@ -529,13 +535,13 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     }
 
     call_regs = regs_saved;
-    args = {remote_fd};
-    remote_call(pid, call_regs, (uintptr_t)close_addr, libc_return_addr, args);
+    long args_close_fd[] = {remote_fd};
+    remote_call(pid, call_regs, (uintptr_t)close_addr, libc_return_addr, args_close_fd, 1);
 
     elf_dyn_info dinfo;
     if (!elf_load_dyn_info(fd, &eh, phdr, &dinfo)) return false;
 
-    std::vector<std::string> needed_paths(dinfo.needed_str_offsets.size());
+    std::vector<const char*> needed_paths(dinfo.needed_str_offsets.size(), nullptr);
     for (size_t i = 0; i < dinfo.needed_str_offsets.size(); i++) {
         size_t off = dinfo.needed_str_offsets[i];
         if (off < dinfo.strsz) {
@@ -554,8 +560,8 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
 
     for (const auto& s : segs) {
         call_regs = regs_saved;
-        args = {(long)s.addr, (long)s.len, s.prot};
-        remote_call(pid, call_regs, (uintptr_t)mprotect_addr, libc_return_addr, args);
+        long args_mprotect[] = {(long)s.addr, (long)s.len, s.prot};
+        remote_call(pid, call_regs, (uintptr_t)mprotect_addr, libc_return_addr, args_mprotect, 3);
     }
 
     ElfW(Addr) entry_value = 0;

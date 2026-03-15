@@ -30,7 +30,7 @@ struct MapInfo {
     /// \brief Scans /proc/self/maps and returns a list of \ref MapInfo entries.
     /// This is useful to find out the inode of the library to hook.
     /// \return A list of \ref MapInfo entries.
-    static std::vector<MapInfo> Scan(const std::string &pid = "self");
+    static std::vector<MapInfo> Scan(int pid = -1);
 };
 
 #if defined(__x86_64__)
@@ -75,7 +75,7 @@ void align_stack(struct user_regs_struct &regs, long preserve = 0);
 uintptr_t push_string(int pid, struct user_regs_struct &regs, const char *str);
 
 uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_addr,
-                      uintptr_t return_addr, std::vector<long> &args);
+                      uintptr_t return_addr, const long *args, size_t argc);
 
 int fork_dont_care();
 
@@ -110,5 +110,5 @@ inline const char *sigabbrev_np(int sig) {
     return "(unknown)";
 }
 
-std::string get_program(int pid);
+bool get_program(int pid, char* buf, size_t buf_size);
 void *find_module_return_addr(const std::vector<MapInfo> &info, std::string_view suffix);

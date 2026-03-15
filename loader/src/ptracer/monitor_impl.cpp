@@ -545,8 +545,11 @@ void AppMonitor::SigChldHandler::handleTracedProcess(int pid, int &status) {
  *         false if the process is irrelevant and should be detached.
  */
 bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
-    auto program = get_program(pid);
-    LOGV("process %d executed program: %s", pid, program.c_str());
+    char program[256];
+    if (!get_program(pid, program, sizeof(program))) {
+        return false;
+    }
+    LOGV("process %d executed program: %s", pid, program);
 
     bool handled = false;
 
@@ -554,7 +557,7 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
         // --- Intermediate Stub Identification ---
         // If this program is a stub_zygote, we must promote it to a Process Factory.
         // It will remain attached forever so we can shield it from SIGCHLD.
-        if (program.find("stub_zygote") != std::string::npos) {
+        if (strstr(program, "stub_zygote") != nullptr) {
             LOGI("detected stub zygote at %d, promoting to parent monitor", pid);
             stub_processes_.push_back(pid);
 
@@ -572,7 +575,7 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
             break;
         }
 
-        if (program != monitor_.get_abi_manager().program_path_) {
+        if (strcmp(program, monitor_.get_abi_manager().program_path_) != 0) {
             break;  // Irrelevant program, exit block and return false.
         }
 
