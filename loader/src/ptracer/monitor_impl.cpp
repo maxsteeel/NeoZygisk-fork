@@ -138,6 +138,18 @@ bool AppMonitor::prepare_environment() {
     return true;
 }
 
+static inline bool contains(const std::vector<int>& vec, int pid) {
+    return std::find(vec.begin(), vec.end(), pid) != vec.end();
+}
+
+static inline void fast_erase(std::vector<int>& vec, int pid) {
+    auto it = std::find(vec.begin(), vec.end(), pid);
+    if (it != vec.end()) {
+        *it = vec.back();
+        vec.pop_back();
+    }
+}
+
 void AppMonitor::run() {
     socket_handler_.Init();
     ptrace_handler_.Init();
@@ -376,8 +388,7 @@ void AppMonitor::SigChldHandler::HandleEvent(EventLoop &, uint32_t) {
 void AppMonitor::SigChldHandler::handleChildEvent(int pid, int &status) {
     // Role 1: Process Factories (Init and Stub Zygotes)
     // These processes are monitored for PTRACE_EVENT_FORK to discover new children.
-    if (pid == 1 ||
-        std::find(stub_processes_.begin(), stub_processes_.end(), pid) != stub_processes_.end()) {
+    if (pid == 1 || contains(stub_processes_, pid)) {
         handleParentEvent(pid, status);
         return;
     }
@@ -391,7 +402,7 @@ void AppMonitor::SigChldHandler::handleChildEvent(int pid, int &status) {
     // Role 3 & 4: Transitioning Candidates and New Discoveries
     // If the process is known to be in the pre-exec stage, evaluate its state.
     // Otherwise, treat it as a newly discovered process.
-    if (std::find(process_.begin(), process_.end(), pid) != process_.end()) {
+    if (contains(process_, pid)) {
         handleTracedProcess(pid, status);
     } else {
         handleNewProcess(pid);
@@ -426,8 +437,7 @@ void AppMonitor::SigChldHandler::handleParentEvent(int pid, int &status) {
     // Case 3: An intermediate stub process died naturally or crashed.
     else if (pid != 1 && (WIFEXITED(status) || WIFSIGNALED(status))) {
         LOGI("stub process %d exited (status: %d)", pid, status);
-        auto it = std::find(stub_processes_.begin(), stub_processes_.end(), pid);
-        if (it != stub_processes_.end()) stub_processes_.erase(it);
+        fast_erase(stub_processes_, pid);
         return;
     }
 
@@ -516,15 +526,13 @@ void AppMonitor::SigChldHandler::handleTracedProcess(int pid, int &status) {
         // If handleExecEvent promoted it to a stub or initiated injection,
         // it no longer belongs in the pre-exec candidate pool.
         if (stopped_with(status, SIGTRAP, PTRACE_EVENT_EXEC)) {
-            auto it = std::find(process_.begin(), process_.end(), pid);
-            if (it != process_.end()) process_.erase(it);
+            fast_erase(process_, pid);
         }
         return;
     }
 
     // If the process is irrelevant (e.g., a random system daemon), clean up and detach.
-    auto it2 = std::find(process_.begin(), process_.end(), pid);
-    if (it2 != process_.end()) process_.erase(it2);
+    fast_erase(process_, pid);
 
     if (WIFSTOPPED(status)) {
         LOGV("detaching irrelevant process %d", pid);
