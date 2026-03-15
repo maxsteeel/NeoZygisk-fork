@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "daemon.hpp"
 #include "logging.hpp"
 #include "socket_utils.hpp"
 #include "misc.hpp"
@@ -20,18 +21,17 @@ namespace utils {
 
 bool set_socket_create_context(const char* context) {
     // Try the modern path first.
-    int fd = open("/proc/thread-self/attr/sockcreate", O_WRONLY | O_CLOEXEC);
+    UniqueFd fd(open("/proc/thread-self/attr/sockcreate", O_WRONLY | O_CLOEXEC));
     if (fd < 0) {
         // Fallback for older kernels.
         char fallback_path[64];
         snprintf(fallback_path, sizeof(fallback_path), "/proc/self/task/%d/attr/sockcreate", gettid());
-        fd = open(fallback_path, O_WRONLY | O_CLOEXEC);
+        fd = UniqueFd(open(fallback_path, O_WRONLY | O_CLOEXEC));
     }
 
     if (fd >= 0) {
         size_t len = strlen(context);
         ssize_t w = socket_utils::xwrite(fd, context, len);
-        close(fd);
         return w == static_cast<ssize_t>(len);
     }
     return false;
@@ -39,10 +39,9 @@ bool set_socket_create_context(const char* context) {
 
 std::string get_current_attr() {
     char buf[256] = {0};
-    int fd = open("/proc/self/attr/current", O_RDONLY | O_CLOEXEC);
+    UniqueFd fd(open("/proc/self/attr/current", O_RDONLY | O_CLOEXEC));
     if (fd >= 0) {
         ssize_t r = socket_utils::xread(fd, buf, sizeof(buf) - 1);
-        close(fd);
         if (r > 0) {
             // Trim trailing newline if any
             while (r > 0 && (buf[r-1] == '\n' || buf[r-1] == '\r')) {
@@ -72,7 +71,7 @@ bool unix_datagram_sendto(const char* path, const void* buf, size_t len) {
         return false;
     }
 
-    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    UniqueFd fd(socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0));
     if (fd < 0) {
         PLOGE("unix_datagram_sendto: socket");
         return false;
@@ -83,7 +82,6 @@ bool unix_datagram_sendto(const char* path, const void* buf, size_t len) {
     size_t path_len = strlen(path);
     if (path_len >= sizeof(addr.sun_path)) {
         LOGE("unix_datagram_sendto: path too long");
-        close(fd);
         return false;
     }
     // Abstract socket name (first byte is 0) or regular? The Rust code used SocketAddrUnix::new(path.as_bytes())
@@ -97,7 +95,6 @@ bool unix_datagram_sendto(const char* path, const void* buf, size_t len) {
     // Equivalent to sendto.
     if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), addr_len) < 0) {
         PLOGE("unix_datagram_sendto: connect");
-        close(fd);
         return false;
     }
 
@@ -105,8 +102,6 @@ bool unix_datagram_sendto(const char* path, const void* buf, size_t len) {
     if (w < 0) {
         PLOGE("unix_datagram_sendto: send");
     }
-
-    close(fd);
 
     if (!set_socket_create_context("u:r:zygote:s0")) {
         PLOGE("unix_datagram_sendto: restore context to zygote");

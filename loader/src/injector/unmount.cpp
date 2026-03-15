@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <string_view>
 
+#include "daemon.hpp"
 #include "logging.hpp"
 #include "module.hpp"
 
@@ -27,12 +28,11 @@ std::vector<mount_info> check_zygote_traces(uint32_t info_flags) {
         return traces;
     }
 
-    int fd = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
+    UniqueFd fd(open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC));
     if (fd < 0) return traces;
 
     char buf[65536]; 
     ssize_t bytes_read = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
 
     if (bytes_read <= 0) return traces;
     buf[bytes_read] = '\0'; 

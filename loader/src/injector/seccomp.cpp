@@ -8,6 +8,7 @@
 
 #include <array>
 
+#include "daemon.hpp"
 #include "logging.hpp"
 #include "zygisk.hpp"
 
@@ -30,7 +31,7 @@
  */
 
 static bool should_skip_seccomp_injection() {
-    int fd = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+    UniqueFd fd(open("/proc/self/status", O_RDONLY | O_CLOEXEC));
     if (fd < 0) {
         // Fail-safe: if we can't check, we skip the injection.
         return true;
@@ -39,7 +40,6 @@ static bool should_skip_seccomp_injection() {
     // read buffer for /proc/self/status. 4096 bytes is typically enough to read the entire status.
     char buf[4096]; 
     ssize_t bytes_read = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
 
     if (bytes_read <= 0) {
         return true;
@@ -65,14 +65,13 @@ void send_seccomp_event_if_needed() {
     std::array<uint32_t, 4> args{};
 
     // Read random bytes to create a unique syscall signature
-    int random_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    UniqueFd random_fd(open("/dev/urandom", O_RDONLY | O_CLOEXEC));
     if (random_fd < 0) {
         PLOGE("seccomp: open(/dev/urandom)");
         return;
     }
     
     ssize_t read_res = read(random_fd, args.data(), args.size() * sizeof(uint32_t));
-    close(random_fd);
     
     if (read_res != static_cast<ssize_t>(args.size() * sizeof(uint32_t))) {
         PLOGE("seccomp: read(random_file)");

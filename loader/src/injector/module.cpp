@@ -301,25 +301,24 @@ void ZygiskContext::sanitize_fds() {
     }
 
     // Close all forbidden fds using direct syscall
-    int fd_dir = open("/proc/self/fd", O_RDONLY | O_DIRECTORY);
+    UniqueFd fd_dir(open("/proc/self/fd", O_RDONLY | O_DIRECTORY));
     if (likely(fd_dir >= 0)) {
         char buf[4096];
         int nread;
-        while ((nread = syscall(__NR_getdents64, fd_dir, buf, sizeof(buf))) > 0) {
+        while ((nread = syscall(__NR_getdents64, (int)fd_dir, buf, sizeof(buf))) > 0) {
             for (int bpos = 0; bpos < nread;) {
                 auto d = reinterpret_cast<struct linux_dirent64 *>(buf + bpos);
                 if (d->d_name[0] >= '0' && d->d_name[0] <= '9') {
                     int fd = fast_atoi(d->d_name);
                     if (unlikely((fd < 0 || static_cast<size_t>(fd) >= allowed_fds.size() ||
                                   !allowed_fds[fd]) &&
-                                 fd != fd_dir)) {
+                                 fd != (int)fd_dir)) {
                         close(fd);
                     }
                 }
                 bpos += d->d_reclen;
             }
         }
-        close(fd_dir);
     }
 
     // Clear exempted fds to free memory
@@ -357,11 +356,11 @@ void ZygiskContext::fork_pre() {
     if (unlikely(!is_child())) return;
 
     // Record all open fds using direct syscall to avoid heap allocations
-    int fd_dir = open("/proc/self/fd", O_RDONLY | O_DIRECTORY);
+    UniqueFd fd_dir(open("/proc/self/fd", O_RDONLY | O_DIRECTORY));
     if (likely(fd_dir >= 0)) {
         char buf[4096];
         int nread;
-        while ((nread = syscall(__NR_getdents64, fd_dir, buf, sizeof(buf))) > 0) {
+        while ((nread = syscall(__NR_getdents64, (int)fd_dir, buf, sizeof(buf))) > 0) {
             for (int bpos = 0; bpos < nread;) {
                 auto d = reinterpret_cast<struct linux_dirent64 *>(buf + bpos);
 
@@ -370,15 +369,12 @@ void ZygiskContext::fork_pre() {
                     int fd = fast_atoi(d->d_name);
                     if (fd >= 0 && static_cast<size_t>(fd) < allowed_fds.size()) {
                         allowed_fds[fd] = true;
-                    } else if (fd != fd_dir) {
-                        close(fd);
                     }
                 }
                 bpos += d->d_reclen;
             }
         }
         allowed_fds[fd_dir] = false;
-        close(fd_dir);
     }
 }
 
@@ -404,6 +400,7 @@ void ZygiskContext::run_modules_pre() {
             modules.emplace_back(i, handle, entry);
         }
 
+        close(m.memfd);
         memzero(m.name, sizeof(m.name));
     }
 
@@ -652,7 +649,7 @@ bool ZygiskContext::update_mount_namespace(zygiskd::MountNamespace namespace_typ
     const char *type_str = (namespace_type == zygiskd::MountNamespace::Clean ? "Clean" : "Root");
     LOGV("updating mount namespace to type %s", type_str);
 
-    int ns_fd = zygiskd::UpdateMountNamespace(namespace_type);
+    UniqueFd ns_fd(zygiskd::UpdateMountNamespace(namespace_type));
 
     // Check for failure (Not cached or error)
     if (ns_fd < 0) {
@@ -665,10 +662,8 @@ bool ZygiskContext::update_mount_namespace(zygiskd::MountNamespace namespace_typ
     int ret = setns(ns_fd, CLONE_NEWNS);
     if (ret != 0) {
         PLOGE("setns failed for type %s", type_str);
-        close(ns_fd);
         return false;
     }
 
-    close(ns_fd);
     return true;
 }

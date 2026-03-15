@@ -39,7 +39,7 @@ static string trim(const string& str) {
 
 static string generate_random_hex(int len) {
     string str(len, 0);
-    int fd = open("/dev/urandom", O_RDONLY);
+    UniqueFd fd(open("/dev/urandom", O_RDONLY));
     if (fd >= 0) {
         int read_len = len / 2;
         vector<unsigned char> buffer(read_len);
@@ -50,7 +50,6 @@ static string generate_random_hex(int len) {
                 str[i * 2 + 1] = digits[buffer[i] & 0x0F];
             }
         }
-        close(fd);
     }
     return str;
 }
@@ -63,7 +62,7 @@ void InitRandomVbmeta() {
 
 void LoadPropConfig() {
     string config_path = string("/data/adb/modules/") + moduleId + "/spoof.prop";
-    int fd = open(config_path.c_str(), O_RDONLY);
+    UniqueFd fd(open(config_path.c_str(), O_RDONLY));
     if (fd < 0) return;
 
     struct stat st;
@@ -86,7 +85,6 @@ void LoadPropConfig() {
             }
         }
     }
-    close(fd);
 }
 
 // *********************

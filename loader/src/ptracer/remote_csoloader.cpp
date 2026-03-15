@@ -10,6 +10,7 @@
 #include <string>
 #include <linux/memfd.h>
 
+#include "daemon.hpp"
 #include "logging.hpp"
 #include "utils.hpp"
 
@@ -388,7 +389,7 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     long page_size_long = sysconf(_SC_PAGESIZE);
     size_t page_size = (size_t)page_size_long;
 
-    int fd = open(lib_path, O_RDONLY | O_CLOEXEC);
+    UniqueFd fd(open(lib_path, O_RDONLY | O_CLOEXEC));
     if (fd < 0) return false;
 
     ElfW(Ehdr) eh;
@@ -396,7 +397,7 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     ElfW(Addr) min_vaddr = 0;
     size_t map_size = 0;
 
-    if (!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size)) { close(fd); return false; }
+    if (!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size)) { return false; }
 
     void *mmap_addr = find_func_addr(local_map, remote_map, libc_path, "mmap");
     void *mprotect_addr = find_func_addr(local_map, remote_map, libc_path, "mprotect");
@@ -404,13 +405,13 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     void *close_addr = find_func_addr(local_map, remote_map, libc_path, "close");
     void *syscall_addr = find_func_addr(local_map, remote_map, libc_path, "syscall");
     void *munmap_addr = find_func_addr(local_map, remote_map, libc_path, "munmap");
-    if (!mmap_addr || !mprotect_addr || !open_addr || !close_addr || !syscall_addr || !munmap_addr) { close(fd); return false; }
+    if (!mmap_addr || !mprotect_addr || !open_addr || !close_addr || !syscall_addr || !munmap_addr) { return false; }
 
     size_t path_len = strlen(lib_path) + 1;
     long args_mmap1[] = {0, (long)path_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
     struct user_regs_struct call_regs = regs_saved;
     uintptr_t remote_path = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args_mmap1, 6);
-    if (!remote_path || remote_path == (uintptr_t)MAP_FAILED) { close(fd); return false; }
+    if (!remote_path || remote_path == (uintptr_t)MAP_FAILED) { return false; }
     write_proc(pid, remote_path, lib_path, path_len);
 
     long args_open[] = {(long)remote_path, O_RDONLY | O_CLOEXEC, 0};
@@ -427,7 +428,7 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     call_regs = regs_saved;
     remote_call(pid, call_regs, (uintptr_t)munmap_addr, libc_return_addr, args_munmap1, 2);
 
-    if (remote_fd < 0) { close(fd); return false; }
+    if (remote_fd < 0) { return false; }
 
     long memfd_syscall_num = 0;
 #if defined(__aarch64__)
@@ -487,7 +488,7 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
         remote_base = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args_mmap_anon, 6);
     }
 
-    if (!remote_base || remote_base == (uintptr_t)MAP_FAILED) { close(fd); return false; }
+    if (!remote_base || remote_base == (uintptr_t)MAP_FAILED) { return false; }
 
     uintptr_t load_bias = remote_base - (uintptr_t)min_vaddr;
     struct SegInfo { uintptr_t addr; size_t len; int prot; };
@@ -565,8 +566,7 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     }
 
     ElfW(Addr) entry_value = 0;
-    if (!find_dynsym_value(fd, &dinfo, "entry", &entry_value)) { close(fd); return false; }
-    close(fd);
+    if (!find_dynsym_value(fd, &dinfo, "entry", &entry_value)) { return false; }
 
     *out_base = remote_base;
     *out_total_size = map_size;

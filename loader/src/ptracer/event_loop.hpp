@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "daemon.hpp"
 
 // Forward declaration
 class EventLoop;
@@ -29,7 +30,6 @@ struct EventHandler {
 class EventLoop {
 public:
     EventLoop();
-    ~EventLoop();
 
     // Disable copy and move
     EventLoop(const EventLoop &) = delete;
@@ -41,6 +41,6 @@ public:
     bool RegisterHandler(EventHandler &handler, uint32_t events);
 
 private:
-    int epoll_fd_;
+    UniqueFd epoll_fd_;
     bool running;
 };

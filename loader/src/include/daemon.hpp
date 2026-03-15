@@ -42,6 +42,13 @@ public:
     // Implict cast to Fd
     operator const Fd&() const { return fd_; }
 
+    // Relinquish ownership of the file descriptor without closing it.
+    Fd release() {
+        Fd temp = fd_;
+        fd_ = -1;
+        return temp;
+    }
+
 private:
     Fd fd_ = -1;
 };

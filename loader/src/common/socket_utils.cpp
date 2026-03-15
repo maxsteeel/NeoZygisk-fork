@@ -80,7 +80,10 @@ void* recv_fds(int sockfd, char* cmsgbuf, size_t bufsz, int cnt) {
                   .msg_controllen = bufsz,
                   .msg_flags = 0};
 
-    ssize_t rec = xrecvmsg(sockfd, &msg, MSG_WAITALL);
+    // MSG_CMSG_CLOEXEC forces any File Descriptor received 
+    // for this socket to be automatically marked to close in execve,
+    // avoiding leaks to daughter applications.
+    ssize_t rec = xrecvmsg(sockfd, &msg, MSG_WAITALL | MSG_CMSG_CLOEXEC);
 
     // --- IO Failed or Stream Desync ---
     if (rec != sizeof(dummy_data)) {

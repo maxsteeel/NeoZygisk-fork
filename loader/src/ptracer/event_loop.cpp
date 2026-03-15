@@ -6,18 +6,14 @@
 #include <cerrno>
 #include <cstring>
 
+#include "daemon.hpp"
 #include "logging.hpp"
 
-EventLoop::EventLoop() : epoll_fd_(-1), running(false) {}
-
-EventLoop::~EventLoop() {
-    if (epoll_fd_ >= 0) {
-        close(epoll_fd_);
-    }
-}
+EventLoop::EventLoop() : running(false) {}
 
 bool EventLoop::Init() {
-    epoll_fd_ = epoll_create(1);
+    epoll_fd_ = UniqueFd(epoll_create(1));
+    
     if (epoll_fd_ == -1) {
         PLOGE("create epoll fd");
         return false;
