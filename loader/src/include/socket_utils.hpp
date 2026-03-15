@@ -2,12 +2,24 @@
 
 #include <string>
 #include <string_view>
+#include <cstdint>
 
 namespace socket_utils {
 
     ssize_t xread(int fd, void *buf, size_t count);
 
     size_t xwrite(int fd, const void *buf, size_t count);
+
+    template <typename T>
+    inline T read_exact_or(int fd, T fail) {
+        T res;
+        return sizeof(T) == xread(fd, &res, sizeof(T)) ? res : fail;
+    }
+
+    template <typename T>
+    inline bool write_exact(int fd, T val) {
+        return sizeof(T) == xwrite(fd, &val, sizeof(T));
+    }
 
     uint8_t read_u8(int fd);
 

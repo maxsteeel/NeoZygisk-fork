@@ -1,9 +1,11 @@
 #include "socket_utils.hpp"
 
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <cstddef>
+#include <cstring>
 
 #include "logging.hpp"
 
@@ -12,9 +14,21 @@ namespace socket_utils {
 ssize_t xread(int fd, void* buf, size_t count) {
     if (count == 0) [[unlikely]] return 0;
     std::byte* ptr = static_cast<std::byte*>(buf);
-    std::byte* const end = ptr + count;
+    const std::byte* const end = ptr + count;
 
-    while (ptr < end) {
+    ssize_t ret_initial = read(fd, ptr, count);
+    if (ret_initial == static_cast<ssize_t>(count)) [[likely]] {
+        return count;
+    } else if (ret_initial > 0) {
+        ptr += ret_initial;
+    } else if (ret_initial < 0 && errno != EINTR) [[unlikely]] {
+        PLOGE("read");
+        return -1;
+    } else if (ret_initial == 0) [[unlikely]] {
+        return 0; // EOF on first read
+    }
+
+    while (ptr < end) [[likely]] {
         ssize_t ret = read(fd, ptr, end - ptr);
         if (ret > 0) [[likely]] {
             ptr += ret;
@@ -38,7 +52,17 @@ size_t xwrite(int fd, const void* buf, size_t count) {
     const std::byte* ptr = static_cast<const std::byte*>(buf);
     const std::byte* const end = ptr + count;
 
-    while (ptr < end) {
+    ssize_t ret_initial = write(fd, ptr, count);
+    if (ret_initial == static_cast<ssize_t>(count)) [[likely]] {
+        return count;
+    } else if (ret_initial > 0) {
+        ptr += ret_initial;
+    } else if (ret_initial < 0 && errno != EINTR) [[unlikely]] {
+        PLOGE("write");
+        return 0;
+    }
+
+    while (ptr < end) [[likely]] {
         ssize_t ret = write(fd, ptr, end - ptr);
         if (ret > 0) [[likely]] {
             ptr += ret;
@@ -122,17 +146,6 @@ void* recv_fds(int sockfd, char* cmsgbuf, size_t bufsz, int cnt) {
     return CMSG_DATA(cmsg);
 }
 
-template <typename T>
-inline T read_exact_or(int fd, T fail) {
-    T res;
-    return sizeof(T) == xread(fd, &res, sizeof(T)) ? res : fail;
-}
-
-template <typename T>
-inline bool write_exact(int fd, T val) {
-    return sizeof(T) == xwrite(fd, &val, sizeof(T));
-}
-
 uint8_t read_u8(int fd) { return read_exact_or<uint8_t>(fd, 0); }
 
 uint32_t read_u32(int fd) { return read_exact_or<uint32_t>(fd, 0); }
@@ -143,13 +156,16 @@ bool write_usize(int fd, size_t val) { return write_exact<size_t>(fd, val); }
 
 void read_string(int fd, char* buf, size_t buf_size) {
     auto len = read_usize(fd);
-    size_t read_len = (len < buf_size) ? len : (buf_size - 1);
-    if (read_len > 0) {
-        xread(fd, buf, read_len);
+    if (len == 0) [[unlikely]] {
+        buf[0] = '\0';
+        return;
     }
+    size_t read_len = (len < buf_size) ? len : (buf_size - 1);
+    xread(fd, buf, read_len);
     buf[read_len] = '\0';
-    if (len > read_len) {
-        char trash[256];
+
+    if (len > read_len) [[unlikely]] {
+        char trash[8196];
         size_t remain = len - read_len;
         while (remain > 0) {
             size_t to_read = (remain < sizeof(trash)) ? remain : sizeof(trash);
@@ -164,7 +180,40 @@ bool write_u8(int fd, uint8_t val) { return write_exact<uint8_t>(fd, val); }
 bool write_u32(int fd, uint32_t val) { return write_exact<uint32_t>(fd, val); }
 
 bool write_string(int fd, std::string_view str) {
-    return write_usize(fd, str.size()) && str.size() == xwrite(fd, str.data(), str.size());
+    size_t len = str.size();
+    struct iovec iov[2];
+    iov[0].iov_base = &len;
+    iov[0].iov_len = sizeof(len);
+    iov[1].iov_base = const_cast<char*>(str.data());
+    iov[1].iov_len = len;
+
+    size_t total = sizeof(len) + len;
+    size_t written = 0;
+
+    while (written < total) {
+        ssize_t ret = writev(fd, iov, 2);
+        if (ret > 0) [[likely]] {
+            written += ret;
+            if (written < total) [[unlikely]] {
+                // Adjust iovec for partial write
+                if (static_cast<size_t>(ret) >= iov[0].iov_len) {
+                    size_t str_written = ret - iov[0].iov_len;
+                    iov[1].iov_base = static_cast<char*>(iov[1].iov_base) + str_written;
+                    iov[1].iov_len -= str_written;
+                    iov[0].iov_len = 0;
+                } else {
+                    iov[0].iov_base = static_cast<char*>(iov[0].iov_base) + ret;
+                    iov[0].iov_len -= ret;
+                }
+            }
+        } else if (ret == 0) [[unlikely]] {
+            break;
+        } else if (errno != EINTR) [[unlikely]] {
+            PLOGE("writev");
+            return false;
+        }
+    }
+    return written == total;
 }
 
 int recv_fd(int sockfd) {
