@@ -38,7 +38,7 @@ androidComponents.onVariants { variant ->
         group = "module"
         dependsOn(
             ":loader:assemble$variantCapped",
-            ":zygiskd:buildAndStrip$variantCapped", 
+            ":zygiskd:assemble$variantCapped", 
         )
         into(moduleDir)
         from("${rootProject.projectDir}/README.md")
@@ -71,7 +71,7 @@ androidComponents.onVariants { variant ->
             filter<FixCrLfFilter>("eol" to FixCrLfFilter.CrLf.newInstance("lf"))
         }
         into("bin") {
-            from(project(":zygiskd").layout.buildDirectory.dir("intermediates/rust/$buildTypeLowered/jniLibs"))
+            from(project(":zygiskd").layout.buildDirectory.dir("out"))
             include("**/zygiskd")
         }
         into("lib") {

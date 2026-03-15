@@ -31,23 +31,10 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Setup Rust toolchain
-        run: |
-          rustup override set nightly
-          rustup target add aarch64-linux-android
-          rustup target add x86_64-linux-android
-          rustup target add i686-linux-android
-          rustup target add armv7-linux-androideabi
-
       - name: Setup Ccache for faster builds
         uses: hendrikmuhs/ccache-action@v1
         with:
           key: ${{ github.job }}-${{ runner.os }}-${{ hashFiles('**/build.gradle.kts', '**/gradle.properties') }}
-
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: zygiskd/src -> ../build/intermediates/rust
 
       # ====================================================================
       # 2. CONFIGURE AND BUILD
