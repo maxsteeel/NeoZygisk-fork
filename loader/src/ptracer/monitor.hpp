@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "daemon.hpp"
 #include "event_loop.hpp"
 #include "main.hpp"
 #include "types.hpp"
@@ -129,7 +130,6 @@ private:
         bool Init();
         int GetFd() override;
         void HandleEvent(EventLoop &loop, uint32_t) override;
-        ~SocketHandler() override;
 
     private:
         struct [[gnu::packed]] MsgHead {
@@ -139,7 +139,7 @@ private:
         };
         AppMonitor &monitor_;
         std::vector<uint8_t> buf_;
-        int sock_fd_ = -1;
+        UniqueFd sock_fd_;
     };
 
     class SigChldHandler : public EventHandler {
@@ -148,7 +148,6 @@ private:
         bool Init();
         int GetFd() override;
         void HandleEvent(EventLoop &, uint32_t) override;
-        ~SigChldHandler() override;
 
     private:
         void handleChildEvent(int pid, int &status);
@@ -160,7 +159,7 @@ private:
         bool handleExecEvent(int pid, int &status);
 
         AppMonitor &monitor_;
-        int signal_fd_ = -1;
+        UniqueFd signal_fd_;
         int status_ = 0;
         std::vector<int> process_;
         std::vector<int> stub_processes_;

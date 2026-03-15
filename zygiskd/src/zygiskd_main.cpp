@@ -55,11 +55,11 @@ using zygisk_mount::switch_mount_namespace;
 
 struct Module {
     std::string name;
-    int lib_fd;
+    UniqueFd lib_fd;
     std::mutex companion_mutex;
-    int companion_fd; // -1 means none
+    UniqueFd companion_fd;
 
-    Module() : lib_fd(-1), companion_fd(-1) {}
+    Module() = default;   
 };
 
 struct AppContext {
@@ -133,16 +133,15 @@ static std::string get_arch() {
 }
 
 static int create_library_fd(const char* so_path) {
-    int memfd = memfd_create("zygisk-module", MFD_ALLOW_SEALING | MFD_CLOEXEC);
+    UniqueFd memfd(memfd_create("zygisk-module", MFD_ALLOW_SEALING | MFD_CLOEXEC));
     if (memfd < 0) {
         PLOGE("memfd_create");
         return -1;
     }
 
-    int file_fd = open(so_path, O_RDONLY | O_CLOEXEC);
+    UniqueFd file_fd(open(so_path, O_RDONLY | O_CLOEXEC));
     if (file_fd < 0) {
         PLOGE("open %s", so_path);
-        close(memfd);
         return -1;
     }
 
@@ -151,19 +150,16 @@ static int create_library_fd(const char* so_path) {
     while ((bytes_read = read(file_fd, buf, sizeof(buf))) > 0) {
         if (socket_utils::xwrite(memfd, buf, bytes_read) != static_cast<size_t>(bytes_read)) {
             PLOGE("write memfd");
-            close(file_fd);
-            close(memfd);
             return -1;
         }
     }
-    close(file_fd);
 
     int seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL;
     if (fcntl(memfd, F_ADD_SEALS, seals) == -1) {
         LOGW("Failed to add seals to memfd: %s", strerror(errno));
     }
 
-    return memfd;
+    return memfd.release();
 }
 
 static std::vector<std::unique_ptr<Module>> load_modules() {
@@ -177,7 +173,7 @@ static std::vector<std::unique_ptr<Module>> load_modules() {
 
     LOGD("Daemon architecture: %s", arch.c_str());
 
-    DIR* dir = opendir(constants::PATH_MODULES_DIR);
+    UniqueDir dir(opendir(constants::PATH_MODULES_DIR));
     if (!dir) {
         LOGW("Failed to read modules directory %s", constants::PATH_MODULES_DIR);
         return modules;
@@ -207,12 +203,12 @@ static std::vector<std::unique_ptr<Module>> load_modules() {
             LOGW("Failed to create memfd for `%s`", entry->d_name);
         }
     }
-    closedir(dir);
+
     return modules;
 }
 
 static int create_daemon_socket() {
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    UniqueFd fd(socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
     if (fd < 0) return -1;
 
     struct sockaddr_un addr{};
@@ -224,17 +220,15 @@ static int create_daemon_socket() {
 
     if (bind(fd, reinterpret_cast<struct sockaddr*>(&addr), addr_len) < 0) {
         PLOGE("bind");
-        close(fd);
         return -1;
     }
 
     if (listen(fd, 10) < 0) {
         PLOGE("listen");
-        close(fd);
         return -1;
     }
 
-    return fd;
+    return fd.release();
 }
 
 static int spawn_companion(const char* name) {
@@ -244,15 +238,13 @@ static int spawn_companion(const char* name) {
         return -1;
     }
 
-    int daemon_sock = pair[0];
-    int companion_sock = pair[1];
+    UniqueFd daemon_sock(pair[0]);
+    UniqueFd companion_sock(pair[1]);
 
     char self_exe[256];
     ssize_t len = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
     if (len < 0) {
         PLOGE("readlink /proc/self/exe");
-        close(daemon_sock);
-        close(companion_sock);
         return -1;
     }
     self_exe[len] = '\0';
@@ -265,14 +257,12 @@ static int spawn_companion(const char* name) {
     pid_t pid = fork();
     if (pid < 0) {
         PLOGE("fork");
-        close(daemon_sock);
-        close(companion_sock);
         return -1;
     }
 
     if (pid == 0) {
         // Child
-        close(daemon_sock);
+        daemon_sock = UniqueFd();
 
         // Remove CLOEXEC from companion_sock
         int flags = fcntl(companion_sock, F_GETFD);
@@ -282,7 +272,7 @@ static int spawn_companion(const char* name) {
         snprintf(arg0, sizeof(arg0), "%s-%s", nice_name, name);
 
         char fd_str[32];
-        snprintf(fd_str, sizeof(fd_str), "%d", companion_sock);
+        snprintf(fd_str, sizeof(fd_str), "%d", (int)companion_sock);
 
         // exec
         const char* argv[] = {arg0, "companion", fd_str, nullptr};
@@ -292,7 +282,7 @@ static int spawn_companion(const char* name) {
     }
 
     // Parent
-    close(companion_sock);
+    companion_sock = UniqueFd();
 
     // Now, establish communication with the newly spawned companion.
     socket_utils::write_string(daemon_sock, name);
@@ -303,7 +293,7 @@ static int spawn_companion(const char* name) {
     // Wait, loader socket_utils only implements recv_fd because the injector only receives.
     // I need to implement send_fd.
 
-    return daemon_sock; // We will handle send_fd locally in a bit
+    return daemon_sock.release(); // We will handle send_fd locally in a bit
 }
 
 // Implement send_fd
@@ -334,21 +324,14 @@ static bool send_fd(int sockfd, int fd) {
 
 // Wait, the above spawn_companion needs to be refactored to use this
 static int spawn_companion_complete(const char* name, int lib_fd) {
-    int daemon_sock = spawn_companion(name);
+    UniqueFd daemon_sock(spawn_companion(name));
     if (daemon_sock < 0) return -1;
-
-    if (!send_fd(daemon_sock, lib_fd)) {
-        close(daemon_sock);
-        return -1;
-    }
+    if (!send_fd(daemon_sock, lib_fd))  return -1;
 
     uint8_t status = socket_utils::read_u8(daemon_sock);
-    if (status == 1) {
-        return daemon_sock;
-    } else {
-        close(daemon_sock);
-        return -1;
-    }
+    if (status == 1) return daemon_sock.release();
+
+    return -1;
 }
 
 
@@ -410,8 +393,7 @@ static void handle_request_companion_socket(int stream, AppContext* context) {
     if (module->companion_fd >= 0) {
         if (!utils::is_socket_alive(module->companion_fd)) {
             LOGE("Companion for module `%s` appears to have crashed.", module->name.c_str());
-            close(module->companion_fd);
-            module->companion_fd = -1;
+            module->companion_fd = UniqueFd();
         }
     }
 
@@ -419,7 +401,7 @@ static void handle_request_companion_socket(int stream, AppContext* context) {
         int sock = spawn_companion_complete(module->name.c_str(), module->lib_fd);
         if (sock >= 0) {
             LOGV("Spawned new companion for `%s`.", module->name.c_str());
-            module->companion_fd = sock;
+            module->companion_fd = UniqueFd(sock);
         } else {
             LOGW("Module `%s` does not have a companion entry point or failed.", module->name.c_str());
         }
@@ -441,11 +423,8 @@ static void handle_get_module_dir(int stream, AppContext* context) {
     auto& module = context->modules[index];
     char dir_path[256];
     snprintf(dir_path, sizeof(dir_path), "%s/%s", constants::PATH_MODULES_DIR, module->name.c_str());
-    int dir_fd = open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dir_fd >= 0) {
-        send_fd(stream, dir_fd);
-        close(dir_fd);
-    }
+    UniqueFd dir_fd(open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (dir_fd >= 0) send_fd(stream, dir_fd);
 }
 
 
@@ -458,10 +437,9 @@ static void handle_threaded_action(DaemonSocketAction action, int stream, std::s
         case DaemonSocketAction::GetModuleDir: handle_get_module_dir(stream, context.get()); break;
         default: break;
     }
-    close(stream);
 }
 
-static void handle_connection(int stream, std::shared_ptr<AppContext> context) {
+static void handle_connection(UniqueFd stream, std::shared_ptr<AppContext> context) {
     uint8_t action_val = socket_utils::read_u8(stream);
     auto action = static_cast<DaemonSocketAction>(action_val);
 
@@ -470,13 +448,11 @@ static void handle_connection(int stream, std::shared_ptr<AppContext> context) {
             pid_t pid = socket_utils::read_u32(stream);
             context->mount_manager->save_mount_namespace(pid, zygiskd::MountNamespace::Clean);
             context->mount_manager->save_mount_namespace(pid, zygiskd::MountNamespace::Root);
-            close(stream);
             break;
         }
         case DaemonSocketAction::PingHeartbeat: {
             uint32_t val = constants::ZYGOTE_INJECTED;
             utils::unix_datagram_sendto(CONTROLLER_SOCKET.c_str(), &val, sizeof(val));
-            close(stream);
             break;
         }
         case DaemonSocketAction::ZygoteRestart: {
@@ -484,22 +460,21 @@ static void handle_connection(int stream, std::shared_ptr<AppContext> context) {
             for (auto& module : context->modules) {
                 std::lock_guard<std::mutex> lock(module->companion_mutex);
                 if (module->companion_fd >= 0) {
-                    close(module->companion_fd);
-                    module->companion_fd = -1;
+                    module->companion_fd = UniqueFd();
                 }
             }
-            close(stream);
             break;
         }
         case DaemonSocketAction::SystemServerStarted: {
             uint32_t val = constants::SYSTEM_SERVER_STARTED;
             utils::unix_datagram_sendto(CONTROLLER_SOCKET.c_str(), &val, sizeof(val));
-            close(stream);
             break;
         }
         default: {
-            std::thread([action, stream, context]() {
-                handle_threaded_action(action, stream, context);
+            int raw_fd = stream.release(); 
+            std::thread([action, raw_fd, context]() {
+                UniqueFd thread_stream(raw_fd);
+                handle_threaded_action(action, thread_stream, context);
             }).detach();
             break;
         }
@@ -526,7 +501,7 @@ int main() {
     context->modules = std::move(modules);
     context->mount_manager = std::make_shared<MountNamespaceManager>();
 
-    int listener = create_daemon_socket();
+    UniqueFd listener(create_daemon_socket());
     if (listener < 0) {
         return 1;
     }
@@ -534,9 +509,9 @@ int main() {
     LOGI("Daemon listening on %s", DAEMON_SOCKET_PATH.c_str());
 
     while (true) {
-        int stream = accept(listener, nullptr, nullptr);
+        UniqueFd stream = accept(listener, nullptr, nullptr);
         if (stream >= 0) {
-            handle_connection(stream, context);
+            handle_connection(std::move(stream), context);
         } else {
             LOGW("Failed to accept incoming connection");
         }

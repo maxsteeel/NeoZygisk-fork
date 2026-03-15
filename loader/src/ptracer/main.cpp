@@ -6,7 +6,7 @@
 
 #include <string_view>
 
-#include "daemon.hpp"  // For GetTmpPath
+#include "daemon.hpp"  // For GetTmpPath and UniqueFd
 #include "logging.hpp"
 #include "monitor.hpp"
 
@@ -31,7 +31,7 @@ void init_monitor() {
 
 // The entry point for the command-line control utility.
 void send_control_command(Command cmd) {
-    int sockfd = socket(PF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    UniqueFd sockfd(socket(PF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0));
     if (sockfd == -1) err(EXIT_FAILURE, "socket");
 
     struct sockaddr_un addr{
@@ -52,7 +52,6 @@ void send_control_command(Command cmd) {
         exit(1);
     }
     printf("command sent\n");
-    close(sockfd);
 }
 
 // --- Command Handler Declarations ---

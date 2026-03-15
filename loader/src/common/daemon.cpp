@@ -23,7 +23,7 @@ std::string GetTmpPath() { return TMP_PATH; }
 std::string GetModDir() { return MODULE_DIR; }
 
 int Connect(uint8_t retry) {
-    int fd = socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    UniqueFd fd(socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
 
@@ -32,14 +32,13 @@ int Connect(uint8_t retry) {
 
     while (retry--) {
         int r = connect(fd, reinterpret_cast<struct sockaddr *>(&addr), socklen);
-        if (r == 0) return fd;
+        if (r == 0) return fd.release();
         if (retry) {
             LOGW("retrying to connect to zygiskd, sleep 1s");
             sleep(1);
         }
     }
 
-    close(fd);
     return -1;
 }
 
@@ -121,7 +120,7 @@ std::vector<Module> ReadModules() {
 }
 
 int ConnectCompanion(size_t index) {
-    int fd = Connect(1);
+    UniqueFd fd(Connect(1));
     if (fd == -1) {
         PLOGE("ConnectCompanion");
         return -1;
@@ -129,9 +128,8 @@ int ConnectCompanion(size_t index) {
     socket_utils::write_u8(fd, (uint8_t) SocketAction::RequestCompanionSocket);
     socket_utils::write_usize(fd, index);
     if (socket_utils::read_u8(fd) == 1) {
-        return fd;
+        return fd.release(); 
     } else {
-        close(fd);
         return -1;
     }
 }

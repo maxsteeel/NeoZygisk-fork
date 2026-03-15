@@ -9,6 +9,7 @@
 #include <string_view>
 #include <algorithm>
 
+#include "daemon.hpp"
 #include "logging.hpp"
 #include "root_impl.hpp"
 #include "socket_utils.hpp"
@@ -27,7 +28,7 @@ bool switch_mount_namespace(pid_t pid) {
     char ns_path[64];
     snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", pid);
 
-    int fd = open(ns_path, O_RDONLY | O_CLOEXEC);
+    UniqueFd fd(open(ns_path, O_RDONLY | O_CLOEXEC));
     if (fd < 0) {
         PLOGE("switch_mount_namespace: open %s", ns_path);
         return false;
@@ -35,10 +36,8 @@ bool switch_mount_namespace(pid_t pid) {
 
     if (setns(fd, CLONE_NEWNS) != 0) {
         PLOGE("switch_mount_namespace: setns");
-        close(fd);
         return false;
     }
-    close(fd);
 
     if (chdir(cwd) != 0) {
         PLOGE("switch_mount_namespace: chdir");
@@ -69,17 +68,18 @@ int MountNamespaceManager::save_mount_namespace(pid_t pid, zygiskd::MountNamespa
         return -1;
     }
 
+    UniqueFd pipe_read(pipefd[0]);
+    UniqueFd pipe_write(pipefd[1]);
+
     pid_t child_pid = fork();
     if (child_pid < 0) {
         PLOGE("fork");
-        close(pipefd[0]);
-        close(pipefd[1]);
         return -1;
     }
 
     if (child_pid == 0) {
         // --- Child Process ---
-        close(pipefd[0]);
+        pipe_read = UniqueFd();
 
         if (!switch_mount_namespace(pid)) {
             _exit(1);
@@ -96,10 +96,10 @@ int MountNamespaceManager::save_mount_namespace(pid_t pid, zygiskd::MountNamespa
         }
 
         uint8_t sig = 0;
-        if (socket_utils::xwrite(pipefd[1], &sig, sizeof(sig)) != sizeof(sig)) {
+        if (socket_utils::xwrite(pipe_write, &sig, sizeof(sig)) != sizeof(sig)) {
             PLOGE("child: write pipe");
         }
-        close(pipefd[1]);
+        pipe_write = UniqueFd();
 
         while (true) {
             sleep(60);
@@ -108,31 +108,34 @@ int MountNamespaceManager::save_mount_namespace(pid_t pid, zygiskd::MountNamespa
     }
 
     // --- Parent Process ---
-    close(pipefd[1]);
+    pipe_write = UniqueFd();
 
     uint8_t buf = 0;
-    if (socket_utils::xread(pipefd[0], &buf, sizeof(buf)) != sizeof(buf)) {
+    if (socket_utils::xread(pipe_read, &buf, sizeof(buf)) != sizeof(buf)) {
         PLOGE("parent: read pipe");
         kill(child_pid, SIGKILL);
         waitpid(child_pid, nullptr, 0);
-        close(pipefd[0]);
         return -1;
     }
-    close(pipefd[0]);
+
+    pipe_read = UniqueFd();
 
     char ns_path[64];
     snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", child_pid);
 
-    int ns_fd = open(ns_path, O_RDONLY | O_CLOEXEC);
+    UniqueFd ns_fd(open(ns_path, O_RDONLY | O_CLOEXEC));
     if (ns_fd < 0) {
         PLOGE("open %s", ns_path);
+        kill(child_pid, SIGKILL);
+        waitpid(child_pid, nullptr, 0);
+        return -1;
     }
 
     kill(child_pid, SIGKILL);
     waitpid(child_pid, nullptr, 0);
 
-    fd_ref = ns_fd;
-    return ns_fd;
+    fd_ref = ns_fd.release();
+    return fd_ref;
 }
 
 struct MountInfo {

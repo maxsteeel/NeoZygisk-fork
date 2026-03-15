@@ -116,7 +116,7 @@ void AppMonitor::update_status() {
 
 bool AppMonitor::prepare_environment() {
     prop_path_ = zygiskd::GetTmpPath() + "/module.prop";
-    close(open(prop_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
+    UniqueFd(open(prop_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
     auto orig_prop = xopen_file("./module.prop", "r");
     if (orig_prop == nullptr) {
         PLOGE("open original prop");
@@ -184,12 +184,9 @@ void AppMonitor::notify_init_detached() {
 // --- SocketHandler Method Implementations ---
 
 int AppMonitor::SocketHandler::GetFd() { return sock_fd_; }
-AppMonitor::SocketHandler::~SocketHandler() {
-    if (sock_fd_ >= 0) close(sock_fd_);
-}
 
 bool AppMonitor::SocketHandler::Init() {
-    sock_fd_ = socket(PF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    sock_fd_ = UniqueFd(socket(PF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
     if (sock_fd_ == -1) {
         PLOGE("socket create");
         return false;
@@ -284,9 +281,6 @@ void AppMonitor::SocketHandler::HandleEvent([[maybe_unused]] EventLoop &loop, ui
 // --- SigChldHandler Method Implementations ---
 
 int AppMonitor::SigChldHandler::GetFd() { return signal_fd_; }
-AppMonitor::SigChldHandler::~SigChldHandler() {
-    if (signal_fd_ >= 0) close(signal_fd_);
-}
 
 bool AppMonitor::SigChldHandler::Init() {
     sigset_t mask;
@@ -296,7 +290,7 @@ bool AppMonitor::SigChldHandler::Init() {
         PLOGE("set sigprocmask");
         return false;
     }
-    signal_fd_ = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
+    signal_fd_ = UniqueFd(signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC));
     if (signal_fd_ == -1) {
         PLOGE("create signalfd");
         return false;
