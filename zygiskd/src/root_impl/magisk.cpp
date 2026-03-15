@@ -29,6 +29,8 @@ static std::string magisk_variant_pkg;
 // Function pointer types for dynamically loading SQLite
 typedef int (*sqlite3_open_t)(const char*, void**);
 typedef int (*sqlite3_prepare_v2_t)(void*, const char*, int, void**, const char**);
+typedef int (*sqlite3_bind_text_t)(void*, int, const char*, int, void (*)(void*));
+typedef int (*sqlite3_bind_int_t)(void*, int, int);
 typedef int (*sqlite3_step_t)(void*);
 typedef int (*sqlite3_finalize_t)(void*);
 typedef int (*sqlite3_close_t)(void*);
@@ -36,6 +38,7 @@ typedef const unsigned char* (*sqlite3_column_text_t)(void*, int);
 
 #define SQLITE_OK 0
 #define SQLITE_ROW 100
+#define SQLITE_TRANSIENT ((void (*)(void*)) - 1)
 
 // Lightweight wrapper to interact with Android's native libsqlite.so
 class MagiskDB {
@@ -45,6 +48,8 @@ private:
 
     sqlite3_open_t fn_open = nullptr;
     sqlite3_prepare_v2_t fn_prepare = nullptr;
+    sqlite3_bind_text_t fn_bind_text = nullptr;
+    sqlite3_bind_int_t fn_bind_int = nullptr;
     sqlite3_step_t fn_step = nullptr;
     sqlite3_finalize_t fn_finalize = nullptr;
     sqlite3_close_t fn_close = nullptr;
@@ -60,6 +65,8 @@ public:
         }
         fn_open = (sqlite3_open_t)dlsym(handle, "sqlite3_open");
         fn_prepare = (sqlite3_prepare_v2_t)dlsym(handle, "sqlite3_prepare_v2");
+        fn_bind_text = (sqlite3_bind_text_t)dlsym(handle, "sqlite3_bind_text");
+        fn_bind_int = (sqlite3_bind_int_t)dlsym(handle, "sqlite3_bind_int");
         fn_step = (sqlite3_step_t)dlsym(handle, "sqlite3_step");
         fn_finalize = (sqlite3_finalize_t)dlsym(handle, "sqlite3_finalize");
         fn_close = (sqlite3_close_t)dlsym(handle, "sqlite3_close");
@@ -88,6 +95,37 @@ public:
         bool result = false;
 
         if (fn_prepare(db, query, -1, &stmt, nullptr) == SQLITE_OK) {
+            if (fn_step(stmt) == SQLITE_ROW) {
+                result = true;
+            }
+            fn_finalize(stmt);
+        }
+        return result;
+    }
+
+    bool check_exists(const char* query, int arg) {
+        if (!is_valid() || !fn_prepare || !fn_bind_int || !fn_step || !fn_finalize) return false;
+        void* stmt = nullptr;
+        bool result = false;
+
+        if (fn_prepare(db, query, -1, &stmt, nullptr) == SQLITE_OK) {
+            if (fn_bind_int(stmt, 1, arg) == SQLITE_OK) {
+                if (fn_step(stmt) == SQLITE_ROW) {
+                    result = true;
+                }
+            }
+            fn_finalize(stmt);
+        }
+        return result;
+    }
+
+    bool check_exists(const char* query, const char* arg) {
+        if (!is_valid() || !fn_prepare || !fn_bind_text || !fn_step || !fn_finalize) return false;
+        void* stmt = nullptr;
+        bool result = false;
+
+        if (fn_prepare(db, query, -1, &stmt, nullptr) == SQLITE_OK) {
+            fn_bind_text(stmt, 1, arg, -1, SQLITE_TRANSIENT);
             if (fn_step(stmt) == SQLITE_ROW) {
                 result = true;
             }
@@ -168,12 +206,21 @@ std::optional<Version> detect_version() {
 
 // --- High-Performance Database Queries ---
 
+static bool is_valid_pkg_name(const std::string& pkg_name) {
+    if (pkg_name.empty() || pkg_name.length() > 255) return false;
+    for (char c : pkg_name) {
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+             c == '.' || c == '_' || c == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool uid_granted_root(int32_t uid) {
     MagiskDB db;
     if (db.is_valid()) {
-        char query[256];
-        snprintf(query, sizeof(query), "SELECT 1 FROM policies WHERE uid=%d AND policy=2 LIMIT 1", uid);
-        return db.check_exists(query);
+        return db.check_exists("SELECT 1 FROM policies WHERE uid=? AND policy=2 LIMIT 1", uid);
     }
 
     // Fallback just in case libsqlite.so fails to load
@@ -201,12 +248,14 @@ bool uid_should_umount(int32_t uid) {
 
     MagiskDB db;
     if (db.is_valid()) {
-        char query[256];
-        snprintf(query, sizeof(query), "SELECT 1 FROM denylist WHERE package_name='%s' LIMIT 1", pkg_name.c_str());
-        return db.check_exists(query);
+        return db.check_exists("SELECT 1 FROM denylist WHERE package_name=? LIMIT 1", pkg_name.c_str());
     }
 
     // Fallback
+    if (!is_valid_pkg_name(pkg_name)) {
+        LOGW("Invalid package name for fallback: %s", pkg_name.c_str());
+        return false;
+    }
     char sqlite_cmd[512];
     snprintf(sqlite_cmd, sizeof(sqlite_cmd), "magisk --sqlite 'SELECT 1 FROM denylist WHERE package_name=\"%s\" LIMIT 1' 2>/dev/null", pkg_name.c_str());
     return run_command(sqlite_cmd).has_value();
