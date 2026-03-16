@@ -25,7 +25,7 @@ void EventLoop::Stop() { running = false; }
 
 void EventLoop::Loop() {
     running = true;
-    constexpr auto MAX_EVENTS = 2;
+    constexpr auto MAX_EVENTS = 32;
     struct epoll_event events[MAX_EVENTS];
 
     while (running) {

@@ -138,7 +138,6 @@ private:
             char data[0];
         };
         AppMonitor &monitor_;
-        std::vector<uint8_t> buf_;
         UniqueFd sock_fd_;
     };
 
@@ -179,4 +178,7 @@ private:
     std::string prop_path_;
     std::string pre_section_;
     std::string post_section_;
+
+    UniqueFd prop_fd_;
+    std::string final_output_;
 };

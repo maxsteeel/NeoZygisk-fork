@@ -66,52 +66,38 @@ void AppMonitor::write_abi_status_section(std::string &status_text, const Status
 }
 
 void AppMonitor::update_status() {
-    auto prop_file = xopen_file(prop_path_.c_str(), "w");
-    if (!prop_file) {
-        PLOGE("open module.prop");
-        return;
-    }
+    if (prop_fd_ < 0) return;
 
-    // Build the middle section of the status text.
-    std::string status_text = "\tmonitor: \t";
+    final_output_.clear();
+    final_output_ += pre_section_;
+    final_output_ += "\n\tmonitor: \t";
+
     switch (tracing_state_) {
     case TRACING:
-        status_text += "😋 tracing";
+        final_output_ += "😋 tracing";
         break;
     case STOPPING:
         [[fallthrough]];
     case STOPPED:
-        status_text += "❌ stopped";
+        final_output_ += "❌ stopped";
         break;
     case EXITING:
-        status_text += "❌ exited";
+        final_output_ += "❌ exited";
         break;
     }
     if (tracing_state_ != TRACING && !monitor_stop_reason_.empty()) {
-        status_text += "(";
-        status_text += monitor_stop_reason_;
-        status_text += ")";
+        final_output_ += "(";
+        final_output_ += monitor_stop_reason_;
+        final_output_ += ")";
     }
 
-    // Build the ABI-specific status section
-    std::string abi_section;
-    write_abi_status_section(abi_section, zygote_.get_status());
+    final_output_ += "\n\n";
+    write_abi_status_section(final_output_, zygote_.get_status());
+    final_output_ += "\n\n";
+    final_output_ += post_section_;
 
-    // reservation of the final output string to avoid multiple reallocations
-    std::string final_output;
-    final_output.reserve(pre_section_.size() + status_text.size() + abi_section.size() +
-                         post_section_.size() + 6);
-
-    // concatenate all sections into the final output
-    final_output += pre_section_;
-    final_output += "\n";
-    final_output += status_text;
-    final_output += "\n\n";
-    final_output += abi_section;
-    final_output += "\n\n";
-    final_output += post_section_;
-
-    fwrite(final_output.c_str(), 1, final_output.length(), prop_file.get());
+    ftruncate(prop_fd_, 0);
+    pwrite(prop_fd_, final_output_.data(), final_output_.size(), 0);
 }
 
 bool AppMonitor::prepare_environment() {
@@ -134,6 +120,13 @@ bool AppMonitor::prepare_environment() {
         }
         return true;
     });
+
+    prop_fd_ = UniqueFd(open(prop_path_.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0644));
+    if (prop_fd_ < 0) {
+        PLOGE("failed to open persistent prop_file");
+    }
+
+    final_output_.reserve(1024);
     update_status();
     return true;
 }
@@ -220,44 +213,25 @@ bool AppMonitor::SocketHandler::Init() {
 }
 
 void AppMonitor::SocketHandler::HandleEvent([[maybe_unused]] EventLoop &loop, uint32_t) {
+    alignas(MsgHead) char buffer[8192];
+
     for (;;) {
-        buf_.resize(sizeof(MsgHead));
-        MsgHead &msg_header = *reinterpret_cast<MsgHead *>(buf_.data());
-        ssize_t nread = recv(sock_fd_, &msg_header, sizeof(MsgHead), MSG_PEEK | MSG_TRUNC);
+        ssize_t nread = recv(sock_fd_, buffer, sizeof(buffer), 0);
         if (nread == -1) {
             if (errno == EAGAIN) break;
-            PLOGE("SocketHandler: recv(peek)");
+            PLOGE("SocketHandler: recv");
             continue;
         }
-        ssize_t real_size;
-        if (msg_header.cmd >= Command::DAEMON_SET_INFO &&
-            msg_header.cmd != Command::SYSTEM_SERVER_STARTED) {
-            if (static_cast<size_t>(nread) < sizeof(MsgHead)) {
-                LOGE("SocketHandler: received incomplete header for cmd %d, size %zd",
-                     msg_header.cmd, nread);
-                recv(sock_fd_, buf_.data(), buf_.size(), 0);
+        
+        if (static_cast<size_t>(nread) < sizeof(Command)) continue;
+
+        MsgHead &full_msg = *reinterpret_cast<MsgHead *>(buffer);
+
+        if (full_msg.cmd >= Command::DAEMON_SET_INFO && full_msg.cmd != Command::SYSTEM_SERVER_STARTED) {
+            if (static_cast<size_t>(nread) < sizeof(MsgHead) + full_msg.length) {
+                LOGE("SocketHandler: mensaje truncado o incompleto");
                 continue;
             }
-            real_size = sizeof(MsgHead) + msg_header.length;
-        } else {
-            if (static_cast<size_t>(nread) != sizeof(Command)) {
-                LOGE("SocketHandler: received invalid size for cmd %d, size %zd", msg_header.cmd,
-                     nread);
-                recv(sock_fd_, buf_.data(), buf_.size(), 0);
-                continue;
-            }
-            real_size = sizeof(Command);
-        }
-        buf_.resize(real_size);
-        MsgHead &full_msg = *reinterpret_cast<MsgHead *>(buf_.data());
-        nread = recv(sock_fd_, &full_msg, real_size, 0);
-        if (nread == -1) {
-            PLOGE("recv(read)");
-            continue;
-        }
-        if (nread != real_size) {
-            LOGE("SocketHandler: expected %zd bytes, but received %zd", real_size, nread);
-            continue;
         }
 
         switch (full_msg.cmd) {
@@ -358,14 +332,11 @@ bool AppMonitor::SigChldHandler::Init() {
  */
 void AppMonitor::SigChldHandler::HandleEvent(EventLoop &, uint32_t) {
     for (;;) {
-        struct signalfd_siginfo fdsi;
-        ssize_t s = read(signal_fd_, &fdsi, sizeof(fdsi));
+        struct signalfd_siginfo fdsi[8];
+        ssize_t s = read(signal_fd_, fdsi, sizeof(fdsi));
         if (s == -1) {
             if (errno == EAGAIN) break;
             PLOGE("read signalfd");
-            continue;
-        }
-        if (s != sizeof(fdsi) || fdsi.ssi_signo != SIGCHLD) {
             continue;
         }
 
