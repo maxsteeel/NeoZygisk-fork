@@ -186,27 +186,9 @@ public:
 
 // --- General Magisk Detection ---
 
-static std::optional<std::string> run_command(const char* cmd) {
-    UniquePipe pipe(popen(cmd, "re"));
-    if (!pipe) return std::nullopt;
-
-    std::string result;
-    char buf[256];
-    while (fgets(buf, sizeof(buf), pipe)) {
-        result += buf;
-    }
-
-    // trim
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r' || result.back() == ' ')) {
-        result.pop_back();
-    }
-    if (result.empty()) return std::nullopt;
-    return result;
-}
-
 static void detect_variant() {
     std::call_once(variant_flag, []() {
-        if (auto version_str = run_command("magisk -v 2>/dev/null")) {
+        if (auto version_str = utils::exec_command({"magisk", "-v"})) {
             for (const auto& pair : MAGISK_THIRD_PARTIES) {
                 if (version_str.value().find(pair.first) != std::string::npos) {
                     LOGI("Detected Magisk variant: %s", pair.first);
@@ -221,7 +203,7 @@ static void detect_variant() {
 }
 
 std::optional<Version> detect_version() {
-    auto version_str = run_command("magisk -V 2>/dev/null");
+    auto version_str = utils::exec_command({"magisk", "-V"});
     if (!version_str) return std::nullopt;
 
     int version = std::stoi(version_str.value());
@@ -258,17 +240,6 @@ static std::string quote_sql_str(const std::string& s) {
     return out;
 }
 
-// Escapes and quotes a string for shell execution (e.g. ' -> '\'' and wrap in '')
-static std::string quote_shell_arg(const std::string& s) {
-    std::string out = "'";
-    for (char c : s) {
-        if (c == '\'') out += "'\\''";
-        else out += c;
-    }
-    out += "'";
-    return out;
-}
-
 bool uid_granted_root(int32_t uid) {
     MagiskDB db;
     if (db.is_valid()) {
@@ -278,8 +249,7 @@ bool uid_granted_root(int32_t uid) {
     // Fallback just in case libsqlite.so fails to load
     char query[128];
     snprintf(query, sizeof(query), "SELECT 1 FROM policies WHERE uid=%d AND policy=2 LIMIT 1", uid);
-    std::string cmd = "magisk --sqlite " + quote_shell_arg(query) + " 2>/dev/null";
-    return run_command(cmd.c_str()).has_value();
+    return utils::exec_command({"magisk", "--sqlite", query}).has_value();
 }
 
 bool uid_should_umount(int32_t uid) {
@@ -303,9 +273,7 @@ bool uid_should_umount(int32_t uid) {
     }
 
     if (pkg_name.empty()) {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "pm list packages --uid %d 2>/dev/null", uid);
-        auto list = run_command(cmd);
+        auto list = utils::exec_command({"pm", "list", "packages", "--uid", std::to_string(uid)});
         if (!list) return false;
 
         // Output is typically "package:com.example.app uid:10000"
@@ -331,8 +299,7 @@ bool uid_should_umount(int32_t uid) {
         return false;
     }
     std::string query = "SELECT 1 FROM denylist WHERE package_name='" + quote_sql_str(pkg_name) + "' LIMIT 1";
-    std::string sqlite_cmd = "magisk --sqlite " + quote_shell_arg(query) + " 2>/dev/null";
-    return run_command(sqlite_cmd.c_str()).has_value();
+    return utils::exec_command({"magisk", "--sqlite", query}).has_value();
 }
 
 bool uid_is_manager(int32_t uid) {
@@ -350,8 +317,7 @@ bool uid_is_manager(int32_t uid) {
     } else {
         // Fallback
         const char* query = "SELECT value FROM strings WHERE key='requester' LIMIT 1";
-        std::string cmd = "magisk --sqlite " + quote_shell_arg(query) + " 2>/dev/null";
-        if (auto output = run_command(cmd.c_str())) {
+        if (auto output = utils::exec_command({"magisk", "--sqlite", query})) {
             std::string val = output.value();
             if (val.find("value=") == 0) {
                 std::string manager_pkg = val.substr(6);

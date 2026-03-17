@@ -6,9 +6,12 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <sys/system_properties.h>
+#include <sys/wait.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
+#include <optional>
 
 #include "daemon.hpp"
 #include "logging.hpp"
@@ -122,6 +125,70 @@ bool is_socket_alive(int fd) {
         return false;
     }
     return (pfd.revents & ~POLLIN) == 0;
+}
+
+std::optional<std::string> exec_command(const std::vector<std::string>& args) {
+    if (args.empty()) return std::nullopt;
+
+    int pipefd[2];
+    if (pipe2(pipefd, O_CLOEXEC) == -1) {
+        return std::nullopt;
+    }
+
+    UniqueFd read_pipe(pipefd[0]);
+    UniqueFd write_pipe(pipefd[1]);
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        return std::nullopt;
+    }
+
+    if (pid == 0) {
+        read_pipe = UniqueFd();
+
+        if (write_pipe != STDOUT_FILENO) {
+            dup2(write_pipe, STDOUT_FILENO);
+            write_pipe = UniqueFd();
+        }
+
+        UniqueFd null_fd(open("/dev/null", O_WRONLY | O_CLOEXEC));
+        if (null_fd >= 0) {
+            if (null_fd != STDERR_FILENO) {
+                dup2(null_fd, STDERR_FILENO);
+                null_fd = UniqueFd();
+            }
+        }
+
+        std::vector<char*> c_args;
+        c_args.reserve(args.size() + 1);
+        for (const auto& arg : args) {
+            c_args.push_back(const_cast<char*>(arg.c_str()));
+        }
+        c_args.push_back(nullptr);
+
+        execvp(c_args[0], c_args.data());
+        _exit(127);
+    }
+
+    write_pipe = UniqueFd();
+    std::string result;
+    char buf[256];
+    ssize_t n;
+
+    while ((n = read(read_pipe, buf, sizeof(buf))) > 0) {
+        result.append(buf, n);
+    }
+
+    int status;
+    waitpid(pid, &status, 0);
+
+    // Trim trailing whitespace and newlines
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r' || result.back() == ' ')) {
+        result.pop_back();
+    }
+
+    if (result.empty()) return std::nullopt;
+    return result;
 }
 
 } // namespace utils

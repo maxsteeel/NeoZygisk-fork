@@ -26,21 +26,23 @@ static std::mutex cache_mutex;
 static std::optional<std::pair<time_t, std::shared_ptr<const std::vector<PackageInfo>>>> config_cache;
 
 std::optional<Version> detect_version() {
-    UniquePipe pipe(popen("apd -V", "re"));
-    if (!pipe) return std::nullopt;
+    auto output = utils::exec_command({"apd", "-V"});
+    if (!output) return std::nullopt;
 
-    char buf[128] = {0};
-    if (fgets(buf, sizeof(buf), pipe)) {
-        char* token = strtok(buf, " \t\r\n");
+    // Example output might be "apd version 10423"
+    std::string out_str = output.value();
+    char buf[128];
+    strlcpy(buf, out_str.c_str(), sizeof(buf));
+
+    char* token = strtok(buf, " \t\r\n");
+    if (token) {
+        token = strtok(nullptr, " \t\r\n");
         if (token) {
-            token = strtok(nullptr, " \t\r\n");
-            if (token) {
-                int version = atoi(token);
-                if (version >= MIN_APATCH_VERSION) {
-                    return Version::Supported;
-                } else {
-                    return Version::TooOld;
-                }
+            int version = atoi(token);
+            if (version >= MIN_APATCH_VERSION) {
+                return Version::Supported;
+            } else {
+                return Version::TooOld;
             }
         }
     }
