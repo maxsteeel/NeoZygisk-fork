@@ -40,12 +40,9 @@ typedef const unsigned char* (*sqlite3_column_text_t)(void*, int);
 #define SQLITE_ROW 100
 #define SQLITE_TRANSIENT ((void (*)(void*)) - 1)
 
-// Lightweight wrapper to interact with Android's native libsqlite.so
-class MagiskDB {
-private:
+// Caches the loaded library handle and resolved function pointers
+struct SQLiteLibrary {
     void* handle = nullptr;
-    void* db = nullptr;
-
     sqlite3_open_t fn_open = nullptr;
     sqlite3_prepare_v2_t fn_prepare = nullptr;
     sqlite3_bind_text_t fn_bind_text = nullptr;
@@ -55,8 +52,7 @@ private:
     sqlite3_close_t fn_close = nullptr;
     sqlite3_column_text_t fn_column_text = nullptr;
 
-public:
-    MagiskDB() {
+    SQLiteLibrary() {
         // Load Android's native SQLite library dynamically to avoid bloating the binary
         handle = dlopen("libsqlite.so", RTLD_NOW);
         if (!handle) {
@@ -71,6 +67,41 @@ public:
         fn_finalize = (sqlite3_finalize_t)dlsym(handle, "sqlite3_finalize");
         fn_close = (sqlite3_close_t)dlsym(handle, "sqlite3_close");
         fn_column_text = (sqlite3_column_text_t)dlsym(handle, "sqlite3_column_text");
+    }
+
+    static const SQLiteLibrary& get() {
+        static SQLiteLibrary instance;
+        return instance;
+    }
+};
+
+// Lightweight wrapper to interact with Android's native libsqlite.so
+class MagiskDB {
+private:
+    void* db = nullptr;
+
+    sqlite3_open_t fn_open = nullptr;
+    sqlite3_prepare_v2_t fn_prepare = nullptr;
+    sqlite3_bind_text_t fn_bind_text = nullptr;
+    sqlite3_bind_int_t fn_bind_int = nullptr;
+    sqlite3_step_t fn_step = nullptr;
+    sqlite3_finalize_t fn_finalize = nullptr;
+    sqlite3_close_t fn_close = nullptr;
+    sqlite3_column_text_t fn_column_text = nullptr;
+
+public:
+    MagiskDB() {
+        const auto& lib = SQLiteLibrary::get();
+        if (!lib.handle) return;
+
+        fn_open = lib.fn_open;
+        fn_prepare = lib.fn_prepare;
+        fn_bind_text = lib.fn_bind_text;
+        fn_bind_int = lib.fn_bind_int;
+        fn_step = lib.fn_step;
+        fn_finalize = lib.fn_finalize;
+        fn_close = lib.fn_close;
+        fn_column_text = lib.fn_column_text;
 
         if (fn_open && fn_close) {
             // Open the Magisk database in read-only mode if possible
@@ -83,7 +114,6 @@ public:
 
     ~MagiskDB() {
         if (db && fn_close) fn_close(db);
-        if (handle) dlclose(handle);
     }
 
     bool is_valid() const { return db != nullptr; }
