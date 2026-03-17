@@ -283,19 +283,40 @@ bool uid_granted_root(int32_t uid) {
 }
 
 bool uid_should_umount(int32_t uid) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "pm list packages --uid %d 2>/dev/null", uid);
-    auto list = run_command(cmd);
-    if (!list) return false;
+    std::string pkg_name;
+    std::string uid_str = std::to_string(uid);
+    size_t uid_len = uid_str.length();
 
-    // Output is typically "package:com.example.app uid:10000"
-    std::string list_str = list.value();
-    size_t pos = list_str.find("package:");
-    if (pos == std::string::npos) return false;
+    UniqueFile fp(fopen("/data/system/packages.list", "re"));
+    if (fp) {
+        char line[1024];
+        while (fgets(line, sizeof(line), fp)) {
+            char* space1 = strchr(line, ' ');
+            if (!space1) continue;
 
-    pos += 8; // "package:"
-    size_t space_pos = list_str.find(' ', pos);
-    std::string pkg_name = list_str.substr(pos, space_pos == std::string::npos ? std::string::npos : space_pos - pos);
+            char* uid_start = space1 + 1;
+            if (strncmp(uid_start, uid_str.c_str(), uid_len) == 0 && uid_start[uid_len] == ' ') {
+                pkg_name.assign(line, space1 - line);
+                break;
+            }
+        }
+    }
+
+    if (pkg_name.empty()) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "pm list packages --uid %d 2>/dev/null", uid);
+        auto list = run_command(cmd);
+        if (!list) return false;
+
+        // Output is typically "package:com.example.app uid:10000"
+        std::string list_str = list.value();
+        size_t pos = list_str.find("package:");
+        if (pos == std::string::npos) return false;
+
+        pos += 8; // "package:"
+        size_t space_pos = list_str.find(' ', pos);
+        pkg_name = list_str.substr(pos, space_pos == std::string::npos ? std::string::npos : space_pos - pos);
+    }
 
     if (pkg_name.empty()) return false;
 
