@@ -4,6 +4,8 @@
 #include <dirent.h>
 #include <utility>
 #include <cstdio>
+#include <vector>
+#include <optional>
 
 // Wrapper to automatically close FILE pointers when they go out of scope.
 // Prevents memory and file descriptor leaks in case of early returns.
@@ -128,5 +130,8 @@ bool unix_datagram_sendto(const char* path, const void* buf, size_t len);
 
 // Checks if a Unix socket is still alive and connected using `poll`.
 bool is_socket_alive(int fd);
+
+// Executes a shell command securely avoiding shell injection by directly using execvp.
+std::optional<std::string> exec_command(const std::vector<std::string>& args);
 
 } // namespace utils
