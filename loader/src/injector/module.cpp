@@ -690,8 +690,14 @@ void ZygiskContext::nativeSpecializeAppProcess_pre() {
         if (!abort_zygote_unmount(traces, info_flags)) {
             for (const auto &trace : traces) {
                 LOGV("AppZygote unmounting %s (Type: %s)", trace.target.c_str(), trace.type.c_str());
-                if (umount2(trace.target.c_str(), MNT_DETACH) != 0) {
-                     LOGE("AppZygote failed to unmount %s: %s", trace.target.c_str(), strerror(errno));
+                int layers = 0;
+                while (umount2(trace.target.c_str(), MNT_DETACH) == 0) {
+                    layers++;
+                }
+                if (layers == 0) {
+                    LOGE("AppZygote failed to unmount %s: %s", trace.target.c_str(), strerror(errno));
+                } else if (layers > 1) {
+                    LOGI("AppZygote cleaned %d stacked layers of %s", layers, trace.target.c_str());
                 }
             }
             g_hook->zygote_unmounted = true;
@@ -719,7 +725,12 @@ void ZygiskContext::nativeForkAndSpecialize_pre() {
         if (!abort_zygote_unmount(g_hook->zygote_traces, info_flags)) {
             auto removal_predicate = [](const mount_info &trace) {
                 LOGV("Unmounting %s (mnt_id: %u)", trace.target.c_str(), trace.id);
-                if (umount2(trace.target.c_str(), MNT_DETACH) == 0) {
+                int layers = 0;
+                while (umount2(trace.target.c_str(), MNT_DETACH) == 0) {
+                    layers++;
+                }
+                if (layers > 0) {
+                    if (layers > 1) LOGI("Cleaned %d layers stacked on %s", layers, trace.target.c_str());
                     return true;  // Success: Mark for removal.
                 } else {
                     LOGE("failed to unmount %s: %s", trace.target.c_str(), strerror(errno));
