@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <vector>
 #include <mutex>
+#include <memory>
 
 #include "constants.hpp"
 #include "logging.hpp"
@@ -22,7 +23,7 @@ struct PackageInfo {
 static const char* CONFIG_FILE = "/data/adb/ap/package_config";
 
 static std::mutex cache_mutex;
-static std::optional<std::pair<time_t, std::vector<PackageInfo>>> config_cache;
+static std::optional<std::pair<time_t, std::shared_ptr<const std::vector<PackageInfo>>>> config_cache;
 
 std::optional<Version> detect_version() {
     UniquePipe pipe(popen("apd -V", "re"));
@@ -46,10 +47,10 @@ std::optional<Version> detect_version() {
     return std::nullopt;
 }
 
-static std::optional<std::vector<PackageInfo>> get_config() {
+static std::shared_ptr<const std::vector<PackageInfo>> get_config() {
     struct stat st;
     if (stat(CONFIG_FILE, &st) != 0) {
-        return std::nullopt;
+        return nullptr;
     }
 
     time_t mtime = st.st_mtime;
@@ -64,14 +65,14 @@ static std::optional<std::vector<PackageInfo>> get_config() {
     }
 
     UniqueFile file(fopen(CONFIG_FILE, "re"));
-    if (!file) return std::nullopt;
+    if (!file) return nullptr;
 
-    std::vector<PackageInfo> result;
+    auto result = std::make_shared<std::vector<PackageInfo>>();
     char line[512];
 
     // Skip header
     if (!fgets(line, sizeof(line), file)) {
-        return std::nullopt;
+        return nullptr;
     }
 
     while (fgets(line, sizeof(line), file)) {
@@ -81,22 +82,24 @@ static std::optional<std::vector<PackageInfo>> get_config() {
         // format: pkg_name,exclude,allow,uid,...
         char pkg_name[256];
         if (sscanf(line, "%255[^,],%d,%d,%d", pkg_name, &exclude_val, &allow_val, &uid_val) >= 4) {
-            result.push_back({uid_val, exclude_val == 1, allow_val == 1});
+            result->push_back({uid_val, exclude_val == 1, allow_val == 1});
         }
     }
 
+    std::shared_ptr<const std::vector<PackageInfo>> const_result = result;
+
     {
         std::lock_guard<std::mutex> lock(cache_mutex);
-        config_cache = std::make_pair(mtime, result);
+        config_cache = std::make_pair(mtime, const_result);
     }
 
-    return result;
+    return const_result;
 }
 
 bool uid_granted_root(int32_t uid) {
     auto config = get_config();
-    if (!config.has_value()) return false;
-    for (const auto& pkg : config.value()) {
+    if (!config) return false;
+    for (const auto& pkg : *config) {
         if (pkg.uid == uid && pkg.allow) return true;
     }
     return false;
@@ -104,8 +107,8 @@ bool uid_granted_root(int32_t uid) {
 
 bool uid_should_umount(int32_t uid) {
     auto config = get_config();
-    if (!config.has_value()) return false;
-    for (const auto& pkg : config.value()) {
+    if (!config) return false;
+    for (const auto& pkg : *config) {
         if (pkg.uid == uid && pkg.exclude) return true;
     }
     return false;
