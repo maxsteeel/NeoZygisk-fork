@@ -247,6 +247,28 @@ static bool is_valid_pkg_name(const std::string& pkg_name) {
     return true;
 }
 
+// Escapes single quotes for SQL string literals (e.g. ' -> '')
+static std::string quote_sql_str(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (char c : s) {
+        if (c == '\'') out += "''";
+        else out += c;
+    }
+    return out;
+}
+
+// Escapes and quotes a string for shell execution (e.g. ' -> '\'' and wrap in '')
+static std::string quote_shell_arg(const std::string& s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    out += "'";
+    return out;
+}
+
 bool uid_granted_root(int32_t uid) {
     MagiskDB db;
     if (db.is_valid()) {
@@ -254,9 +276,10 @@ bool uid_granted_root(int32_t uid) {
     }
 
     // Fallback just in case libsqlite.so fails to load
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "magisk --sqlite 'SELECT 1 FROM policies WHERE uid=%d AND policy=2 LIMIT 1' 2>/dev/null", uid);
-    return run_command(cmd).has_value();
+    char query[128];
+    snprintf(query, sizeof(query), "SELECT 1 FROM policies WHERE uid=%d AND policy=2 LIMIT 1", uid);
+    std::string cmd = "magisk --sqlite " + quote_shell_arg(query) + " 2>/dev/null";
+    return run_command(cmd.c_str()).has_value();
 }
 
 bool uid_should_umount(int32_t uid) {
@@ -286,9 +309,9 @@ bool uid_should_umount(int32_t uid) {
         LOGW("Invalid package name for fallback: %s", pkg_name.c_str());
         return false;
     }
-    char sqlite_cmd[512];
-    snprintf(sqlite_cmd, sizeof(sqlite_cmd), "magisk --sqlite 'SELECT 1 FROM denylist WHERE package_name=\"%s\" LIMIT 1' 2>/dev/null", pkg_name.c_str());
-    return run_command(sqlite_cmd).has_value();
+    std::string query = "SELECT 1 FROM denylist WHERE package_name='" + quote_sql_str(pkg_name) + "' LIMIT 1";
+    std::string sqlite_cmd = "magisk --sqlite " + quote_shell_arg(query) + " 2>/dev/null";
+    return run_command(sqlite_cmd.c_str()).has_value();
 }
 
 bool uid_is_manager(int32_t uid) {
@@ -305,15 +328,19 @@ bool uid_is_manager(int32_t uid) {
         }
     } else {
         // Fallback
-        if (auto output = run_command("magisk --sqlite 'SELECT value FROM strings WHERE key=\"requester\" LIMIT 1' 2>/dev/null")) {
+        const char* query = "SELECT value FROM strings WHERE key='requester' LIMIT 1";
+        std::string cmd = "magisk --sqlite " + quote_shell_arg(query) + " 2>/dev/null";
+        if (auto output = run_command(cmd.c_str())) {
             std::string val = output.value();
             if (val.find("value=") == 0) {
                 std::string manager_pkg = val.substr(6);
-                char path[256];
-                snprintf(path, sizeof(path), "/data/user_de/0/%s", manager_pkg.c_str());
-                struct stat st;
-                if (stat(path, &st) == 0) {
-                    return st.st_uid == static_cast<uid_t>(uid);
+                if (is_valid_pkg_name(manager_pkg)) {
+                    char path[256];
+                    snprintf(path, sizeof(path), "/data/user_de/0/%s", manager_pkg.c_str());
+                    struct stat st;
+                    if (stat(path, &st) == 0) {
+                        return st.st_uid == static_cast<uid_t>(uid);
+                    }
                 }
             }
         }
