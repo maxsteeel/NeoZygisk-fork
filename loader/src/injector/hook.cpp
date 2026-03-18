@@ -14,6 +14,7 @@
 #include <linux/filter.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <linux/audit.h>
 
 #include <lsplt.hpp>
 
@@ -286,33 +287,55 @@ DCL_HOOK_FUNC(static int, pthread_attr_setstacksize, void *target, size_t size) 
     return res;
 }
 
+#if defined(__aarch64__)
+#define SECCOMP_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#elif defined(__arm__)
+#define SECCOMP_AUDIT_ARCH AUDIT_ARCH_ARM
+#elif defined(__x86_64__)
+#define SECCOMP_AUDIT_ARCH AUDIT_ARCH_X86_64
+#elif defined(__i386__)
+#define SECCOMP_AUDIT_ARCH AUDIT_ARCH_I386
+#else
+#error "Unsupported architecture"
+#endif
+
 DCL_HOOK_FUNC(int, prctl, int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5) {
     if (option == PR_SET_SECCOMP && arg2 == SECCOMP_MODE_FILTER) {
         struct sock_fprog* prog = reinterpret_cast<struct sock_fprog*>(arg3);
         if (prog != nullptr && prog->len > 0) {
-            // We want to prepend rules to allow __NR_execve.
+            // We want to prepend rules to check the arch and allow __NR_execve.
             const struct sock_filter prepend[] = {
+                // 1. Check Architecture
+                BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SECCOMP_AUDIT_ARCH, 0, 3), // If match, go to next. If not, jump 3 instructions (to original filter).
+
+                // 2. Check Syscall Number
                 BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execve, 0, 1),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execve, 0, 1), // If match, go to allow. If not, jump 1 instruction (to original filter).
+
+                // 3. Allow Syscall
                 BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
             };
 
             size_t prepend_len = sizeof(prepend) / sizeof(prepend[0]);
             size_t total_len = prepend_len + prog->len;
 
-            // Use stack allocated array to strictly avoid heap allocations.
-            // BPF_MAXINSNS is 4096, which is reasonable for the stack.
             if (total_len <= BPF_MAXINSNS) {
-                struct sock_filter new_filter[BPF_MAXINSNS];
-                memcpy(new_filter, prepend, sizeof(prepend));
-                memcpy(new_filter + prepend_len, prog->filter, prog->len * sizeof(struct sock_filter));
+                // Use dynamic stack allocation via alloca to avoid reserving 32KB unconditionally.
+                size_t alloc_size = total_len * sizeof(struct sock_filter);
+                struct sock_filter* new_filter = static_cast<struct sock_filter*>(__builtin_alloca(alloc_size));
 
-                // Temporarily modify the prog to point to our new filter
-                struct sock_fprog new_prog;
-                new_prog.len = static_cast<unsigned short>(total_len);
-                new_prog.filter = new_filter;
+                if (new_filter != nullptr) {
+                    memcpy(new_filter, prepend, sizeof(prepend));
+                    memcpy(new_filter + prepend_len, prog->filter, prog->len * sizeof(struct sock_filter));
 
-                return old_prctl(option, arg2, reinterpret_cast<unsigned long>(&new_prog), arg4, arg5);
+                    // Temporarily modify the prog to point to our new filter
+                    struct sock_fprog new_prog;
+                    new_prog.len = static_cast<unsigned short>(total_len);
+                    new_prog.filter = new_filter;
+
+                    return old_prctl(option, arg2, reinterpret_cast<unsigned long>(&new_prog), arg4, arg5);
+                }
             }
         }
     }
