@@ -2,6 +2,8 @@
 
 #include <android/dlext.h>
 #include <fcntl.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -29,6 +31,32 @@ struct linux_dirent64 {
     unsigned char d_type;
     char d_name[];
 };
+
+static __thread sigjmp_buf g_segv_jmp_buf;
+static __thread volatile sig_atomic_t g_in_module_load = 0;
+static struct sigaction old_segv, old_bus;
+
+static void module_segv_handler(int sig, siginfo_t *info, void *context) {
+    if (g_in_module_load) {
+        siglongjmp(g_segv_jmp_buf, 1);
+    }
+
+    // Chain to previous handler if not caught by us
+    struct sigaction *old_sa = (sig == SIGSEGV) ? &old_segv : &old_bus;
+    if (old_sa->sa_flags & SA_SIGINFO) {
+        if (old_sa->sa_sigaction) {
+            old_sa->sa_sigaction(sig, info, context);
+        }
+    } else {
+        if (old_sa->sa_handler == SIG_DFL || old_sa->sa_handler == SIG_IGN) {
+            // Reset to default and re-raise to properly crash the process
+            signal(sig, SIG_DFL);
+            raise(sig);
+        } else if (old_sa->sa_handler) {
+            old_sa->sa_handler(sig);
+        }
+    }
+}
 
 // Extremely fast inline string-to-int parser (avoids atoi overhead)
 static inline int fast_atoi(const char *str) {
@@ -421,24 +449,84 @@ void ZygiskContext::fork_post() {
 void ZygiskContext::run_modules_pre() {
     auto ms = zygiskd::ReadModules();
     auto size = ms.size();
+
+    void* altstack_mem = malloc(SIGSTKSZ);
+    stack_t ss = {};
+    ss.ss_sp = altstack_mem;
+    ss.ss_size = SIGSTKSZ;
+    ss.ss_flags = 0;
+    sigaltstack(&ss, nullptr);
+
+    struct sigaction sa = {};
+    sa.sa_sigaction = module_segv_handler;
+    sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS, &sa, &old_bus);
+
     for (size_t i = 0; i < size; i++) {
         auto &m = ms[i];
-        if (void *handle = DlopenMem(m.memfd, RTLD_NOW);
-            void *entry = handle ? dlsym(handle, "zygisk_module_entry") : nullptr) {
-            modules.emplace_back(i, handle, entry);
+
+        g_in_module_load = 1;
+        if (sigsetjmp(g_segv_jmp_buf, 1) == 0) {
+            void *handle = DlopenMem(m.memfd, RTLD_NOW);
+            void *entry = handle ? dlsym(handle, "zygisk_module_entry") : nullptr;
+            if (handle && entry) {
+                modules.emplace_back(i, handle, entry);
+            }
+        } else {
+            LOGE("Module `%s` crashed during dlopen/dlsym. Disabling.", m.name);
+            LOGW("WARNING: A crash during dlopen may leave the bionic linker mutex locked, "
+                 "potentially causing a deadlock in future library loading.");
+            UniqueFd dir_fd(zygiskd::GetModuleDir(i));
+            if (dir_fd >= 0) {
+                UniqueFd fd(openat(dir_fd, "disable", O_CREAT | O_RDWR | O_CLOEXEC, 0644));
+            }
         }
+        g_in_module_load = 0;
 
         close(m.memfd);
-        memzero(m.name, sizeof(m.name));
     }
 
-    for (auto &m : modules) {
-        m.onLoad(env);
-        if (flags & APP_SPECIALIZE) {
-            m.preAppSpecialize(args.app);
-        } else if (flags & SERVER_FORK_AND_SPECIALIZE) {
-            m.preServerSpecialize(args.server);
+    for (auto it = modules.begin(); it != modules.end(); ) {
+        auto &m = *it;
+        bool crashed = false;
+
+        g_in_module_load = 1;
+        if (sigsetjmp(g_segv_jmp_buf, 1) == 0) {
+            m.onLoad(env);
+            if (flags & APP_SPECIALIZE) {
+                m.preAppSpecialize(args.app);
+            } else if (flags & SERVER_FORK_AND_SPECIALIZE) {
+                m.preServerSpecialize(args.server);
+            }
+        } else {
+            crashed = true;
+            LOGE("Module crashed during onLoad/preSpecialize. Disabling.");
+            UniqueFd dir_fd(zygiskd::GetModuleDir(m.getId()));
+            if (dir_fd >= 0) {
+                UniqueFd fd(openat(dir_fd, "disable", O_CREAT | O_RDWR | O_CLOEXEC, 0644));
+            }
         }
+        g_in_module_load = 0;
+
+        if (crashed) {
+            it = modules.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    sigaction(SIGSEGV, &old_segv, nullptr);
+    sigaction(SIGBUS, &old_bus, nullptr);
+
+    ss.ss_flags = SS_DISABLE;
+    sigaltstack(&ss, nullptr);
+    free(altstack_mem);
+
+    for (auto &m : ms) {
+        memzero(m.name, sizeof(m.name));
     }
 }
 
