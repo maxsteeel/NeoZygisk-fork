@@ -4,6 +4,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -19,6 +20,8 @@
 
 #include <sys/mman.h>
 #include <linux/memfd.h>
+#include <sys/prctl.h>
+#include <sys/ptrace.h>
 
 #include "logging.hpp"
 #include "constants.hpp"
@@ -482,6 +485,30 @@ static void handle_connection(UniqueFd stream, std::shared_ptr<AppContext> conte
 }
 
 int main() {
+    // Prevent RAM dumping of the daemon
+    prctl(PR_SET_DUMPABLE, 0);
+
+    // Anti-debugging (Self-debugging trick)
+    // We spawn a dummy child thread that calls PTRACE_TRACEME and sleeps forever.
+    // When tools like Frida (or other reverse engineering tools) iterate through
+    // /proc/<pid>/task/ to attach to all threads in the process group, they will
+    // encounter EBUSY/EPERM when trying to attach to this thread. This graceful
+    // trick causes the injection process to fail without the resource overhead of
+    // actively proxying signals for the main process.
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    // Use an extremely small 16KB stack size to save RAM since every byte counts.
+    pthread_attr_setstacksize(&attr, 16384);
+    pthread_t guard_thread;
+    pthread_create(&guard_thread, &attr, [](void*) -> void* {
+        prctl(PR_SET_NAME, "zygiskd-guard");
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        while (true) pause();
+        return nullptr;
+    }, nullptr);
+    pthread_attr_destroy(&attr);
+    pthread_detach(guard_thread);
+
     // Ignore SIGPIPE to prevent the daemon from crashing if a client disconnects unexpectedly
     signal(SIGPIPE, SIG_IGN);
 
