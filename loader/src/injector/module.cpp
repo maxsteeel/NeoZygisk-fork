@@ -8,6 +8,10 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#ifndef __NR_close_range
+#define __NR_close_range 436
+#endif
+
 #include <lsplt.hpp>
 
 #include "daemon.hpp"
@@ -301,22 +305,46 @@ void ZygiskContext::sanitize_fds() {
     }
 
     // Close all forbidden fds using direct syscall
-    UniqueFd fd_dir(open("/proc/self/fd", O_RDONLY | O_DIRECTORY));
-    if (likely(fd_dir >= 0)) {
-        char buf[4096];
-        int nread;
-        while ((nread = syscall(__NR_getdents64, (int)fd_dir, buf, sizeof(buf))) > 0) {
-            for (int bpos = 0; bpos < nread;) {
-                auto d = reinterpret_cast<struct linux_dirent64 *>(buf + bpos);
-                if (d->d_name[0] >= '0' && d->d_name[0] <= '9') {
-                    int fd = fast_atoi(d->d_name);
-                    if (unlikely((fd < 0 || static_cast<size_t>(fd) >= allowed_fds.size() ||
-                                  !allowed_fds[fd]) &&
-                                 fd != (int)fd_dir)) {
-                        close(fd);
-                    }
+    if (is_kernel_5_9_or_newer()) {
+        unsigned int start_fd = 0;
+        bool in_range = false;
+        size_t n = allowed_fds.size();
+        for (size_t i = 0; i < n; ++i) {
+            if (!allowed_fds[i]) {
+                if (!in_range) {
+                    start_fd = static_cast<unsigned int>(i);
+                    in_range = true;
                 }
-                bpos += d->d_reclen;
+            } else {
+                if (in_range) {
+                    syscall(__NR_close_range, start_fd, static_cast<unsigned int>(i - 1), 0);
+                    in_range = false;
+                }
+            }
+        }
+        if (in_range) {
+            syscall(__NR_close_range, start_fd, ~0U, 0);
+        } else {
+            syscall(__NR_close_range, static_cast<unsigned int>(n), ~0U, 0);
+        }
+    } else {
+        UniqueFd fd_dir(open("/proc/self/fd", O_RDONLY | O_DIRECTORY));
+        if (likely(fd_dir >= 0)) {
+            char buf[4096];
+            int nread;
+            while ((nread = syscall(__NR_getdents64, (int)fd_dir, buf, sizeof(buf))) > 0) {
+                for (int bpos = 0; bpos < nread;) {
+                    auto d = reinterpret_cast<struct linux_dirent64 *>(buf + bpos);
+                    if (d->d_name[0] >= '0' && d->d_name[0] <= '9') {
+                        int fd = fast_atoi(d->d_name);
+                        if (unlikely((fd < 0 || static_cast<size_t>(fd) >= allowed_fds.size() ||
+                                      !allowed_fds[fd]) &&
+                                     fd != (int)fd_dir)) {
+                            close(fd);
+                        }
+                    }
+                    bpos += d->d_reclen;
+                }
             }
         }
     }
