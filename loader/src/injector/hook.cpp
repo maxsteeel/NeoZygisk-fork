@@ -15,6 +15,7 @@
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <linux/audit.h>
+#include <stdint.h>
 
 #include <lsplt.hpp>
 
@@ -34,6 +35,14 @@ struct Property {
 };
 
 vector<Property> g_spoof_props;
+
+struct prop_info;
+typedef void (*prop_info_cb)(void* cookie, const char* name, const char* value, uint32_t serial);
+
+struct CustomCallbackCookie {
+    prop_info_cb original_callback;
+    void* original_cookie;
+};
 
 static string trim(const string& str) {
     size_t first = str.find_first_not_of(" \t\r\n");
@@ -216,6 +225,46 @@ DCL_HOOK_FUNC(static int, unshare, int flags) {
     return res;
 }
 
+static void custom_property_read_callback(void* cookie, const char* name, const char* value, uint32_t serial) {
+    if (cookie == nullptr) return;
+    auto* custom_cookie = static_cast<CustomCallbackCookie*>(cookie);
+
+    if (name && !g_spoof_props.empty()) {
+        for (const auto &prop : g_spoof_props) {
+            if (prop.key == name) {
+                custom_cookie->original_callback(custom_cookie->original_cookie, name, prop.value.c_str(), serial);
+                return;
+            }
+        }
+    }
+
+    custom_cookie->original_callback(custom_cookie->original_cookie, name, value, serial);
+}
+
+DCL_HOOK_FUNC(void, __system_property_read_callback, const prop_info* pi, prop_info_cb callback, void* cookie) {
+    CustomCallbackCookie custom_cookie{callback, cookie};
+    old___system_property_read_callback(pi, custom_property_read_callback, &custom_cookie);
+}
+
+DCL_HOOK_FUNC(int, __system_property_get, const char *name, char *value) {
+    if (name && !g_spoof_props.empty()) {
+        for (const auto &prop : g_spoof_props) {
+            if (prop.key == name) {
+                int len = prop.value.length();
+                // PROP_VALUE_MAX is 92, we limit it to 91 to be safe
+                if (len >= 92) len = 91;
+
+                if (value) {
+                    strncpy(value, prop.value.c_str(), len);
+                    value[len] = '\0';
+                }
+                return len;
+            }
+        }
+    }
+    return old___system_property_get(name, value);
+}
+
 DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *default_value) {
 
     if (key && !g_spoof_props.empty()) {
@@ -240,18 +289,23 @@ DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *defau
             g_hook->hook_unloader();
             g_hook->skip_hooking_unloader = true;
 
-            for (auto it = g_hook->plt_backup.rbegin(); it != g_hook->plt_backup.rend(); ++it) {
+            for (auto it = g_hook->plt_backup.rbegin(); it != g_hook->plt_backup.rend();) {
                 const auto &[dev, inode, sym, old_func] = *it;
-                if (*old_func == reinterpret_cast<void*>(old_property_get)) {
+                bool is_prop_get = (*old_func == reinterpret_cast<void*>(old_property_get));
+                bool is_sys_prop_get = (*old_func == reinterpret_cast<void*>(old___system_property_get));
+                bool is_sys_prop_read = (*old_func == reinterpret_cast<void*>(old___system_property_read_callback));
+
+                if (is_prop_get || is_sys_prop_get || is_sys_prop_read) {
                     if (!lsplt::RegisterHook(dev, inode, sym, *old_func, nullptr) ||
                         !lsplt::CommitHook(g_hook->cached_map_infos, true)) {
-                        PLOGE("unhook property_get");
+                        PLOGE("unhook %s", sym);
+                        ++it;
                     } else {
-                        g_hook->plt_backup.erase(std::next(it).base());
+                        it = decltype(it)(g_hook->plt_backup.erase(std::next(it).base()));
                     }
-                    break;
+                } else {
+                    ++it;
                 }
-                break;
             }
         }
     }
@@ -449,6 +503,8 @@ void HookContext::hook_plt() {
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, unshare);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, strdup);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, property_get);
+    PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, __system_property_get);
+    PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, __system_property_read_callback);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, prctl);
 
     if (!lsplt::CommitHook(cached_map_infos)) LOGE("HookContext::hook_plt failed");
