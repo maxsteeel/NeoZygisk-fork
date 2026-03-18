@@ -2,15 +2,39 @@
 
 #include <linux/un.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 
 #include "logging.hpp"
 #include "misc.hpp"
 #include "socket_utils.hpp"
 
+// Forward declaration of ShmLayout since we can't include zygiskd constants here
+namespace constants {
+    constexpr size_t SHM_HASH_MAP_SIZE = 8192;
+    struct ShmEntry {
+        std::atomic<uint32_t> uid;
+        std::atomic<uint32_t> flags;
+    };
+    struct ShmLayout {
+        std::atomic<uint32_t> version;
+        ShmEntry entries[SHM_HASH_MAP_SIZE];
+    };
+}
+
 namespace zygiskd {
 static std::string TMP_PATH;
 static std::string MODULE_DIR;
 std::string kCPSocketName = (sizeof(void*) == 8) ? "cp64.sock" : "cp32.sock";
+
+static constants::ShmLayout* g_shm_base = nullptr;
+static bool g_shm_init_attempted = false;
+
+void UnmapSharedMemory() {
+    if (g_shm_base) {
+        munmap(g_shm_base, sizeof(constants::ShmLayout));
+        g_shm_base = nullptr;
+    }
+}
 
 void Init(const char *path, const char *mod_dir) {
     TMP_PATH = path;
@@ -53,6 +77,53 @@ bool PingHeartbeat() {
 }
 
 uint32_t GetProcessFlags(uid_t uid) {
+    // Attempt to initialize SHM if we haven't already
+    if (!g_shm_init_attempted) {
+        g_shm_init_attempted = true;
+        UniqueFd shm_fd = UniqueFd(GetSharedMemoryFd());
+        if (shm_fd >= 0) {
+            void* map_res = mmap(nullptr, sizeof(constants::ShmLayout), PROT_READ, MAP_SHARED, shm_fd, 0);
+            if (map_res != MAP_FAILED) {
+                g_shm_base = static_cast<constants::ShmLayout*>(map_res);
+                LOGV("Successfully mapped shared memory for ProcessFlags caching");
+            } else {
+                PLOGE("Failed to mmap zygisk-shm");
+            }
+        }
+    }
+
+    if (g_shm_base) {
+        // Read version to ensure we aren't reading during a write
+        uint32_t version1 = g_shm_base->version.load(std::memory_order_acquire);
+
+        if (version1 % 2 == 0) { // Not currently writing
+            size_t index = uid & (constants::SHM_HASH_MAP_SIZE - 1); // uid & 8191
+            size_t start_index = index;
+            bool found = false;
+            uint32_t cached_flags = 0;
+
+            do {
+                uint32_t current_uid = g_shm_base->entries[index].uid.load(std::memory_order_relaxed);
+                if (current_uid == static_cast<uint32_t>(uid)) {
+                    cached_flags = g_shm_base->entries[index].flags.load(std::memory_order_relaxed);
+                    found = true;
+                    break;
+                } else if (current_uid == UINT32_MAX) {
+                    break; // Empty slot found, UID is definitely not here
+                }
+                index = (index + 1) % constants::SHM_HASH_MAP_SIZE;
+            } while (index != start_index);
+
+            if (found) {
+                uint32_t version2 = g_shm_base->version.load(std::memory_order_acquire);
+                if (version1 == version2) {
+                    return cached_flags;
+                }
+            }
+        }
+    }
+
+    // Fallback to IPC if SHM fails, UID isn't cached, or version check failed
     UniqueFd fd = Connect(1);
     if (fd == -1) {
         PLOGE("GetProcessFlags");
@@ -61,6 +132,29 @@ uint32_t GetProcessFlags(uid_t uid) {
     socket_utils::write_u8(fd, (uint8_t) SocketAction::GetProcessFlags);
     socket_utils::write_u32(fd, uid);
     return socket_utils::read_u32(fd);
+}
+
+int GetSharedMemoryFd() {
+    UniqueFd fd = Connect(1);
+    if (fd == -1) {
+        PLOGE("GetSharedMemoryFd");
+        return -1;
+    }
+    socket_utils::write_u8(fd, (uint8_t) SocketAction::GetSharedMemoryFd);
+
+    // Read Status Byte
+    uint8_t status = socket_utils::read_u8(fd);
+    if (status == 0) {
+        return -1;
+    }
+
+    int namespace_fd = socket_utils::recv_fd(fd);
+    if (namespace_fd < 0) {
+        PLOGE("GetSharedMemoryFd: failed to receive fd");
+        return -1;
+    }
+
+    return namespace_fd;
 }
 
 void CacheMountNamespace(pid_t pid) {

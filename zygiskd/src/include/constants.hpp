@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 // --- Versioning Constants ---
@@ -55,6 +56,7 @@ enum class DaemonSocketAction : uint8_t {
     GetModuleDir,
     ZygoteRestart,
     SystemServerStarted,
+    GetSharedMemoryFd,
 };
 
 // ProcessFlags bitmask
@@ -95,5 +97,20 @@ inline ProcessFlags& operator&=(ProcessFlags& a, ProcessFlags b) {
 inline bool has_flag(ProcessFlags flags, ProcessFlags flag) {
     return (flags & flag) == flag;
 }
+
+// --- Shared Memory ---
+constexpr size_t SHM_HASH_MAP_SIZE = 8192; // Should be a power of 2 for fast modulo
+
+struct ShmEntry {
+    std::atomic<uint32_t> uid;
+    std::atomic<uint32_t> flags;
+};
+
+struct ShmLayout {
+    // This value is incremented before a batch update and after a batch update.
+    // Readers should check if the version is even, and verify it hasn't changed during reads.
+    std::atomic<uint32_t> version;
+    ShmEntry entries[SHM_HASH_MAP_SIZE];
+};
 
 } // namespace constants
