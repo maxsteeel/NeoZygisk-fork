@@ -74,6 +74,10 @@ static std::string TMP_PATH;
 static std::string CONTROLLER_SOCKET;
 static std::string DAEMON_SOCKET_PATH;
 
+static UniqueFd g_shm_fd;
+static constants::ShmLayout* g_shm_base = nullptr;
+static std::mutex g_shm_write_mutex;
+
 static bool initialize_globals() {
     const char* tmp = getenv("TMP_PATH");
     if (!tmp) {
@@ -84,6 +88,37 @@ static bool initialize_globals() {
 
     CONTROLLER_SOCKET = TMP_PATH + "/init_monitor";
     DAEMON_SOCKET_PATH = LP_SELECT("cp32.sock", "cp64.sock");
+
+    // Initialize Shared Memory
+    g_shm_fd = UniqueFd(memfd_create("zygisk-shm", MFD_ALLOW_SEALING | MFD_CLOEXEC));
+    if (g_shm_fd < 0) {
+        PLOGE("memfd_create zygisk-shm failed");
+        return false;
+    }
+    if (ftruncate(g_shm_fd, sizeof(constants::ShmLayout)) < 0) {
+        PLOGE("ftruncate zygisk-shm failed");
+        return false;
+    }
+
+    // Add seals to prevent modifying size
+    int seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL;
+    if (fcntl(g_shm_fd, F_ADD_SEALS, seals) == -1) {
+        LOGW("Failed to add seals to shm memfd: %s", strerror(errno));
+    }
+
+    g_shm_base = static_cast<constants::ShmLayout*>(mmap(nullptr, sizeof(constants::ShmLayout), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0));
+    if (g_shm_base == MAP_FAILED) {
+        PLOGE("mmap zygisk-shm failed");
+        return false;
+    }
+
+    // Initialize all UID slots to UINT32_MAX to allow UID 0 (root) caching
+    g_shm_base->version.store(0, std::memory_order_relaxed);
+    for (size_t i = 0; i < constants::SHM_HASH_MAP_SIZE; ++i) {
+        g_shm_base->entries[i].uid.store(UINT32_MAX, std::memory_order_relaxed);
+        g_shm_base->entries[i].flags.store(0, std::memory_order_relaxed);
+    }
+
     return true;
 }
 
@@ -358,7 +393,41 @@ static void handle_get_process_flags(int stream) {
     else if (root == root_impl::RootImpl::KernelSU) flags |= ProcessFlags::PROCESS_ROOT_IS_KSU;
     else if (root == root_impl::RootImpl::Magisk) flags |= ProcessFlags::PROCESS_ROOT_IS_MAGISK;
 
-    socket_utils::write_u32(stream, static_cast<uint32_t>(flags));
+    uint32_t flags_val = static_cast<uint32_t>(flags);
+    socket_utils::write_u32(stream, flags_val);
+
+    if (g_shm_base) {
+        std::lock_guard<std::mutex> lock(g_shm_write_mutex);
+
+        // Find slot in hash map using linear probing
+        size_t index = uid % constants::SHM_HASH_MAP_SIZE;
+        size_t start_index = index;
+        bool inserted = false;
+
+        // We increment version to denote we are writing
+        uint32_t current_version = g_shm_base->version.load(std::memory_order_relaxed);
+        if (current_version % 2 == 0) {
+            g_shm_base->version.store(current_version + 1, std::memory_order_release);
+        }
+
+        do {
+            uint32_t current_uid = g_shm_base->entries[index].uid.load(std::memory_order_relaxed);
+            if (current_uid == UINT32_MAX || current_uid == static_cast<uint32_t>(uid)) {
+                g_shm_base->entries[index].uid.store(uid, std::memory_order_relaxed);
+                g_shm_base->entries[index].flags.store(flags_val, std::memory_order_relaxed);
+                inserted = true;
+                break;
+            }
+            index = (index + 1) % constants::SHM_HASH_MAP_SIZE;
+        } while (index != start_index);
+
+        if (!inserted) {
+            LOGW("ShmMap is full! Could not cache uid %d", uid);
+        }
+
+        // Finish update
+        g_shm_base->version.store(g_shm_base->version.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+    }
 }
 
 static void handle_update_mount_namespace(int stream, AppContext* context) {
@@ -471,6 +540,15 @@ static void handle_connection(UniqueFd stream, std::shared_ptr<AppContext> conte
         case DaemonSocketAction::SystemServerStarted: {
             uint32_t val = constants::SYSTEM_SERVER_STARTED;
             utils::unix_datagram_sendto(CONTROLLER_SOCKET.c_str(), &val, sizeof(val));
+            break;
+        }
+        case DaemonSocketAction::GetSharedMemoryFd: {
+            if (g_shm_fd >= 0) {
+                socket_utils::write_u8(stream, 1);
+                send_fd((int)stream, (int)g_shm_fd);
+            } else {
+                socket_utils::write_u8(stream, 0);
+            }
             break;
         }
         default: {
