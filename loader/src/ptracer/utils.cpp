@@ -21,8 +21,86 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <link.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <sys/mman.h>
 
 #include "logging.hpp"
+
+#ifndef PAGE_SIZE
+#define PAGE_SIZE 4096
+#endif
+#define PAGE_START(x) ((x) & ~(PAGE_SIZE - 1))
+#define PAGE_END(x) PAGE_START((x) + (PAGE_SIZE - 1))
+
+static int DlIterateCallback(struct dl_phdr_info *info, size_t size, void *data) {
+    auto *info_vec = static_cast<std::vector<MapInfo> *>(data);
+
+    const char *name = info->dlpi_name;
+    char exe_path[256];
+    if (!name || name[0] == '\0') {
+        ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+        if (len != -1) {
+            exe_path[len] = '\0';
+            name = exe_path;
+        } else {
+            name = "";
+        }
+    }
+
+    struct stat st;
+    ino_t inode = 0;
+    dev_t dev = 0;
+    if (name[0] == '/') {
+        char clean_name[256];
+        strncpy(clean_name, name, sizeof(clean_name));
+        clean_name[sizeof(clean_name) - 1] = '\0';
+        char* exclamation = strstr(clean_name, "!/");
+        if (exclamation) {
+            *exclamation = '\0';
+        }
+        if (stat(clean_name, &st) == 0) {
+            inode = st.st_ino;
+            dev = st.st_dev;
+        }
+    }
+
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *phdr = &info->dlpi_phdr[i];
+        if (phdr->p_type == PT_LOAD) {
+            uintptr_t start = PAGE_START(info->dlpi_addr + phdr->p_vaddr);
+            uintptr_t end = PAGE_END(info->dlpi_addr + phdr->p_vaddr + phdr->p_memsz);
+            uintptr_t offset = PAGE_START(phdr->p_offset);
+
+            uint8_t perms = 0;
+            if (phdr->p_flags & PF_R) perms |= PROT_READ;
+            if (phdr->p_flags & PF_W) perms |= PROT_WRITE;
+            if (phdr->p_flags & PF_X) perms |= PROT_EXEC;
+
+            MapInfo map_info;
+            map_info.start = start;
+            map_info.end = end;
+            map_info.perms = perms;
+            map_info.is_private = true; // dl_iterate_phdr doesn't expose mapping type, but mostly private
+            map_info.offset = offset;
+            map_info.dev = dev;
+            map_info.inode = inode;
+
+            size_t name_len = strlen(name);
+            if (name_len >= sizeof(map_info.path)) {
+                name_len = sizeof(map_info.path) - 1;
+            }
+            if (name_len > 0) {
+                memcpy(map_info.path, name, name_len);
+            }
+            map_info.path[name_len] = '\0';
+
+            info_vec->push_back(map_info);
+        }
+    }
+    return 0;
+}
 
 static bool ParseMapLine(const char* buffer, MapInfo& ref) {
     const char* p = buffer;
@@ -132,23 +210,21 @@ static bool ParseMapLine(const char* buffer, MapInfo& ref) {
  */
 std::vector<MapInfo> MapInfo::Scan(int pid) {
     std::vector<MapInfo> info;
-    char file_name[64];
+    info.reserve(256);
+
     if (pid == -1) {
-        strcpy(file_name, "/proc/self/maps");
-    } else {
-        snprintf(file_name, sizeof(file_name), "/proc/%d/maps", pid);
+        dl_iterate_phdr(DlIterateCallback, &info);
+        return info;
     }
+
+    char file_name[64];
+    snprintf(file_name, sizeof(file_name), "/proc/%d/maps", pid);
     auto maps = std::unique_ptr<FILE, decltype(&fclose)>{fopen(file_name, "r"), &fclose};
 
     if (!maps) {
         PLOGE("fopen %s", file_name);
         return info;
     }
-
-    // A typical maps file can contain hundreds or thousands of lines.
-    // By reserving a reasonable amount of space, we reduce the number
-    // of reallocations significantly.
-    info.reserve(256);
 
     char buffer[8196];
     while (fgets(buffer, sizeof(buffer), maps.get())) {
