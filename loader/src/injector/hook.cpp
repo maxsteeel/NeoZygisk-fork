@@ -10,6 +10,10 @@
 #include <string>
 #include <vector>
 #include <fcntl.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
 
 #include <lsplt.hpp>
 
@@ -282,6 +286,39 @@ DCL_HOOK_FUNC(static int, pthread_attr_setstacksize, void *target, size_t size) 
     return res;
 }
 
+DCL_HOOK_FUNC(int, prctl, int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5) {
+    if (option == PR_SET_SECCOMP && arg2 == SECCOMP_MODE_FILTER) {
+        struct sock_fprog* prog = reinterpret_cast<struct sock_fprog*>(arg3);
+        if (prog != nullptr && prog->len > 0) {
+            // We want to prepend rules to allow __NR_execve.
+            const struct sock_filter prepend[] = {
+                BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execve, 0, 1),
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            };
+
+            size_t prepend_len = sizeof(prepend) / sizeof(prepend[0]);
+            size_t total_len = prepend_len + prog->len;
+
+            // Use stack allocated array to strictly avoid heap allocations.
+            // BPF_MAXINSNS is 4096, which is reasonable for the stack.
+            if (total_len <= BPF_MAXINSNS) {
+                struct sock_filter new_filter[BPF_MAXINSNS];
+                memcpy(new_filter, prepend, sizeof(prepend));
+                memcpy(new_filter + prepend_len, prog->filter, prog->len * sizeof(struct sock_filter));
+
+                // Temporarily modify the prog to point to our new filter
+                struct sock_fprog new_prog;
+                new_prog.len = static_cast<unsigned short>(total_len);
+                new_prog.filter = new_filter;
+
+                return old_prctl(option, arg2, reinterpret_cast<unsigned long>(&new_prog), arg4, arg5);
+            }
+        }
+    }
+    return old_prctl(option, arg2, arg3, arg4, arg5);
+}
+
 #undef DCL_HOOK_FUNC
 
 // -----------------------------------------------------------------
@@ -389,6 +426,7 @@ void HookContext::hook_plt() {
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, unshare);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, strdup);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, property_get);
+    PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, prctl);
 
     if (!lsplt::CommitHook(cached_map_infos)) LOGE("HookContext::hook_plt failed");
 
