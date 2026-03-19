@@ -223,12 +223,10 @@ static uintptr_t smart_resolve_symbol(const char* sym_name, const std::vector<Ma
         return cached_remote_start + offset;
     }
 
-    std::string actual_path;
+    const MapInfo* actual_map = nullptr;
     uintptr_t local_base = 0;
     uintptr_t last_base = 0;
     const char* last_path = nullptr;
-    uintptr_t found_local_start = 0;
-    uintptr_t found_local_end = 0;
 
     for (const auto& m : local_map) {
         if (m.offset == 0) {
@@ -236,9 +234,7 @@ static uintptr_t smart_resolve_symbol(const char* sym_name, const std::vector<Ma
             last_path = m.path;
         }
         if (l_addr >= m.start && l_addr < m.end) {
-            actual_path = m.path;
-            found_local_start = m.start;
-            found_local_end = m.end;
+            actual_map = &m;
             if (last_path && strcmp(last_path, m.path) == 0) {
                 local_base = last_base;
             }
@@ -246,11 +242,11 @@ static uintptr_t smart_resolve_symbol(const char* sym_name, const std::vector<Ma
         }
     }
 
-    if (actual_path.empty()) return 0;
+    if (!actual_map || actual_map->path[0] == '\0') return 0;
 
     if (local_base == 0) {
         for (const auto& m : local_map) {
-            if (m.offset == 0 && actual_path == m.path) {
+            if (m.offset == 0 && strcmp(actual_map->path, m.path) == 0) {
                 local_base = m.start;
                 break;
             }
@@ -261,9 +257,9 @@ static uintptr_t smart_resolve_symbol(const char* sym_name, const std::vector<Ma
     uintptr_t offset = l_addr - local_base;
 
     for (const auto& m : remote_map) {
-        if (m.path == actual_path && m.offset == 0) {
-            cached_local_start = found_local_start;
-            cached_local_end = found_local_end;
+        if (m.offset == 0 && strcmp(actual_map->path, m.path) == 0) {
+            cached_local_start = actual_map->start;
+            cached_local_end = actual_map->end;
             cached_local_base = local_base;
             cached_remote_start = m.start;
             return m.start + offset;
