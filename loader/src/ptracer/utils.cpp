@@ -54,8 +54,7 @@ static int DlIterateCallback(struct dl_phdr_info *info, size_t size, void *data)
     dev_t dev = 0;
     if (name[0] == '/') {
         char clean_name[256];
-        strncpy(clean_name, name, sizeof(clean_name));
-        clean_name[sizeof(clean_name) - 1] = '\0';
+        snprintf(clean_name, sizeof(clean_name), "%s", name);
         char* exclamation = strstr(clean_name, "!/");
         if (exclamation) {
             *exclamation = '\0';
@@ -87,15 +86,7 @@ static int DlIterateCallback(struct dl_phdr_info *info, size_t size, void *data)
             map_info.dev = dev;
             map_info.inode = inode;
 
-            size_t name_len = strlen(name);
-            if (name_len >= sizeof(map_info.path)) {
-                name_len = sizeof(map_info.path) - 1;
-            }
-            if (name_len > 0) {
-                memcpy(map_info.path, name, name_len);
-            }
-            map_info.path[name_len] = '\0';
-
+            snprintf(map_info.path, sizeof(map_info.path), "%s", name);
             info_vec->push_back(map_info);
         }
     }
@@ -210,7 +201,7 @@ static bool ParseMapLine(const char* buffer, MapInfo& ref) {
  */
 std::vector<MapInfo> MapInfo::Scan(int pid) {
     std::vector<MapInfo> info;
-    info.reserve(256);
+    info.reserve(2048);
 
     if (pid == -1) {
         dl_iterate_phdr(DlIterateCallback, &info);
