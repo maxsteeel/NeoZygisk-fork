@@ -8,7 +8,10 @@
 #include <unistd.h>
 #include <unwind.h>
 #include <string>
+#include <string_view>
 #include <vector>
+#include <unordered_map>
+#include <functional>
 #include <fcntl.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
@@ -29,12 +32,14 @@ using namespace std;
 
 const char *moduleId = "zygisksu";
 
-struct Property {
-    string key;
-    string value;
+struct StringHash {
+    using is_transparent = void;
+    size_t operator()(const char* s) const { return std::hash<std::string_view>{}(s); }
+    size_t operator()(std::string_view s) const { return std::hash<std::string_view>{}(s); }
+    size_t operator()(const std::string& s) const { return std::hash<std::string>{}(s); }
 };
 
-vector<Property> g_spoof_props;
+unordered_map<string, string, StringHash, equal_to<>> g_spoof_props;
 
 struct prop_info;
 typedef void (*prop_info_cb)(void* cookie, const char* name, const char* value, uint32_t serial);
@@ -71,7 +76,7 @@ static string generate_random_hex(int len) {
 void InitRandomVbmeta() {
     // 生成 64 hex characters 的隨機值
     std::string fake_digest = generate_random_hex(64);
-    g_spoof_props.push_back({"ro.boot.vbmeta.digest", fake_digest});
+    g_spoof_props.try_emplace("ro.boot.vbmeta.digest", fake_digest);
 }
 
 void LoadPropConfig() {
@@ -92,7 +97,7 @@ void LoadPropConfig() {
                     if (eq_pos != string::npos) {
                         string key = trim(sLine.substr(0, eq_pos));
                         string value = trim(sLine.substr(eq_pos + 1));
-                        g_spoof_props.push_back({key, value});
+                        g_spoof_props.insert_or_assign(key, value);
                     }
                 }
                 line = strtok_r(nullptr, "\n", &saveptr);
@@ -230,11 +235,10 @@ static void custom_property_read_callback(void* cookie, const char* name, const 
     auto* custom_cookie = static_cast<CustomCallbackCookie*>(cookie);
 
     if (name && !g_spoof_props.empty()) {
-        for (const auto &prop : g_spoof_props) {
-            if (prop.key == name) {
-                custom_cookie->original_callback(custom_cookie->original_cookie, name, prop.value.c_str(), serial);
-                return;
-            }
+        auto it = g_spoof_props.find(name);
+        if (it != g_spoof_props.end()) {
+            custom_cookie->original_callback(custom_cookie->original_cookie, name, it->second.c_str(), serial);
+            return;
         }
     }
 
@@ -248,18 +252,17 @@ DCL_HOOK_FUNC(void, __system_property_read_callback, const prop_info* pi, prop_i
 
 DCL_HOOK_FUNC(int, __system_property_get, const char *name, char *value) {
     if (name && !g_spoof_props.empty()) {
-        for (const auto &prop : g_spoof_props) {
-            if (prop.key == name) {
-                int len = prop.value.length();
-                // PROP_VALUE_MAX is 92, we limit it to 91 to be safe
-                if (len >= 92) len = 91;
+        auto it = g_spoof_props.find(name);
+        if (it != g_spoof_props.end()) {
+            int len = it->second.length();
+            // PROP_VALUE_MAX is 92, we limit it to 91 to be safe
+            if (len >= 92) len = 91;
 
-                if (value) {
-                    strncpy(value, prop.value.c_str(), len);
-                    value[len] = '\0';
-                }
-                return len;
+            if (value) {
+                strncpy(value, it->second.c_str(), len);
+                value[len] = '\0';
             }
+            return len;
         }
     }
     return old___system_property_get(name, value);
@@ -268,15 +271,14 @@ DCL_HOOK_FUNC(int, __system_property_get, const char *name, char *value) {
 DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *default_value) {
 
     if (key && !g_spoof_props.empty()) {
-        for (const auto &prop : g_spoof_props) {
-            if (prop.key == key) {
-                int len = prop.value.length();
-                if (value) {
-                    strncpy(value, prop.value.c_str(), len);
-                    value[len] = '\0';
-                }
-                return len;
+        auto it = g_spoof_props.find(key);
+        if (it != g_spoof_props.end()) {
+            int len = it->second.length();
+            if (value) {
+                strncpy(value, it->second.c_str(), len);
+                value[len] = '\0';
             }
+            return len;
         }
     }
 
