@@ -194,7 +194,7 @@ DCL_HOOK_FUNC(static char *, strdup, const char *str) {
             // The new scan will repopulate the map info with the same paths, but they 
             // will be wiped again in hook_zygote_jni() after we are done with hooking.
             g_hook->clear_map_paths();
-            g_hook->cached_map_infos = lsplt::MapInfo::Scan();
+            g_hook->refresh_map_infos();
             
             zygote_hooked = true;
         }
@@ -475,30 +475,36 @@ void HookContext::register_hook(dev_t dev, ino_t inode, const char *symbol, void
 
 #define PLT_HOOK_REGISTER(DEV, INODE, NAME) PLT_HOOK_REGISTER_SYM(DEV, INODE, #NAME, NAME)
 
+void HookContext::refresh_map_infos() {
+    map_info_cache.clear();
+    cached_map_infos = lsplt::MapInfo::Scan();
+    for (const auto &map : cached_map_infos) {
+        if (map.path[0] != '\0') {
+            std::string_view path(map.path);
+            size_t last_slash = path.find_last_of('/');
+            if (last_slash != std::string_view::npos) {
+                map_info_cache.try_emplace(path.substr(last_slash + 1), &map);
+            } else {
+                map_info_cache.try_emplace(path, &map);
+            }
+        }
+    }
+}
+
 void HookContext::hook_plt() {
     ino_t android_runtime_inode = 0;
     dev_t android_runtime_dev = 0;
 
-    cached_map_infos = lsplt::MapInfo::Scan();
+    refresh_map_infos();
 
-    bool found_runtime = false;
-    bool found_art = false;
+    if (auto it = map_info_cache.find("libandroid_runtime.so"); it != map_info_cache.end()) {
+        android_runtime_inode = it->second->inode;
+        android_runtime_dev = it->second->dev;
+    }
 
-    for (const auto &map : cached_map_infos) {
-        if (!found_runtime && std::string_view(map.path).ends_with("/libandroid_runtime.so")) {
-            android_runtime_inode = map.inode;
-            android_runtime_dev = map.dev;
-            found_runtime = true;
-        } 
-        else if (!found_art && std::string_view(map.path).ends_with("/libart.so")) {
-            g_art_inode = map.inode;
-            g_art_dev = map.dev;
-            found_art = true;
-        }
-
-        if (found_runtime && found_art) {
-            break; 
-        }
+    if (auto it = map_info_cache.find("libart.so"); it != map_info_cache.end()) {
+        g_art_inode = it->second->inode;
+        g_art_dev = it->second->dev;
     }
 
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, fork);
@@ -519,14 +525,11 @@ void HookContext::hook_plt() {
 
 void HookContext::hook_unloader() {
     clear_map_paths();
-    cached_map_infos = lsplt::MapInfo::Scan();
+    refresh_map_infos();
     if (g_art_inode == 0 || g_art_dev == 0) {
-        for (auto &map : cached_map_infos) {
-            if (std::string_view(map.path).ends_with("/libart.so")) {
-                g_art_inode = map.inode;
-                g_art_dev = map.dev;
-                break;
-            }
+        if (auto it = map_info_cache.find("libart.so"); it != map_info_cache.end()) {
+            g_art_inode = it->second->inode;
+            g_art_dev = it->second->dev;
         }
     }
 
@@ -613,17 +616,15 @@ void HookContext::hook_zygote_jni() {
     auto get_created_java_vms = reinterpret_cast<jint (*)(JavaVM **, jsize, jsize *)>(
         dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs"));
     if (!get_created_java_vms) {
-        for (auto &map : cached_map_infos) {
-            if (!std::string_view(map.path).ends_with("/libnativehelper.so")) continue;
-            void *h = dlopen(map.path, RTLD_LAZY);
+        if (auto it = map_info_cache.find("libnativehelper.so"); it != map_info_cache.end()) {
+            void *h = dlopen(it->second->path, RTLD_LAZY);
             if (!h) {
                 LOGW("cannot dlopen libnativehelper.so: %s", dlerror());
-                break;
+            } else {
+                get_created_java_vms =
+                    reinterpret_cast<decltype(get_created_java_vms)>(dlsym(h, "JNI_GetCreatedJavaVMs"));
+                dlclose(h);
             }
-            get_created_java_vms =
-                reinterpret_cast<decltype(get_created_java_vms)>(dlsym(h, "JNI_GetCreatedJavaVMs"));
-            dlclose(h);
-            break;
         }
         if (!get_created_java_vms) {
             LOGW("JNI_GetCreatedJavaVMs not found");
