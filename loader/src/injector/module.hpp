@@ -205,7 +205,6 @@ struct ZygiskModule {
     void preServerSpecialize(ServerSpecializeArgs_v1 *args) const;
     void postServerSpecialize(const ServerSpecializeArgs_v1 *args) const;
 
-    bool valid() const;
     int connectCompanion() const;
     int getModuleDir() const;
     void setOption(zygisk::Option opt);

@@ -117,21 +117,6 @@ bool ZygiskModule::RegisterModuleImpl(ApiTable *api, long *module) {
     return true;
 }
 
-bool ZygiskModule::valid() const {
-    if (mod.api_version == nullptr) return false;
-    switch (*mod.api_version) {
-    case 5:
-    case 4:
-    case 3:
-    case 2:
-    case 1:
-        return mod.v1->impl && mod.v1->preAppSpecialize && mod.v1->postAppSpecialize &&
-               mod.v1->preServerSpecialize && mod.v1->postServerSpecialize;
-    default:
-        return false;
-    }
-}
-
 /* Zygisksu changed: Use own zygiskd */
 int ZygiskModule::connectCompanion() const { return zygiskd::ConnectCompanion(id); }
 
