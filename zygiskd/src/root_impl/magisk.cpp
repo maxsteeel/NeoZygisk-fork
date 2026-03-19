@@ -229,13 +229,13 @@ static bool is_valid_pkg_name(const std::string& pkg_name) {
     return true;
 }
 
-// Escapes single quotes for SQL string literals (e.g. ' -> '')
-static std::string quote_sql_str(const std::string& s) {
+static std::string to_hex(const std::string& s) {
+    static const char* hex = "0123456789ABCDEF";
     std::string out;
-    out.reserve(s.size() + 2);
-    for (char c : s) {
-        if (c == '\'') out += "''";
-        else out += c;
+    out.reserve(s.size() * 2);
+    for (unsigned char c : s) {
+        out += hex[c >> 4];
+        out += hex[c & 0xf];
     }
     return out;
 }
@@ -298,7 +298,7 @@ bool uid_should_umount(int32_t uid) {
         LOGW("Invalid package name for fallback: %s", pkg_name.c_str());
         return false;
     }
-    std::string query = "SELECT 1 FROM denylist WHERE package_name='" + quote_sql_str(pkg_name) + "' LIMIT 1";
+    std::string query = "SELECT 1 FROM denylist WHERE package_name=CAST(X'" + to_hex(pkg_name) + "' AS TEXT) LIMIT 1";
     return utils::exec_command({"magisk", "--sqlite", query}).has_value();
 }
 
