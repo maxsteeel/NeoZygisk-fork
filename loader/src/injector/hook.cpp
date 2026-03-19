@@ -9,6 +9,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <string_view>
+#include <algorithm>
 #include <unordered_map>
 #include <functional>
 #include <fcntl.h>
@@ -31,14 +33,25 @@ using namespace std;
 
 const char *moduleId = "zygisksu";
 
-struct StringHash {
-    using is_transparent = void;
-    size_t operator()(const char* s) const { return std::hash<std::string_view>{}(s); }
-    size_t operator()(std::string_view s) const { return std::hash<std::string_view>{}(s); }
-    size_t operator()(const std::string& s) const { return std::hash<std::string>{}(s); }
+struct Property {
+    string key;
+    string value;
 };
 
-unordered_map<string, string, StringHash, equal_to<>> g_spoof_props;
+vector<Property> g_spoof_props;
+
+static const Property* find_spoof_prop(const char* name) {
+    if (!name || g_spoof_props.empty()) return nullptr;
+    std::string_view name_sv(name);
+    auto it = std::lower_bound(g_spoof_props.begin(), g_spoof_props.end(), name_sv,
+        [](const Property& p, std::string_view n) {
+            return std::string_view(p.key) < n;
+        });
+    if (it != g_spoof_props.end() && it->key == name_sv) {
+        return &(*it);
+    }
+    return nullptr;
+}
 
 struct prop_info;
 typedef void (*prop_info_cb)(void* cookie, const char* name, const char* value, uint32_t serial);
@@ -75,7 +88,7 @@ static string generate_random_hex(int len) {
 void InitRandomVbmeta() {
     // 生成 64 hex characters 的隨機值
     std::string fake_digest = generate_random_hex(64);
-    g_spoof_props.try_emplace("ro.boot.vbmeta.digest", fake_digest);
+    g_spoof_props.push_back({"ro.boot.vbmeta.digest", fake_digest});
 }
 
 void LoadPropConfig() {
@@ -96,7 +109,7 @@ void LoadPropConfig() {
                     if (eq_pos != string::npos) {
                         string key = trim(sLine.substr(0, eq_pos));
                         string value = trim(sLine.substr(eq_pos + 1));
-                        g_spoof_props.insert_or_assign(key, value);
+                        g_spoof_props.push_back({key, value});
                     }
                 }
                 line = strtok_r(nullptr, "\n", &saveptr);
@@ -233,12 +246,9 @@ static void custom_property_read_callback(void* cookie, const char* name, const 
     if (cookie == nullptr) return;
     auto* custom_cookie = static_cast<CustomCallbackCookie*>(cookie);
 
-    if (name && !g_spoof_props.empty()) {
-        auto it = g_spoof_props.find(name);
-        if (it != g_spoof_props.end()) {
-            custom_cookie->original_callback(custom_cookie->original_cookie, name, it->second.c_str(), serial);
-            return;
-        }
+    if (const Property* prop = find_spoof_prop(name)) {
+        custom_cookie->original_callback(custom_cookie->original_cookie, name, prop->value.c_str(), serial);
+        return;
     }
 
     custom_cookie->original_callback(custom_cookie->original_cookie, name, value, serial);
@@ -250,35 +260,29 @@ DCL_HOOK_FUNC(void, __system_property_read_callback, const prop_info* pi, prop_i
 }
 
 DCL_HOOK_FUNC(int, __system_property_get, const char *name, char *value) {
-    if (name && !g_spoof_props.empty()) {
-        auto it = g_spoof_props.find(name);
-        if (it != g_spoof_props.end()) {
-            int len = it->second.length();
-            // PROP_VALUE_MAX is 92, we limit it to 91 to be safe
-            if (len >= 92) len = 91;
+    if (const Property* prop = find_spoof_prop(name)) {
+        int len = prop->value.length();
+        // PROP_VALUE_MAX is 92, we limit it to 91 to be safe
+        if (len >= 92) len = 91;
 
-            if (value) {
-                strncpy(value, it->second.c_str(), len);
-                value[len] = '\0';
-            }
-            return len;
+        if (value) {
+            strncpy(value, prop->value.c_str(), len);
+            value[len] = '\0';
         }
+        return len;
     }
     return old___system_property_get(name, value);
 }
 
 DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *default_value) {
 
-    if (key && !g_spoof_props.empty()) {
-        auto it = g_spoof_props.find(key);
-        if (it != g_spoof_props.end()) {
-            int len = it->second.length();
-            if (value) {
-                strncpy(value, it->second.c_str(), len);
-                value[len] = '\0';
-            }
-            return len;
+    if (const Property* prop = find_spoof_prop(key)) {
+        int len = prop->value.length();
+        if (value) {
+            strncpy(value, prop->value.c_str(), len);
+            value[len] = '\0';
         }
+        return len;
     }
 
     static bool unloader_triggered = false;
@@ -647,6 +651,10 @@ void HookContext::restore_zygote_hook(JNIEnv *env) {
 void hook_entry(void *start_addr, size_t block_size) {
     LoadPropConfig();
     InitRandomVbmeta();
+
+    std::sort(g_spoof_props.begin(), g_spoof_props.end(), [](const Property& a, const Property& b) {
+        return a.key < b.key;
+    });
 
     g_hook = new HookContext(start_addr, block_size);
     g_hook->hook_plt();
