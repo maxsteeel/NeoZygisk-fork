@@ -6,7 +6,6 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <unwind.h>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -442,23 +441,6 @@ ZygiskContext::~ZygiskContext() {
 HookContext::HookContext(void *start_addr, size_t block_size)
     : start_addr{start_addr}, block_size{block_size} {};
 
-// -----------------------------------------------------------------
-
-inline void *unwind_get_region_start(_Unwind_Context *ctx) {
-    auto fp = _Unwind_GetRegionStart(ctx);
-#if defined(__arm__)
-    // On arm32, we need to check if the pc is in thumb mode,
-    // if so, we need to set the lowest bit of fp to 1
-    auto pc = _Unwind_GetGR(ctx, 15);  // r15 is pc
-    if (pc & 1) {
-        // Thumb mode
-        fp |= 1;
-    }
-#endif
-    return reinterpret_cast<void *>(fp);
-}
-
-// -----------------------------------------------------------------
 
 void HookContext::register_hook(dev_t dev, ino_t inode, const char *symbol, void *new_func,
                                 void **old_func) {
