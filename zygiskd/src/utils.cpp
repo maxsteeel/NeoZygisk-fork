@@ -17,6 +17,29 @@
 #include "logging.hpp"
 #include "socket_utils.hpp"
 #include "misc.hpp"
+#include <sys/syscall.h>
+
+#ifndef __NR_close_range
+#define __NR_close_range 436
+#endif
+
+// Structure for the getdents64 syscall
+struct linux_dirent64 {
+    uint64_t d_ino;
+    int64_t d_off;
+    unsigned short d_reclen;
+    unsigned char d_type;
+    char d_name[];
+};
+
+// Extremely fast inline string-to-int parser (avoids atoi overhead)
+static inline int fast_atoi(const char *str) {
+    int val = 0;
+    while (*str >= '0' && *str <= '9') {
+        val = val * 10 + (*str++ - '0');
+    }
+    return val;
+}
 
 namespace utils {
 
@@ -165,6 +188,33 @@ std::optional<std::string> exec_command(const std::vector<std::string>& args) {
             c_args.push_back(const_cast<char*>(arg.c_str()));
         }
         c_args.push_back(nullptr);
+
+        if (syscall(__NR_close_range, 3, ~0U, 0) != 0) {
+            UniqueFd fd_dir(open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+            if (fd_dir >= 0) {
+                char buf[1024];
+                int nread;
+                int fds_to_close[256]; 
+                int fd_count = 0;
+                while ((nread = syscall(__NR_getdents64, (int)fd_dir, buf, sizeof(buf))) > 0) {
+                    for (int bpos = 0; bpos < nread;) {
+                        auto d = reinterpret_cast<struct linux_dirent64 *>(buf + bpos);
+                        if (d->d_name[0] >= '0' && d->d_name[0] <= '9') {
+                            int fd = fast_atoi(d->d_name);
+                            if (fd > 2 && fd != (int)fd_dir) {
+                                if (fd_count < 256) {
+                                    fds_to_close[fd_count++] = fd;
+                                }
+                            }
+                        }
+                        bpos += d->d_reclen;
+                    }
+                }
+                for (int i = 0; i < fd_count; i++) {
+                    close(fds_to_close[i]);
+                }
+            }
+        }
 
         execvp(c_args[0], c_args.data());
         _exit(127);
