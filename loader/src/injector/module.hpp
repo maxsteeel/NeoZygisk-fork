@@ -6,6 +6,7 @@
 #include <list>
 #include <span>
 #include <vector>
+#include <unordered_map>
 
 #include "api.hpp"
 #include "daemon.hpp"
@@ -335,6 +336,7 @@ struct HookContext {
     jint MODIFIER_NATIVE = 0;
     jmethodID member_getModifiers = nullptr;
     std::vector<lsplt::MapInfo> cached_map_infos = {};
+    std::unordered_map<std::string_view, const lsplt::MapInfo*> map_info_cache;
     std::vector<std::tuple<dev_t, ino_t, const char *, void **>> plt_backup;
     std::vector<mount_info> zygote_traces;
 
@@ -346,6 +348,7 @@ struct HookContext {
     void hook_zygote_jni();
     void restore_zygote_hook(JNIEnv *env);
     void hook_jni_methods(JNIEnv *env, const char *clz, JNIMethods methods);
+    void refresh_map_infos();
     void clear_map_paths();
 
 private:
