@@ -65,6 +65,4 @@ private:
     pthread_mutex_t* mutex;
 };
 
-int parse_int(std::string_view s);
-
 bool is_kernel_5_9_or_newer();
