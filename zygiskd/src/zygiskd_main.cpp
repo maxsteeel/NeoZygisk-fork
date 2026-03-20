@@ -75,7 +75,7 @@ static std::string CONTROLLER_SOCKET;
 static std::string DAEMON_SOCKET_PATH;
 
 static UniqueFd g_shm_fd;
-static constants::ShmLayout* g_shm_base = nullptr;
+static constants::ZygiskSharedData* g_shm_base = nullptr;
 static std::mutex g_shm_write_mutex;
 
 static bool initialize_globals() {
@@ -95,24 +95,31 @@ static bool initialize_globals() {
         PLOGE("memfd_create zygisk-shm failed");
         return false;
     }
-    if (ftruncate(g_shm_fd, sizeof(constants::ShmLayout)) < 0) {
+    if (ftruncate(g_shm_fd, sizeof(constants::ZygiskSharedData)) < 0) {
         PLOGE("ftruncate zygisk-shm failed");
         return false;
     }
 
-    // Add seals to prevent modifying size
+    // We do NOT add F_SEAL_WRITE yet, so we can write to it on the fly when new requests come in.
     int seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL;
     if (fcntl(g_shm_fd, F_ADD_SEALS, seals) == -1) {
         LOGW("Failed to add seals to shm memfd: %s", strerror(errno));
     }
 
-    g_shm_base = static_cast<constants::ShmLayout*>(mmap(nullptr, sizeof(constants::ShmLayout), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0));
+    g_shm_base = static_cast<constants::ZygiskSharedData*>(mmap(nullptr, sizeof(constants::ZygiskSharedData), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0));
     if (g_shm_base == MAP_FAILED) {
         PLOGE("mmap zygisk-shm failed");
         return false;
     }
 
     // Initialize all UID slots to UINT32_MAX to allow UID 0 (root) caching
+    ProcessFlags global_flags = ProcessFlags::NONE;
+    auto root = root_impl::get();
+    if (root == root_impl::RootImpl::APatch) global_flags |= ProcessFlags::PROCESS_ROOT_IS_APATCH;
+    else if (root == root_impl::RootImpl::KernelSU) global_flags |= ProcessFlags::PROCESS_ROOT_IS_KSU;
+    else if (root == root_impl::RootImpl::Magisk) global_flags |= ProcessFlags::PROCESS_ROOT_IS_MAGISK;
+    
+    g_shm_base->global_root_flags.store(static_cast<uint32_t>(global_flags), std::memory_order_relaxed);
     g_shm_base->version.store(0, std::memory_order_relaxed);
     for (size_t i = 0; i < constants::SHM_HASH_MAP_SIZE; ++i) {
         g_shm_base->entries[i].uid.store(UINT32_MAX, std::memory_order_relaxed);
@@ -542,7 +549,8 @@ static void handle_connection(UniqueFd stream, std::shared_ptr<AppContext> conte
             utils::unix_datagram_sendto(CONTROLLER_SOCKET.c_str(), &val, sizeof(val));
             break;
         }
-        case DaemonSocketAction::GetSharedMemoryFd: {
+        case DaemonSocketAction::GetSharedMemoryFd:
+        case DaemonSocketAction::GetZygiskSharedData: {
             if (g_shm_fd >= 0) {
                 socket_utils::write_u8(stream, 1);
                 send_fd((int)stream, (int)g_shm_fd);
