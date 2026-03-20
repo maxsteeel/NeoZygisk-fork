@@ -87,6 +87,12 @@ ssize_t xrecvmsg(int sockfd, struct msghdr* msg, int flags) {
     return rec;
 }
 
+ssize_t xsendmsg(int sockfd, const struct msghdr* msg, int flags) {
+    int sent = sendmsg(sockfd, msg, flags);
+    if (sent < 0) PLOGE("sendmsg");
+    return sent;
+}
+
 void* recv_fds(int sockfd, char* cmsgbuf, size_t bufsz, int cnt) {
     // Create a throwaway buffer.
     // It must match the size Rust sends (sizeof(int) = 4 bytes).
@@ -225,5 +231,33 @@ int recv_fd(int sockfd) {
     int result;
     memcpy(&result, data, sizeof(int));
     return result;
+}
+
+bool send_fd(int sockfd, int fd) {
+    char cmsgbuf[CMSG_SPACE(sizeof(int))];
+    int dummy_data = 0;
+    iovec iov = {.iov_base = &dummy_data, .iov_len = sizeof(dummy_data)};
+    msghdr msg = {
+        .msg_name = nullptr,
+        .msg_namelen = 0,
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = cmsgbuf,
+        .msg_controllen = sizeof(cmsgbuf),
+        .msg_flags = 0,
+    };
+
+    cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+
+    ssize_t sent = xsendmsg(sockfd, &msg, 0);
+    if (sent != sizeof(dummy_data)) {
+        LOGE("send_fd: IO failure. Sent %zd bytes, expected %zu", sent, sizeof(dummy_data));
+        return false;
+    }
+    return true;
 }
 }  // namespace socket_utils

@@ -331,47 +331,14 @@ static int spawn_companion(const char* name) {
 
     // Now, establish communication with the newly spawned companion.
     socket_utils::write_string(daemon_sock, name);
-    // Use write_u8 to mimic rust code passing fd and write logic correctly
 
-    // send_fd is needed here, need to implement send_fd.
-    // However, existing socket_utils.hpp does not have send_fd!
-    // Wait, loader socket_utils only implements recv_fd because the injector only receives.
-    // I need to implement send_fd.
-
-    return daemon_sock.release(); // We will handle send_fd locally in a bit
+    return daemon_sock.release();
 }
 
-// Implement send_fd
-static bool send_fd(int sockfd, int fd) {
-    char cmsgbuf[CMSG_SPACE(sizeof(int))];
-    int dummy_data = 0;
-    struct iovec iov = {&dummy_data, sizeof(dummy_data)};
-    struct msghdr msg = {
-        nullptr, 0,
-        &iov, 1,
-        cmsgbuf, sizeof(cmsgbuf),
-        0
-    };
-
-    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
-
-    ssize_t sent = sendmsg(sockfd, &msg, 0);
-    if (sent != sizeof(dummy_data)) {
-        PLOGE("send_fd: sendmsg failed");
-        return false;
-    }
-    return true;
-}
-
-// Wait, the above spawn_companion needs to be refactored to use this
 static int spawn_companion_complete(const char* name, int lib_fd) {
     UniqueFd daemon_sock(spawn_companion(name));
     if (daemon_sock < 0) return -1;
-    if (!send_fd(daemon_sock, lib_fd))  return -1;
+    if (!socket_utils::send_fd(daemon_sock, lib_fd))  return -1;
 
     uint8_t status = socket_utils::read_u8(daemon_sock);
     if (status == 1) return daemon_sock.release();
@@ -444,7 +411,7 @@ static void handle_update_mount_namespace(int stream, AppContext* context) {
     int fd = context->mount_manager->get_namespace_fd(ns_type);
     if (fd >= 0) {
         socket_utils::write_u8(stream, 1);
-        send_fd(stream, fd);
+        socket_utils::send_fd(stream, fd);
     } else {
         LOGW("Namespace is not cached yet.");
         socket_utils::write_u8(stream, 0);
@@ -455,7 +422,7 @@ static void handle_read_modules(int stream, AppContext* context) {
     socket_utils::write_usize(stream, context->modules.size());
     for (const auto& module : context->modules) {
         socket_utils::write_string(stream, module->name);
-        send_fd(stream, module->lib_fd);
+        socket_utils::send_fd(stream, module->lib_fd);
     }
 }
 
@@ -487,7 +454,7 @@ static void handle_request_companion_socket(int stream, AppContext* context) {
     }
 
     if (module->companion_fd >= 0) {
-        if (!send_fd(module->companion_fd, stream)) {
+        if (!socket_utils::send_fd(module->companion_fd, stream)) {
             LOGE("Failed to send companion socket FD for module `%s`", module->name.c_str());
             socket_utils::write_u8(stream, 0);
         }
@@ -503,7 +470,7 @@ static void handle_get_module_dir(int stream, AppContext* context) {
     char dir_path[256];
     snprintf(dir_path, sizeof(dir_path), "%s/%s", constants::PATH_MODULES_DIR, module->name.c_str());
     UniqueFd dir_fd(open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-    if (dir_fd >= 0) send_fd(stream, dir_fd);
+    if (dir_fd >= 0) socket_utils::send_fd(stream, dir_fd);
 }
 
 
@@ -553,7 +520,7 @@ static void handle_connection(UniqueFd stream, std::shared_ptr<AppContext> conte
         case DaemonSocketAction::GetZygiskSharedData: {
             if (g_shm_fd >= 0) {
                 socket_utils::write_u8(stream, 1);
-                send_fd((int)stream, (int)g_shm_fd);
+                socket_utils::send_fd((int)stream, (int)g_shm_fd);
             } else {
                 socket_utils::write_u8(stream, 0);
             }
