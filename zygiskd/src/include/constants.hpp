@@ -57,6 +57,7 @@ enum class DaemonSocketAction : uint8_t {
     ZygoteRestart,
     SystemServerStarted,
     GetSharedMemoryFd,
+    GetZygiskSharedData,
 };
 
 // ProcessFlags bitmask
@@ -106,10 +107,14 @@ struct ShmEntry {
     std::atomic<uint32_t> flags;
 };
 
-struct ShmLayout {
+struct ZygiskSharedData {
     // This value is incremented before a batch update and after a batch update.
     // Readers should check if the version is even, and verify it hasn't changed during reads.
     std::atomic<uint32_t> version;
+
+    // Global flags applied to all processes (e.g. root implementation type)
+    std::atomic<uint32_t> global_root_flags;
+
     ShmEntry entries[SHM_HASH_MAP_SIZE];
 };
 

@@ -31,6 +31,20 @@
 
 using namespace std;
 
+namespace constants {
+    constexpr size_t SHM_HASH_MAP_SIZE = 8192;
+    struct ShmEntry {
+        std::atomic<uint32_t> uid;
+        std::atomic<uint32_t> flags;
+    };
+    struct ZygiskSharedData {
+        std::atomic<uint32_t> version;
+        std::atomic<uint32_t> global_root_flags;
+        ShmEntry entries[SHM_HASH_MAP_SIZE];
+    };
+}
+
+extern constants::ZygiskSharedData* g_shared_data;
 const char *moduleId = "zygisksu";
 
 struct Property {
@@ -655,6 +669,20 @@ void hook_entry(void *start_addr, size_t block_size) {
     std::sort(g_spoof_props.begin(), g_spoof_props.end(), [](const Property& a, const Property& b) {
         return a.key < b.key;
     });
+
+    UniqueFd shm_fd = UniqueFd(zygiskd::GetZygiskSharedData());
+    if (shm_fd >= 0) {
+        void* map_res = mmap(nullptr, sizeof(constants::ZygiskSharedData), PROT_READ, MAP_SHARED, shm_fd, 0);
+        if (map_res != MAP_FAILED) {
+            g_shared_data = static_cast<constants::ZygiskSharedData*>(map_res);
+            prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, g_shared_data, sizeof(constants::ZygiskSharedData), "jit-cache");
+            LOGV("Successfully mapped zero-ipc shared data");
+        } else {
+            PLOGE("Failed to mmap zygisk-shm");
+        }
+    } else {
+        LOGE("Failed to get zygisk shared data fd");
+    }
 
     g_hook = new HookContext(start_addr, block_size);
     g_hook->hook_plt();

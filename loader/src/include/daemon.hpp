@@ -75,6 +75,7 @@ enum class SocketAction {
     ZygoteRestart,
     SystemServerStarted,
     GetSharedMemoryFd,
+    GetZygiskSharedData,
 };
 
 enum class MountNamespace { Clean, Root };
@@ -103,6 +104,8 @@ void ZygoteRestart();
 void SystemServerStarted();
 
 int GetSharedMemoryFd();
+
+int GetZygiskSharedData();
 
 void UnmapSharedMemory();
 
