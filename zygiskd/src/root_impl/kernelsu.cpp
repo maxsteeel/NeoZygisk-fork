@@ -126,10 +126,30 @@ static bool ksuctl_ioctl(int fd, uint32_t request, T* arg) {
 
 // --- `prctl` Implementation Details ---
 
+template <typename T>
+static unsigned long to_prctl_arg(T arg) {
+    if constexpr (std::is_pointer_v<T>) {
+        return reinterpret_cast<unsigned long>(arg);
+    } else {
+        return static_cast<unsigned long>(arg);
+    }
+}
+
+template <typename... Args>
+static int ksuctl_prctl(int option, unsigned long arg2 = 0, unsigned long arg3 = 0, unsigned long arg4 = 0,
+                        unsigned long arg5 = 0) {
+    return prctl(option, arg2, arg3, arg4, arg5);
+}
+
+template <typename T1, typename... Args>
+static int ksuctl_prctl(int option, T1 arg2, Args... args) {
+    return ksuctl_prctl(option, to_prctl_arg(arg2), to_prctl_arg(args)...);
+}
+
 static void init_legacy_variant_probe() {
     std::call_once(legacy_variant_flag, []() {
         char mode[16] = {0};
-        prctl(KERNEL_SU_OPTION, CMD_HOOK_MODE, reinterpret_cast<unsigned long>(mode), 0, 0);
+        ksuctl_prctl(KERNEL_SU_OPTION, CMD_HOOK_MODE, mode);
         if (mode[0] != 0) {
             legacy_variant = KernelSuVariant::Next;
         } else {
@@ -137,7 +157,7 @@ static void init_legacy_variant_probe() {
         }
 
         int result_ok = 0;
-        prctl(KERNEL_SU_OPTION, CMD_GET_MANAGER_UID, 0, 0, reinterpret_cast<unsigned long>(&result_ok));
+        ksuctl_prctl(KERNEL_SU_OPTION, CMD_GET_MANAGER_UID, 0, 0, &result_ok);
         legacy_supports_manager_uid = (result_ok == KERNEL_SU_OPTION);
     });
 }
@@ -169,7 +189,7 @@ static void detect_and_init() {
         }
 
         int version_code = 0;
-        prctl(KERNEL_SU_OPTION, CMD_GET_VERSION, reinterpret_cast<unsigned long>(&version_code), 0, 0);
+        ksuctl_prctl(KERNEL_SU_OPTION, CMD_GET_VERSION, &version_code);
         if (version_code > 0) {
             init_legacy_variant_probe();
             struct stat st;
@@ -209,8 +229,7 @@ bool uid_granted_root(int32_t uid) {
     } else {
         bool result_payload = false;
         uint32_t result_ok = 0;
-        prctl(KERNEL_SU_OPTION, CMD_UID_GRANTED_ROOT, static_cast<unsigned long>(uid),
-              reinterpret_cast<unsigned long>(&result_payload), reinterpret_cast<unsigned long>(&result_ok));
+        ksuctl_prctl(KERNEL_SU_OPTION, CMD_UID_GRANTED_ROOT, uid, &result_payload, &result_ok);
         return (result_ok == static_cast<uint32_t>(KERNEL_SU_OPTION)) && result_payload;
     }
 }
@@ -228,8 +247,7 @@ bool uid_should_umount(int32_t uid) {
     } else {
         bool result_payload = false;
         uint32_t result_ok = 0;
-        prctl(KERNEL_SU_OPTION, CMD_UID_SHOULD_UMOUNT, static_cast<unsigned long>(uid),
-              reinterpret_cast<unsigned long>(&result_payload), reinterpret_cast<unsigned long>(&result_ok));
+        ksuctl_prctl(KERNEL_SU_OPTION, CMD_UID_SHOULD_UMOUNT, uid, &result_payload, &result_ok);
         return (result_ok == static_cast<uint32_t>(KERNEL_SU_OPTION)) && result_payload;
     }
 }
@@ -248,8 +266,7 @@ bool uid_is_manager(int32_t uid) {
         if (legacy_supports_manager_uid) {
             uint32_t manager_uid = 0;
             uint32_t result_ok = 0;
-            prctl(KERNEL_SU_OPTION, CMD_GET_MANAGER_UID, reinterpret_cast<unsigned long>(&manager_uid), 0,
-                  reinterpret_cast<unsigned long>(&result_ok));
+            ksuctl_prctl(KERNEL_SU_OPTION, CMD_GET_MANAGER_UID, &manager_uid, 0, &result_ok);
             if (result_ok == static_cast<uint32_t>(KERNEL_SU_OPTION)) {
                 return static_cast<uint32_t>(uid) == manager_uid;
             }
