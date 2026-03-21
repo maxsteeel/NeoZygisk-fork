@@ -29,8 +29,6 @@ static std::string TMP_PATH;
 static std::string MODULE_DIR;
 std::string kCPSocketName = (sizeof(void*) == 8) ? "cp64.sock" : "cp32.sock";
 
-static bool g_shm_init_attempted = false;
-
 void UnmapSharedMemory() {
     if (g_shared_data) {
         munmap(g_shared_data, sizeof(constants::ZygiskSharedData));
