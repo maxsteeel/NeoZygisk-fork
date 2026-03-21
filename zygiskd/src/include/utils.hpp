@@ -109,6 +109,14 @@ struct UniqueDir {
     operator DIR*() const { return dir; }
 };
 
+// Extremely fast inline string-to-int parser (avoids atoi overhead)
+inline int fast_atoi(const char *str) {
+    int val = 0;
+    while (*str >= '0' && *str <= '9') {
+        val = val * 10 + (*str++ - '0');
+    }
+    return val;
+}
 
 namespace utils {
 

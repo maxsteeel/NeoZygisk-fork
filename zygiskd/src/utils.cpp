@@ -32,15 +32,6 @@ struct linux_dirent64 {
     char d_name[];
 };
 
-// Extremely fast inline string-to-int parser (avoids atoi overhead)
-static inline int fast_atoi(const char *str) {
-    int val = 0;
-    while (*str >= '0' && *str <= '9') {
-        val = val * 10 + (*str++ - '0');
-    }
-    return val;
-}
-
 namespace utils {
 
 // --- SELinux and Android Property Utilities ---
