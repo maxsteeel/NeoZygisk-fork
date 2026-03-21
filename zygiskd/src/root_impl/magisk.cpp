@@ -6,6 +6,8 @@
 #include <vector>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_set>
@@ -437,6 +439,55 @@ static std::string to_hex(const std::string& s) {
     return out;
 }
 
+static bool get_package_by_uid_from_xml(int32_t uid, std::string& pkg_name) {
+    int fd = open("/data/system/packages.xml", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return false;
+    }
+
+    const char* map = (const char*)mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+
+    if (map == MAP_FAILED) return false;
+
+    int32_t app_id = uid % 100000;
+
+    char uid_str[32];
+    int len = snprintf(uid_str, sizeof(uid_str), "userId=\"%d\"", app_id);
+
+    char shared_uid_str[32];
+    int shared_len = snprintf(shared_uid_str, sizeof(shared_uid_str), "sharedUserId=\"%d\"", app_id);
+
+    const char* pos = (const char*)memmem(map, st.st_size, uid_str, len);
+    if (!pos) {
+        pos = (const char*)memmem(map, st.st_size, shared_uid_str, shared_len);
+    }
+
+    bool found = false;
+    if (pos) {
+        const char* cur = pos;
+        while (cur > map && *cur != '<') cur--;
+
+        const char* name_attr = "name=\"";
+        const char* name_pos = (const char*)memmem(cur, pos - cur, name_attr, 6);
+        if (name_pos) {
+            name_pos += 6;
+            const char* end_pos = (const char*)memchr(name_pos, '\"', pos - name_pos);
+            if (end_pos) {
+                pkg_name.assign(name_pos, end_pos - name_pos);
+                found = true;
+            }
+        }
+    }
+
+    munmap((void*)map, st.st_size);
+    return found;
+}
+
 bool uid_granted_root(int32_t uid) {
     update_cache();
     std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
@@ -455,16 +506,10 @@ bool uid_should_umount(int32_t uid) {
     lock.unlock(); // Release lock before executing external command
 
     // Fallback for missing packages in packages.list (e.g. freshly installed or system apps)
-    auto list = utils::exec_command({"pm", "list", "packages", "--uid", std::to_string(uid)});
-    if (!list) return false;
-
-    std::string list_str = list.value();
-    size_t pos = list_str.find("package:");
-    if (pos == std::string::npos) return false;
-
-    pos += 8; // "package:"
-    size_t space_pos = list_str.find(' ', pos);
-    std::string pkg_name = list_str.substr(pos, space_pos == std::string::npos ? std::string::npos : space_pos - pos);
+    std::string pkg_name;
+    if (!get_package_by_uid_from_xml(uid, pkg_name)) {
+        return false;
+    }
 
     if (pkg_name.empty() || !is_valid_pkg_name(pkg_name)) return false;
 
