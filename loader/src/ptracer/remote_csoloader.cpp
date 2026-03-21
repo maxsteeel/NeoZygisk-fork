@@ -159,10 +159,25 @@ static bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, con
                 off_t buckets_off = gnu_hash_off + 16 + (off_t)(bloom_size * sizeof(ElfW(Addr)));
                 
                 uint32_t max_bucket = 0;
-                for (uint32_t b = 0; b < nbuckets; b++) {
-                    uint32_t bucket_val;
-                    if (!read_loop_offset(fd, &bucket_val, sizeof(bucket_val), buckets_off + (off_t)(b * 4))) break;
-                    if (bucket_val > max_bucket) max_bucket = bucket_val;
+                bool fast_path_success = false;
+
+                // Only use the fast path if nbuckets is reasonable (e.g. <= 1M elements, 4MB)
+                if (nbuckets <= 1024 * 1024) {
+                    std::vector<uint32_t> buckets(nbuckets);
+                    if (read_loop_offset(fd, buckets.data(), nbuckets * sizeof(uint32_t), buckets_off)) {
+                        for (uint32_t b = 0; b < nbuckets; b++) {
+                            if (buckets[b] > max_bucket) max_bucket = buckets[b];
+                        }
+                        fast_path_success = true;
+                    }
+                }
+
+                if (!fast_path_success) {
+                    for (uint32_t b = 0; b < nbuckets; b++) {
+                        uint32_t bucket_val;
+                        if (!read_loop_offset(fd, &bucket_val, sizeof(bucket_val), buckets_off + (off_t)(b * 4))) break;
+                        if (bucket_val > max_bucket) max_bucket = bucket_val;
+                    }
                 }
 
                 if (max_bucket >= symoffset) {
