@@ -95,10 +95,6 @@ inline ProcessFlags& operator&=(ProcessFlags& a, ProcessFlags b) {
     return a;
 }
 
-inline bool has_flag(ProcessFlags flags, ProcessFlags flag) {
-    return (flags & flag) == flag;
-}
-
 // --- Shared Memory ---
 constexpr size_t SHM_HASH_MAP_SIZE = 8192; // Should be a power of 2 for fast modulo
 

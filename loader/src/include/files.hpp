@@ -21,12 +21,7 @@ sFILE make_file(FILE *fp) {
 }
 
 static inline sDIR open_dir(const char *path) { return make_dir(opendir(path)); }
-static inline sDIR xopen_dir(const char *path) { return make_dir(opendir(path)); }
-static inline sDIR xopen_dir(int dirfd) { return make_dir(fdopendir(dirfd)); }
 
-static inline sFILE open_file(const char *path, const char *mode) {
-    return make_file(fopen(path, mode));
-}
 static inline sFILE xopen_file(const char *path, const char *mode) {
     return make_file(fopen(path, mode));
 }

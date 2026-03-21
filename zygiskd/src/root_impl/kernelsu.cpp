@@ -46,8 +46,8 @@ constexpr uint32_t KSU_IOCTL_GET_MANAGER_UID = 0x80004B0A;   // nr=10, dir=R
 
 struct KsuGetInfoCmd {
     uint32_t version;
-    uint32_t flags;
-    uint32_t features;
+    [[maybe_unused]] uint32_t flags;
+    [[maybe_unused]] uint32_t features;
 };
 
 struct KsuUidGrantedRootCmd {
