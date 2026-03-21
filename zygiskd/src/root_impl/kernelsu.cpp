@@ -17,20 +17,14 @@ namespace kernelsu {
 
 // --- KernelSU Communication Method Enum & Cached State ---
 
-enum class MethodType { Ioctl, Prctl };
-
-struct Method {
-    MethodType type;
-    int fd; // Only used for Ioctl
-};
-
-struct DetectionResult {
-    Method method;
-    Version version;
-};
-
 static std::once_flag ksu_result_flag;
-static std::optional<DetectionResult> ksu_result;
+static int g_ksu_fd = -1;
+static std::optional<Version> g_ksu_version;
+static std::atomic<int32_t> g_manager_uid{-1};
+
+static bool (*uid_granted_root_impl)(int32_t) = [](int32_t) { return false; };
+static bool (*uid_should_umount_impl)(int32_t) = [](int32_t) { return false; };
+static int32_t (*get_manager_uid_impl)() = []() -> int32_t { return -2; };
 
 // --- Modern `ioctl` Interface Constants and Structs ---
 
@@ -162,6 +156,72 @@ static void init_legacy_variant_probe() {
     });
 }
 
+// --- Split Implementations ---
+
+static bool ioctl_granted_root(int32_t uid) {
+    KsuUidGrantedRootCmd cmd = {static_cast<uint32_t>(uid), 0};
+    if (ksuctl_ioctl(g_ksu_fd, KSU_IOCTL_UID_GRANTED_ROOT, &cmd)) {
+        return cmd.granted != 0;
+    }
+    return false;
+}
+
+static bool prctl_granted_root(int32_t uid) {
+    int result_payload = 0;
+    uint32_t result_ok = 0;
+    ksuctl_prctl(KERNEL_SU_OPTION, CMD_UID_GRANTED_ROOT, uid, &result_payload, &result_ok);
+    return (result_ok == static_cast<uint32_t>(KERNEL_SU_OPTION)) && (result_payload != 0);
+}
+
+static bool ioctl_should_umount(int32_t uid) {
+    KsuUidShouldUmountCmd cmd = {static_cast<uint32_t>(uid), 0};
+    if (ksuctl_ioctl(g_ksu_fd, KSU_IOCTL_UID_SHOULD_UMOUNT, &cmd)) {
+        return cmd.should_umount != 0;
+    }
+    return false;
+}
+
+static bool prctl_should_umount(int32_t uid) {
+    int result_payload = 0;
+    uint32_t result_ok = 0;
+    ksuctl_prctl(KERNEL_SU_OPTION, CMD_UID_SHOULD_UMOUNT, uid, &result_payload, &result_ok);
+    return (result_ok == static_cast<uint32_t>(KERNEL_SU_OPTION)) && (result_payload != 0);
+}
+
+static int32_t ioctl_get_manager_uid() {
+    KsuGetManagerUidCmd cmd = {0};
+    if (ksuctl_ioctl(g_ksu_fd, KSU_IOCTL_GET_MANAGER_UID, &cmd)) {
+        return static_cast<int32_t>(cmd.uid);
+    }
+    return -2;
+}
+
+static int32_t prctl_get_manager_uid() {
+    if (legacy_supports_manager_uid) {
+        uint32_t manager_uid = 0;
+        uint32_t result_ok = 0;
+        ksuctl_prctl(KERNEL_SU_OPTION, CMD_GET_MANAGER_UID, &manager_uid, 0, &result_ok);
+        if (result_ok == static_cast<uint32_t>(KERNEL_SU_OPTION)) {
+            return static_cast<int32_t>(manager_uid);
+        }
+    }
+
+    const char* manager_path = nullptr;
+    if (legacy_variant == KernelSuVariant::Official) {
+        manager_path = "/data/user_de/0/me.weishu.kernelsu";
+    } else if (legacy_variant == KernelSuVariant::Next) {
+        manager_path = "/data/user_de/0/com.rifsxd.ksunext";
+    } else {
+        return -2;
+    }
+
+    struct stat st;
+    if (stat(manager_path, &st) == 0) {
+        return static_cast<int32_t>(st.st_uid);
+    }
+    return -2;
+}
+
 // --- Core Detection and Dispatch Logic ---
 
 static void detect_and_init() {
@@ -170,6 +230,7 @@ static void detect_and_init() {
             int fd = fd_opt.value();
             KsuGetInfoCmd cmd = {0, 0, 0};
             if (ksuctl_ioctl(fd, KSU_IOCTL_GET_INFO, &cmd)) {
+                (void)cmd.flags; (void)cmd.features;
                 int version_code = static_cast<int>(cmd.version);
                 if (version_code > 0) {
                     struct stat st;
@@ -178,10 +239,15 @@ static void detect_and_init() {
                         if (version_code > MAX_KSU_VERSION) {
                             LOGW("Support for current KernelSU (variant) could be incomplete");
                         }
-                        ksu_result = DetectionResult{{MethodType::Ioctl, fd}, Version::Supported};
+                        g_ksu_fd = fd;
+                        g_ksu_version = Version::Supported;
+                        uid_granted_root_impl = ioctl_granted_root;
+                        uid_should_umount_impl = ioctl_should_umount;
+                        get_manager_uid_impl = ioctl_get_manager_uid;
                         return;
                     } else if (version_code < MIN_KSU_VERSION) {
-                        ksu_result = DetectionResult{{MethodType::Ioctl, fd}, Version::TooOld};
+                        g_ksu_fd = fd;
+                        g_ksu_version = Version::TooOld;
                         return;
                     }
                 }
@@ -198,10 +264,13 @@ static void detect_and_init() {
                 if (version_code > MAX_KSU_VERSION) {
                     LOGW("Support for current KernelSU (variant) could be incomplete");
                 }
-                ksu_result = DetectionResult{{MethodType::Prctl, -1}, Version::Supported};
+                g_ksu_version = Version::Supported;
+                uid_granted_root_impl = prctl_granted_root;
+                uid_should_umount_impl = prctl_should_umount;
+                get_manager_uid_impl = prctl_get_manager_uid;
                 return;
             } else if (version_code < MIN_KSU_VERSION) {
-                ksu_result = DetectionResult{{MethodType::Prctl, -1}, Version::TooOld};
+                g_ksu_version = Version::TooOld;
                 return;
             }
         }
@@ -210,83 +279,25 @@ static void detect_and_init() {
 
 std::optional<Version> detect_version() {
     detect_and_init();
-    if (ksu_result.has_value()) {
-        return ksu_result.value().version;
-    }
-    return std::nullopt;
+    return g_ksu_version;
 }
 
 bool uid_granted_root(int32_t uid) {
-    if (!ksu_result.has_value()) return false;
-    auto method = ksu_result.value().method;
-
-    if (method.type == MethodType::Ioctl) {
-        KsuUidGrantedRootCmd cmd = {static_cast<uint32_t>(uid), 0};
-        if (ksuctl_ioctl(method.fd, KSU_IOCTL_UID_GRANTED_ROOT, &cmd)) {
-            return cmd.granted != 0;
-        }
-        return false;
-    } else {
-        bool result_payload = false;
-        uint32_t result_ok = 0;
-        ksuctl_prctl(KERNEL_SU_OPTION, CMD_UID_GRANTED_ROOT, uid, &result_payload, &result_ok);
-        return (result_ok == static_cast<uint32_t>(KERNEL_SU_OPTION)) && result_payload;
-    }
+    return uid_granted_root_impl(uid);
 }
 
 bool uid_should_umount(int32_t uid) {
-    if (!ksu_result.has_value()) return false;
-    auto method = ksu_result.value().method;
-
-    if (method.type == MethodType::Ioctl) {
-        KsuUidShouldUmountCmd cmd = {static_cast<uint32_t>(uid), 0};
-        if (ksuctl_ioctl(method.fd, KSU_IOCTL_UID_SHOULD_UMOUNT, &cmd)) {
-            return cmd.should_umount != 0;
-        }
-        return false;
-    } else {
-        bool result_payload = false;
-        uint32_t result_ok = 0;
-        ksuctl_prctl(KERNEL_SU_OPTION, CMD_UID_SHOULD_UMOUNT, uid, &result_payload, &result_ok);
-        return (result_ok == static_cast<uint32_t>(KERNEL_SU_OPTION)) && result_payload;
-    }
+    return uid_should_umount_impl(uid);
 }
 
 bool uid_is_manager(int32_t uid) {
-    if (!ksu_result.has_value()) return false;
-    auto method = ksu_result.value().method;
-
-    if (method.type == MethodType::Ioctl) {
-        KsuGetManagerUidCmd cmd = {0};
-        if (ksuctl_ioctl(method.fd, KSU_IOCTL_GET_MANAGER_UID, &cmd)) {
-            return static_cast<uint32_t>(uid) == cmd.uid;
-        }
-        return false;
-    } else {
-        if (legacy_supports_manager_uid) {
-            uint32_t manager_uid = 0;
-            uint32_t result_ok = 0;
-            ksuctl_prctl(KERNEL_SU_OPTION, CMD_GET_MANAGER_UID, &manager_uid, 0, &result_ok);
-            if (result_ok == static_cast<uint32_t>(KERNEL_SU_OPTION)) {
-                return static_cast<uint32_t>(uid) == manager_uid;
-            }
-        }
-
-        const char* manager_path = nullptr;
-        if (legacy_variant == KernelSuVariant::Official) {
-            manager_path = "/data/user_de/0/me.weishu.kernelsu";
-        } else if (legacy_variant == KernelSuVariant::Next) {
-            manager_path = "/data/user_de/0/com.rifsxd.ksunext";
-        } else {
-            return false;
-        }
-
-        struct stat st;
-        if (stat(manager_path, &st) == 0) {
-            return st.st_uid == static_cast<uid_t>(uid);
-        }
-        return false;
+    int32_t manager_uid = g_manager_uid.load(std::memory_order_relaxed);
+    if (manager_uid == -1) {
+        manager_uid = get_manager_uid_impl();
+        g_manager_uid.store(manager_uid, std::memory_order_relaxed);
     }
+    if (manager_uid < 0) return false;
+    return static_cast<int32_t>(uid) == manager_uid;
 }
 
 } // namespace kernelsu
