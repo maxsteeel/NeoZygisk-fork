@@ -26,6 +26,7 @@ struct Cache {
     struct timespec pkg_mtime = {0, -1};
     std::unordered_set<int32_t> granted_uids;
     std::unordered_set<int32_t> denylist_uids;
+    std::unordered_set<std::string> denylist_pkgs;
     std::unordered_set<int32_t> all_known_uids;
     bool manager_resolved = false;
     int32_t manager_uid = -1;
@@ -306,6 +307,7 @@ static void update_cache() {
 
     g_cache.granted_uids.clear();
     g_cache.denylist_uids.clear();
+    g_cache.denylist_pkgs.clear();
     g_cache.all_known_uids.clear();
     g_cache.manager_uid = -1;
     g_cache.manager_resolved = false;
@@ -389,6 +391,7 @@ static void update_cache() {
     std::unordered_set<std::string_view> target_pkgs;
     for (const auto& pkg : denylist_pkgs) {
         target_pkgs.insert(pkg);
+        g_cache.denylist_pkgs.insert(pkg);
     }
 
     UniqueFile fp(fopen("/data/system/packages.list", "re"));
@@ -428,16 +431,6 @@ static bool is_valid_pkg_name(const std::string& pkg_name) {
     return true;
 }
 
-static std::string to_hex(const std::string& s) {
-    static const char* hex = "0123456789ABCDEF";
-    std::string out;
-    out.reserve(s.size() * 2);
-    for (unsigned char c : s) {
-        out += hex[c >> 4];
-        out += hex[c & 0xf];
-    }
-    return out;
-}
 
 static bool get_package_by_uid_from_xml(int32_t uid, std::string& pkg_name) {
     int fd = open("/data/system/packages.xml", O_RDONLY | O_CLOEXEC);
@@ -513,13 +506,8 @@ bool uid_should_umount(int32_t uid) {
 
     if (pkg_name.empty() || !is_valid_pkg_name(pkg_name)) return false;
 
-    MagiskDB db;
-    if (db.is_valid()) {
-        return db.check_exists("SELECT 1 FROM denylist WHERE package_name=? LIMIT 1", pkg_name.c_str());
-    }
-
-    std::string query = "SELECT 1 FROM denylist WHERE package_name=CAST(X'" + to_hex(pkg_name) + "' AS TEXT) LIMIT 1";
-    return utils::exec_command({"magisk", "--sqlite", query}).has_value();
+    lock.lock();
+    return g_cache.denylist_pkgs.find(pkg_name) != g_cache.denylist_pkgs.end();
 }
 
 bool uid_is_manager(int32_t uid) {
