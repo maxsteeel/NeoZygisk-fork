@@ -27,7 +27,7 @@ struct ConfigData {
 static const char* CONFIG_FILE = "/data/adb/ap/package_config";
 
 static std::mutex writer_mutex;
-static std::atomic<std::shared_ptr<const ConfigData>> config_cache_rcu;
+static std::atomic<const ConfigData*> config_cache_rcu{nullptr};
 static std::atomic<int64_t> last_stat_time_ms{0};
 
 std::optional<Version> detect_version() {
@@ -54,7 +54,7 @@ std::optional<Version> detect_version() {
     return cached_version;
 }
 
-static std::shared_ptr<const ConfigData> get_config() {
+static const ConfigData* get_config() {
     struct timespec now_ts;
     clock_gettime(CLOCK_MONOTONIC, &now_ts);
     int64_t now_ms = now_ts.tv_sec * 1000LL + now_ts.tv_nsec / 1000000LL;
@@ -92,8 +92,9 @@ static std::shared_ptr<const ConfigData> get_config() {
     UniqueFd fd(open(CONFIG_FILE, O_RDONLY | O_CLOEXEC));
     if (fd < 0) return nullptr;
 
-    auto result = std::make_shared<ConfigData>();
-    result->mtim = st.st_mtim;
+    // Allocate raw pointer to avoid NDK shared_ptr atomic limitation
+    ConfigData* new_config = new ConfigData();
+    new_config->mtim = st.st_mtim;
 
     if (st.st_size > 0) {
         void* map = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -108,7 +109,7 @@ static std::shared_ptr<const ConfigData> get_config() {
                 lines++;
                 p_count++;
             }
-            result->packages.reserve(lines);
+            new_config->packages.reserve(lines);
 
             // Skip header: find first newline
             const char* p = static_cast<const char*>(memchr(start, '\n', end - start));
@@ -129,7 +130,6 @@ static std::shared_ptr<const ConfigData> get_config() {
                             int uid_val = fast_atoi(cursor + 1);
 
                             // Extract allow
-                            const char* allow_end = cursor;
                             cursor--;
                             while (cursor >= p && *cursor != ',') cursor--;
                             if (cursor >= p) {
@@ -144,7 +144,7 @@ static std::shared_ptr<const ConfigData> get_config() {
                                     uint32_t packed = (static_cast<uint32_t>(uid_val) & 0x3FFFFFFF);
                                     if (allow_val == 1) packed |= (1U << 30);
                                     if (exclude_val == 1) packed |= (1U << 31);
-                                    result->packages.push_back(packed);
+                                    new_config->packages.push_back(packed);
                                 }
                             }
                         }
@@ -156,13 +156,19 @@ static std::shared_ptr<const ConfigData> get_config() {
         }
     }
 
-    std::sort(result->packages.begin(), result->packages.end(), [](uint32_t a, uint32_t b) {
+    std::sort(new_config->packages.begin(), new_config->packages.end(), [](uint32_t a, uint32_t b) {
         return (a & 0x3FFFFFFF) < (b & 0x3FFFFFFF);
     });
 
-    config_cache_rcu.store(result, std::memory_order_release);
+    // Store new configuration
+    (void)config_cache_rcu.exchange(new_config, std::memory_order_release);
 
-    return result;
+    // Defer deletion of old_config. In a strict daemon environment with extremely
+    // rare updates, leaking a few KB is safer than risking a Use-After-Free.
+    // However, if we know threads finish quickly, we could theoretically delete old_config here.
+    // For maximum safety without a hazard pointer framework, we leave it orphaned.
+
+    return new_config;
 }
 
 static uint32_t find_package(const ConfigData* config, int32_t uid) {
@@ -180,14 +186,14 @@ static uint32_t find_package(const ConfigData* config, int32_t uid) {
 bool uid_granted_root(int32_t uid) {
     auto config = get_config();
     if (!config) return false;
-    uint32_t pkg = find_package(config.get(), uid);
+    uint32_t pkg = find_package(config, uid);
     return (pkg & (1U << 30)) != 0;
 }
 
 bool uid_should_umount(int32_t uid) {
     auto config = get_config();
     if (!config) return false;
-    uint32_t pkg = find_package(config.get(), uid);
+    uint32_t pkg = find_package(config, uid);
     return (pkg & (1U << 31)) != 0;
 }
 
