@@ -3,6 +3,8 @@
 #include <linux/un.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <atomic>
+#include <memory>
 
 #include "logging.hpp"
 #include "misc.hpp"

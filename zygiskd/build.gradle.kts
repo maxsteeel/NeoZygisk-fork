@@ -8,7 +8,7 @@ val defaultCFlags = arrayOf(
     "-fno-stack-protector", "-fomit-frame-pointer",
     "-ffunction-sections", "-fdata-sections",
     "-fno-ident", "-fmerge-all-constants",
-    "-fno-semantic-interposition", "-fno-plt",
+    "-fno-semantic-interposition",
     "-Wno-builtin-macro-redefined", "-D__FILE__=__FILE_NAME__",
 )
 

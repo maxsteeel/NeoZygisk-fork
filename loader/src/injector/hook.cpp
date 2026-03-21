@@ -20,6 +20,7 @@
 #include <sys/syscall.h>
 #include <linux/audit.h>
 #include <stdint.h>
+#include <atomic>
 
 #include <lsplt.hpp>
 
