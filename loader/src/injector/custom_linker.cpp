@@ -18,10 +18,13 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <stdlib.h>
 
 #include <string>
 #include <vector>
 #include <mutex>
+#include <functional>
 
 #include "logging.hpp"
 #include "files.hpp"
@@ -86,10 +89,16 @@ static bool vaddr_to_offset(const std::vector<ElfW(Phdr)>& phdr, ElfW(Addr) vadd
     return false;
 }
 
+#ifndef STT_GNU_IFUNC
+#define STT_GNU_IFUNC 10
+#endif
+
 static std::mutex g_custom_regions_lock;
 struct CustomRegion {
     uintptr_t base;
     size_t size;
+
+    std::vector<std::function<void()>> destructors;
 };
 static std::vector<CustomRegion> g_custom_regions;
 
@@ -107,12 +116,21 @@ void custom_linker_unload(void* handle) {
     std::lock_guard<std::mutex> lock(g_custom_regions_lock);
     for (auto it = g_custom_regions.begin(); it != g_custom_regions.end(); ++it) {
         if (it->base == base) {
+            for (const auto& destructor : it->destructors) {
+                destructor();
+            }
+
             munmap(handle, it->size);
             g_custom_regions.erase(it);
             return;
         }
     }
 }
+
+struct CustomTlsInfo {
+    size_t module_id;
+    pthread_key_t key;
+};
 
 struct LoadedModule;
 
@@ -125,6 +143,10 @@ struct elf_dyn_info {
     int pltrel_type = 0; size_t syment = 0;
     size_t strsz = 0; size_t nsyms = 0;
     ElfW(Addr) init_array_vaddr = 0; size_t init_arraysz = 0;
+
+    ElfW(Addr) init_vaddr = 0;
+    ElfW(Addr) fini_vaddr = 0;
+    ElfW(Addr) fini_array_vaddr = 0; size_t fini_arraysz = 0;
 
     ElfW(Addr) eh_frame_hdr_vaddr = 0; size_t eh_frame_hdr_sz = 0;
 
@@ -149,6 +171,9 @@ struct LoadedModule {
     uintptr_t base;
     size_t size;
     elf_dyn_info dinfo;
+
+    bool eh_registered = false;
+    uintptr_t eh_frame_ptr = 0;
 };
 
 static bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, const std::vector<ElfW(Phdr)>& phdr, elf_dyn_info *out) {
@@ -204,6 +229,10 @@ static bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, con
             case DT_NEEDED: out->needed_str_offsets.push_back((size_t)dyn[i].d_un.d_val); break;
             case DT_INIT_ARRAY: out->init_array_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; break;
             case DT_INIT_ARRAYSZ: out->init_arraysz = (size_t)dyn[i].d_un.d_val; break;
+            case DT_INIT: out->init_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; break;
+            case DT_FINI: out->fini_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; break;
+            case DT_FINI_ARRAY: out->fini_array_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; break;
+            case DT_FINI_ARRAYSZ: out->fini_arraysz = (size_t)dyn[i].d_un.d_val; break;
 #ifdef __ANDROID__
             case DT_ANDROID_RELA: android_rel_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; android_is_rela = true; break;
             case DT_ANDROID_RELASZ: android_rel_sz = (size_t)dyn[i].d_un.d_val; break;
@@ -300,13 +329,14 @@ static bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, con
     return true;
 }
 
-static bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr) *out_value) {
+static bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr) *out_value, uint8_t *out_type = nullptr) {
     for (size_t i = 0; i < info->nsyms; i++) {
         const ElfW(Sym)& sym = info->symtab[i];
         if (sym.st_name == 0 || sym.st_name >= info->strsz) continue;
         const char *name = &info->strtab[sym.st_name];
         if (strcmp(name, sym_name) != 0 || sym.st_shndx == SHN_UNDEF) continue;
         *out_value = sym.st_value;
+        if (out_type) *out_type = ELF_ST_TYPE(sym.st_info);
         return true;
     }
     return false;
@@ -328,15 +358,29 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
     if (sym_idx >= info->nsyms) return false;
     const ElfW(Sym)& sym = info->symtab[sym_idx];
 
-    if (sym.st_shndx != SHN_UNDEF) { *out_addr = (uintptr_t)load_bias + (uintptr_t)sym.st_value; return true; }
+    if (sym.st_shndx != SHN_UNDEF) { 
+        uintptr_t addr = (uintptr_t)load_bias + (uintptr_t)sym.st_value;
+        if (ELF_ST_TYPE(sym.st_info) == STT_GNU_IFUNC) {
+            auto ifunc = reinterpret_cast<void* (*)()>(addr);
+            addr = reinterpret_cast<uintptr_t>(ifunc());
+        }
+        *out_addr = addr; 
+        return true; 
+    }
     if (sym.st_name == 0 || sym.st_name >= info->strsz) return false;
 
     const char *name = &info->strtab[sym.st_name];
     if (!name || !*name) return false;
 
     ElfW(Addr) local_val = 0;
-    if (find_dynsym_value(info, name, &local_val) && local_val != 0) {
-        *out_addr = (uintptr_t)load_bias + local_val;
+    uint8_t local_type = 0;
+    if (find_dynsym_value(info, name, &local_val, &local_type) && local_val != 0) {
+        uintptr_t addr = (uintptr_t)load_bias + local_val;
+        if (local_type == STT_GNU_IFUNC) {
+            auto ifunc = reinterpret_cast<void* (*)()>(addr);
+            addr = reinterpret_cast<uintptr_t>(ifunc());
+        }
+        *out_addr = addr;
         return true;
     }
 
@@ -346,8 +390,14 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
         for (const auto& mod : loaded_modules) {
             if (mod.path == mod_path) {
                 ElfW(Addr) mod_val = 0;
-                if (find_dynsym_value(&mod.dinfo, name, &mod_val) && mod_val != 0) {
-                    *out_addr = (uintptr_t)mod.load_bias + mod_val;
+                uint8_t mod_type = 0;
+                if (find_dynsym_value(&mod.dinfo, name, &mod_val, &mod_type) && mod_val != 0) {
+                    uintptr_t addr = (uintptr_t)mod.load_bias + mod_val;
+                    if (mod_type == STT_GNU_IFUNC) {
+                        auto ifunc = reinterpret_cast<void* (*)()>(addr);
+                        addr = reinterpret_cast<uintptr_t>(ifunc());
+                    }
+                    *out_addr = addr;
                     return true;
                 }
             }
@@ -914,51 +964,7 @@ static bool apply_module_relocations(int memfd, LoadedModule& mod, const std::ve
 }
 
 extern "C" void __register_frame(void*) __attribute__((weak));
-
-static bool register_eh_frames(const std::vector<LoadedModule>& loaded_modules) {
-    if (!__register_frame) return false;
-    for (const auto& mod : loaded_modules) {
-        if (!mod.dinfo.eh_frame_hdr_sz || !mod.dinfo.eh_frame_hdr_vaddr) continue;
-
-        uintptr_t hdr_addr = mod.load_bias + mod.dinfo.eh_frame_hdr_vaddr;
-        const uint8_t *p = reinterpret_cast<const uint8_t*>(hdr_addr);
-        const uint8_t *end = p + mod.dinfo.eh_frame_hdr_sz;
-
-        if (mod.dinfo.eh_frame_hdr_sz < 4) continue;
-        uint8_t version = *p++;
-        uint8_t eh_frame_ptr_enc = *p++;
-        uint8_t fde_count_enc = *p++;
-        uint8_t table_enc = *p++;
-
-        (void)fde_count_enc;
-        (void)table_enc;
-
-        if (version != 1) continue;
-
-        uintptr_t base = hdr_addr + (p - reinterpret_cast<const uint8_t*>(hdr_addr));
-        uintptr_t eh_frame_ptr = decode_eh_value(eh_frame_ptr_enc, &p, base, hdr_addr, end);
-        if (eh_frame_ptr) {
-            __register_frame(reinterpret_cast<void*>(eh_frame_ptr));
-        }
-    }
-    return true;
-}
-
-static void execute_init_arrays(const std::vector<LoadedModule>& loaded_modules) {
-    for (auto it = loaded_modules.rbegin(); it != loaded_modules.rend(); ++it) {
-        const auto& mod = *it;
-        if (mod.dinfo.init_array_vaddr && mod.dinfo.init_arraysz) {
-            size_t count = mod.dinfo.init_arraysz / sizeof(ElfW(Addr));
-            ElfW(Addr)* array_addr = reinterpret_cast<ElfW(Addr)*>(mod.load_bias + mod.dinfo.init_array_vaddr);
-            for (size_t i = 0; i < count; ++i) {
-                if (array_addr[i]) {
-                    auto func = reinterpret_cast<void (*)()>(array_addr[i]);
-                    func();
-                }
-            }
-        }
-    }
-}
+extern "C" void __deregister_frame(void*) __attribute__((weak));
 
 static bool load_single_library(const char *lib_path, int memfd, LoadedModule* out_module) {
     long page_size_long = sysconf(_SC_PAGESIZE);
@@ -1025,6 +1031,13 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
     for (const auto& s : segs) {
         if (s.prot == (PROT_READ | PROT_WRITE)) continue;
         mprotect(reinterpret_cast<void*>(s.addr), s.len, s.prot);
+    }
+
+    if (dinfo.tls_segment_vaddr && dinfo.tls_segment_memsz) {
+        CustomTlsInfo* tls_info = new CustomTlsInfo();
+        tls_info->module_id = reinterpret_cast<size_t>(tls_info);
+        pthread_key_create(&tls_info->key, free);
+        dinfo.tls_mod_id = tls_info->module_id;
     }
 
     out_module->path = lib_path;
@@ -1136,11 +1149,41 @@ static bool load_dependencies_recursive(const char *lib_path, int memfd, std::ve
 }
 
 static inline void cleanup_failed_load(const std::vector<LoadedModule>& loaded_modules) {
-    for (const auto& mod : loaded_modules) {
+    for (auto it = loaded_modules.rbegin(); it != loaded_modules.rend(); ++it) {
+        const auto& mod = *it;
+        if (mod.eh_registered && __deregister_frame) {
+            __deregister_frame(reinterpret_cast<void*>(mod.eh_frame_ptr));
+        }
+        if (mod.dinfo.tls_mod_id) {
+            CustomTlsInfo* tls_info = reinterpret_cast<CustomTlsInfo*>(mod.dinfo.tls_mod_id);
+            pthread_key_delete(tls_info->key);
+            delete tls_info;
+        }
         if (mod.base != 0 && mod.size != 0) {
             munmap(reinterpret_cast<void*>(mod.base), mod.size);
         }
     }
+}
+
+struct tls_index {
+    size_t module_id;
+    size_t offset;
+};
+
+extern "C" void* custom_tls_get_addr(tls_index* ti) {
+    CustomTlsInfo* tls_info = reinterpret_cast<CustomTlsInfo*>(ti->module_id);
+    if (tls_info && tls_info->module_id == ti->module_id) {
+        void* ptr = pthread_getspecific(tls_info->key);
+        if (!ptr) {
+            size_t size = 4096;
+            posix_memalign(&ptr, 16, size);
+            memset(ptr, 0, size);
+            pthread_setspecific(tls_info->key, ptr);
+        }
+        return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(ptr) + ti->offset);
+    }
+    auto original_tls = reinterpret_cast<void*(*)(tls_index*)>(dlsym(RTLD_NEXT, "__tls_get_addr"));
+    return original_tls ? original_tls(ti) : nullptr;
 }
 
 // ---------------- MAIN ----------------
@@ -1156,35 +1199,71 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
 
     if (loaded_modules.empty()) return false;
 
+    // Step 1: Hook TLS for all modules first
     for (auto& mod : loaded_modules) {
         for (size_t i = 0; i < mod.dinfo.nsyms; i++) {
             ElfW(Sym)& sym = mod.dinfo.symtab[i];
             if (sym.st_name != 0 && sym.st_name < mod.dinfo.strsz) {
                 const char *name = &mod.dinfo.strtab[sym.st_name];
                 if (strcmp(name, "__tls_get_addr") == 0) {
-#if defined(__arm__)
-                    // On ARM32 __aeabi_read_tp might be unresolved dynamically when linked statically.
-                    // Better to use an inline asm to avoid dependency on libc internals
-                    uintptr_t tp;
-                    __asm__ __volatile__("mrc p15, 0, %0, c13, c0, 3" : "=r"(tp));
-                    sym.st_value = tp - mod.load_bias;
-#else
-                    sym.st_value = reinterpret_cast<uintptr_t>(__builtin_thread_pointer()) - mod.load_bias;
-#endif
+                    sym.st_value = reinterpret_cast<uintptr_t>(&custom_tls_get_addr) - mod.load_bias;
                     sym.st_shndx = 1;
                 }
             }
         }
+    }
+
+    // Step 2: Relocate and Initialize in REVERSE order (dependencies first)
+    for (auto it = loaded_modules.rbegin(); it != loaded_modules.rend(); ++it) {
+        auto& mod = *it;
 
         if (!apply_module_relocations(memfd, mod, loaded_modules)) {
             LOGE("Failed to apply relocations for module %s", mod.path.c_str());
             cleanup_failed_load(loaded_modules);
             return false;
         }
-    }
 
-    register_eh_frames(loaded_modules);
-    execute_init_arrays(loaded_modules);
+        // Register DWARF immediately after relocation
+        if (__register_frame && mod.dinfo.eh_frame_hdr_sz && mod.dinfo.eh_frame_hdr_vaddr) {
+            uintptr_t hdr_addr = mod.load_bias + mod.dinfo.eh_frame_hdr_vaddr;
+            const uint8_t *p = reinterpret_cast<const uint8_t*>(hdr_addr);
+            const uint8_t *end = p + mod.dinfo.eh_frame_hdr_sz;
+
+            if (mod.dinfo.eh_frame_hdr_sz >= 4) {
+                uint8_t version = *p++;
+                uint8_t eh_frame_ptr_enc = *p++;
+                [[maybe_unused]] uint8_t fde_count_enc = *p++;
+                [[maybe_unused]] uint8_t table_enc = *p++;
+
+                if (version == 1) {
+                    uintptr_t base = hdr_addr + (p - reinterpret_cast<const uint8_t*>(hdr_addr));
+                    uintptr_t eh_frame_ptr = decode_eh_value(eh_frame_ptr_enc, &p, base, hdr_addr, end);
+                    if (eh_frame_ptr) {
+                        __register_frame(reinterpret_cast<void*>(eh_frame_ptr));
+                        mod.eh_registered = true;
+                        mod.eh_frame_ptr = eh_frame_ptr;
+                    }
+                }
+            }
+        }
+
+        // Execute Constructors immediately after DWARF registration
+        if (mod.dinfo.init_vaddr) {
+            auto func = reinterpret_cast<void (*)()>(mod.load_bias + mod.dinfo.init_vaddr);
+            func();
+        }
+
+        if (mod.dinfo.init_array_vaddr && mod.dinfo.init_arraysz) {
+            size_t count = mod.dinfo.init_arraysz / sizeof(ElfW(Addr));
+            ElfW(Addr)* array_addr = reinterpret_cast<ElfW(Addr)*>(mod.load_bias + mod.dinfo.init_array_vaddr);
+            for (size_t i = 0; i < count; ++i) {
+                if (array_addr[i]) {
+                    auto func = reinterpret_cast<void (*)()>(array_addr[i]);
+                    func();
+                }
+            }
+        }
+    }
 
     LoadedModule& main_mod = loaded_modules[0];
 
@@ -1201,7 +1280,51 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
 
     {
         std::lock_guard<std::mutex> lock(g_custom_regions_lock);
-        g_custom_regions.push_back({main_mod.base, main_mod.size});
+        CustomRegion region;
+        region.base = main_mod.base;
+        region.size = main_mod.size;
+
+        // We collect all destroyers in reverse order of loading
+        for (auto it = loaded_modules.rbegin(); it != loaded_modules.rend(); ++it) {
+            const auto& mod = *it;
+
+            // 1. FINI_ARRAY is executed in reverse order (from the end of the array to the beginning)
+            if (mod.dinfo.fini_array_vaddr && mod.dinfo.fini_arraysz) {
+                size_t count = mod.dinfo.fini_arraysz / sizeof(ElfW(Addr));
+                ElfW(Addr)* array_addr = reinterpret_cast<ElfW(Addr)*>(mod.load_bias + mod.dinfo.fini_array_vaddr);
+                for (size_t i = 0; i < count; ++i) {
+                    if (array_addr[count - 1 - i]) {
+                        auto func = reinterpret_cast<void (*)()>(array_addr[count - 1 - i]);
+                        region.destructors.push_back(func);
+                    }
+                }
+            }
+
+            // 2. DT_FINI is executed after FINI_ARRAY
+            if (mod.dinfo.fini_vaddr) {
+                auto func = reinterpret_cast<void (*)()>(mod.load_bias + mod.dinfo.fini_vaddr);
+                region.destructors.push_back(func);
+            }
+
+            // 3. It's also the perfect time to clean up TLS and DWARF
+            if (mod.dinfo.tls_mod_id) {
+                size_t mod_id = mod.dinfo.tls_mod_id;
+                region.destructors.push_back([mod_id]() {
+                    CustomTlsInfo* tls_info = reinterpret_cast<CustomTlsInfo*>(mod_id);
+                    pthread_key_delete(tls_info->key);
+                    delete tls_info;
+                });
+            }
+
+            if (mod.eh_registered && __deregister_frame) {
+                uintptr_t frame_ptr = mod.eh_frame_ptr;
+                region.destructors.push_back([frame_ptr]() {
+                    __deregister_frame(reinterpret_cast<void*>(frame_ptr));
+                });
+            }
+        }
+
+        g_custom_regions.push_back(std::move(region));
     }
     return true;
 }
