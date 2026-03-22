@@ -1112,11 +1112,13 @@ static bool load_dependencies_recursive(const char *lib_path, int memfd, std::ve
         }
     }
 
-    // If not loaded by us, check if system linker has it
-    void* existing_handle = dlopen(soname, RTLD_NOLOAD | RTLD_NOW);
+    // Allows the system linker (Bionic) to load the library if it is system.
+    // We remove RTLD_NOLOAD so that Bionic can safely load it if it is missing, 
+    // avoiding mapping duplicate manual copies of the OS.
+    void* existing_handle = dlopen(soname, RTLD_NOW);
     if (existing_handle != nullptr) {
-        // The library is already in the operating system memory (e.g. libc.so, libdl.so)
-        dlclose(existing_handle); // We decrease the reference counter
+        // We INTENTIONALLY do not do dlclose(). We want the system to maintain
+        // the library lives in memory so that our module can use it.
         return true;
     }
 
@@ -1182,7 +1184,7 @@ extern "C" void* custom_tls_get_addr(tls_index* ti) {
         }
         return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(ptr) + ti->offset);
     }
-    auto original_tls = reinterpret_cast<void*(*)(tls_index*)>(dlsym(RTLD_NEXT, "__tls_get_addr"));
+    auto original_tls = reinterpret_cast<void*(*)(tls_index*)>(dlsym(RTLD_DEFAULT, "__tls_get_addr"));
     return original_tls ? original_tls(ti) : nullptr;
 }
 
