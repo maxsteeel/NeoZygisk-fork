@@ -19,7 +19,7 @@
 #include "daemon.hpp"
 #include "logging.hpp"
 #include "utils.hpp"
-#include "remote_csoloader.hpp"
+#include "remote_custom_linker.hpp"
 
 /**
  * @brief Injects a shared library into a running process at its main entry point.
@@ -191,7 +191,7 @@ static bool execute_remote_injection(int pid, const char *lib_path, uintptr_t en
     auto map = MapInfo::Scan(pid);  // Re-scan maps as they may have changed.
     auto local_map = MapInfo::Scan();
     
-    // Find libc.so return address and path for CSOLoader
+    // Find libc.so return address and path for Remote-Custom Linker
     auto libc_return_addr = find_module_return_addr(map, "libc.so");
     const char* libc_path_str = nullptr;
     for (const auto &info : map) {
@@ -215,17 +215,17 @@ static bool execute_remote_injection(int pid, const char *lib_path, uintptr_t en
     uintptr_t init_array = 0;
     size_t init_count = 0;
 
-    if (!remote_csoloader_load_and_resolve_entry(pid, &regs, (uintptr_t)libc_return_addr, 
+    if (!remote_custom_linker_load_and_resolve_entry(pid, &regs, (uintptr_t)libc_return_addr, 
                                                  local_map, map, libc_path_str,
                                                  lib_path, &remote_base, &remote_size, &injector_entry,
                                                  &init_array, &init_count)) {
-        LOGE("CSOLoader failed to map the library remotely");
+        LOGE("Remote-Custom Linker failed to map the library remotely");
         backup.REG_IP = (long) entry_addr;
         set_regs(pid, backup);
         return false;
     }
 
-    LOGI("CSOLoader success. entry: 0x%" PRIxPTR, injector_entry);
+    LOGI("Remote-Custom Linker success. entry: 0x%" PRIxPTR, injector_entry);
 
     auto remote_tmp_path = push_string(pid, regs, zygiskd::GetTmpPath().c_str());
     long args[] = {
