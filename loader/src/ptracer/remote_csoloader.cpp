@@ -10,6 +10,7 @@
 #include <string>
 #include <sys/uio.h>
 #include <linux/memfd.h>
+#include <sys/utsname.h>
 
 #include "daemon.hpp"
 #include "logging.hpp"
@@ -418,6 +419,38 @@ static bool apply_rel_section(int pid, int fd, [[maybe_unused]] const elf_dyn_in
     return true;
 }
 
+static bool is_memfd_supported_by_kernel() {
+    static int supported = -1;
+    if (supported != -1) return supported == 1;
+
+    struct utsname uts;
+    if (uname(&uts) != 0) {
+        supported = 1; // Default to true if uname fails
+        return true;
+    }
+
+    int major = 0, minor = 0;
+    const char *p = uts.release;
+    while (*p >= '0' && *p <= '9') {
+        major = major * 10 + (*p - '0');
+        p++;
+    }
+    if (*p == '.') {
+        p++;
+        while (*p >= '0' && *p <= '9') {
+            minor = minor * 10 + (*p - '0');
+            p++;
+        }
+    }
+
+    if (major > 3 || (major == 3 && minor >= 17)) {
+        supported = 1;
+    } else {
+        supported = 0;
+    }
+    return supported == 1;
+}
+
 // ---------------- MAIN ----------------
 bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *regs,
                                              uintptr_t libc_return_addr, 
@@ -475,20 +508,23 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
         return false;
     }
 
-    long memfd_syscall_num = 0;
+    long memfd = -1;
+    if (is_memfd_supported_by_kernel()) {
+        long memfd_syscall_num = 0;
 #if defined(__aarch64__)
-    memfd_syscall_num = 279;
+        memfd_syscall_num = 279;
 #elif defined(__x86_64__)
-    memfd_syscall_num = 319;
+        memfd_syscall_num = 319;
 #elif defined(__arm__)
-    memfd_syscall_num = 385;
+        memfd_syscall_num = 385;
 #elif defined(__i386__)
-    memfd_syscall_num = 356;
+        memfd_syscall_num = 356;
 #endif
 
-    long args_syscall_memfd[] = {memfd_syscall_num, (long)(remote_str_block + 2048), MFD_CLOEXEC};
-    call_regs = regs_saved;
-    long memfd = (long)remote_call(pid, call_regs, (uintptr_t)syscall_addr, libc_return_addr, args_syscall_memfd, 3);
+        long args_syscall_memfd[] = {memfd_syscall_num, (long)(remote_str_block + 2048), MFD_CLOEXEC};
+        call_regs = regs_saved;
+        memfd = (long)remote_call(pid, call_regs, (uintptr_t)syscall_addr, libc_return_addr, args_syscall_memfd, 3);
+    }
 
     long args_munmap1[] = {(long)remote_str_block, 4096};
     call_regs = regs_saved;
@@ -595,6 +631,7 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
     }
 
     for (const auto& s : segs) {
+        if (s.prot == (PROT_READ | PROT_WRITE)) continue;
         call_regs = regs_saved;
         long args_mprotect[] = {(long)s.addr, (long)s.len, s.prot};
         remote_call(pid, call_regs, (uintptr_t)mprotect_addr, libc_return_addr, args_mprotect, 3);
