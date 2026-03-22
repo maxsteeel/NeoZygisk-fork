@@ -1,4 +1,17 @@
-#include "remote_csoloader.hpp"
+/*
+ * Remote-Custom Linker for NeoZygisk-fork
+ * 
+ * This file is a derivative work based on CSOLoader.
+ * Original Author: ThePedroo (Copyright (c) 2025)
+ * C++ rewrite and modifications by: maxsteeel (Copyright (c) 2026)
+ * 
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+#include "remote_custom_linker.hpp"
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -452,7 +465,7 @@ static bool is_memfd_supported_by_kernel() {
 }
 
 // ---------------- MAIN ----------------
-bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *regs,
+bool remote_custom_linker_load_and_resolve_entry(int pid, struct user_regs_struct *regs,
                                              uintptr_t libc_return_addr, 
                                              const std::vector<MapInfo>& local_map,
                                              const std::vector<MapInfo>& remote_map, 
@@ -555,7 +568,7 @@ bool remote_csoloader_load_and_resolve_entry(int pid, struct user_regs_struct *r
         call_regs = regs_saved;
         remote_call(pid, call_regs, (uintptr_t)close_addr, libc_return_addr, args_close, 1);
     } else {
-        LOGW("CSOLoader: memfd_create failed, falling back to anonymous memory");
+        LOGW("remote_custom_linker: memfd_create failed, falling back to anonymous memory");
         long args_mmap_anon[] = {0, (long)map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
         call_regs = regs_saved;
         remote_base = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args_mmap_anon, 6);
