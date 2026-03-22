@@ -12,11 +12,11 @@
 using sFILE = std::unique_ptr<FILE, decltype(&fclose)>;
 using sDIR = std::unique_ptr<DIR, decltype(&closedir)>;
 
-sDIR make_dir(DIR *dp) {
+static inline sDIR make_dir(DIR *dp) {
     return sDIR(dp, [](DIR *dp) { return dp ? closedir(dp) : 1; });
 }
 
-sFILE make_file(FILE *fp) {
+static inline sFILE make_file(FILE *fp) {
     return sFILE(fp, [](FILE *fp) { return fp ? fclose(fp) : 1; });
 }
 

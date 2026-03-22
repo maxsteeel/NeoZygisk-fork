@@ -22,6 +22,7 @@
 #include "logging.hpp"
 #include "misc.hpp"
 #include "zygisk.hpp"
+#include "custom_linker.hpp"
 
 // Structure for the getdents64 syscall
 struct linux_dirent64 {
@@ -455,10 +456,19 @@ void ZygiskContext::run_modules_pre() {
 
         g_in_module_load = 1;
         if (sigsetjmp(g_segv_jmp_buf, 1) == 0) {
-            void *handle = DlopenMem(m.memfd, RTLD_NOW);
-            void *entry = handle ? dlsym(handle, "zygisk_module_entry") : nullptr;
-            if (handle && entry) {
+            uintptr_t base, entry_addr;
+            size_t size_mod, init_array, init_count;
+            if (custom_linker_load(m.memfd, &base, &size_mod, &entry_addr, &init_array, &init_count)) {
+                void* handle = reinterpret_cast<void*>(base); // Fake handle
+                void* entry = reinterpret_cast<void*>(entry_addr);
                 modules.emplace_back(i, handle, entry);
+            } else {
+                // Fallback to DlopenMem if custom linker fails
+                void *handle = DlopenMem(m.memfd, RTLD_NOW);
+                void *entry = handle ? dlsym(handle, "zygisk_module_entry") : nullptr;
+                if (handle && entry) {
+                    modules.emplace_back(i, handle, entry);
+                }
             }
         } else {
             LOGE("Module `%s` crashed during dlopen/dlsym. Disabling.", m.name);
