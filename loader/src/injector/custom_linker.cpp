@@ -21,6 +21,7 @@
 
 #include <string>
 #include <vector>
+#include <mutex>
 
 #include "logging.hpp"
 #include "files.hpp"
@@ -83,6 +84,34 @@ static bool vaddr_to_offset(const std::vector<ElfW(Phdr)>& phdr, ElfW(Addr) vadd
         return true;
     }
     return false;
+}
+
+static std::mutex g_custom_regions_lock;
+struct CustomRegion {
+    uintptr_t base;
+    size_t size;
+};
+static std::vector<CustomRegion> g_custom_regions;
+
+bool is_custom_linker_address(const void* addr) {
+    uintptr_t ptr = reinterpret_cast<uintptr_t>(addr);
+    std::lock_guard<std::mutex> lock(g_custom_regions_lock);
+    for (const auto& reg : g_custom_regions) {
+        if (ptr >= reg.base && ptr < reg.base + reg.size) return true;
+    }
+    return false;
+}
+
+void custom_linker_unload(void* handle) {
+    uintptr_t base = reinterpret_cast<uintptr_t>(handle);
+    std::lock_guard<std::mutex> lock(g_custom_regions_lock);
+    for (auto it = g_custom_regions.begin(); it != g_custom_regions.end(); ++it) {
+        if (it->base == base) {
+            munmap(handle, it->size);
+            g_custom_regions.erase(it);
+            return;
+        }
+    }
 }
 
 struct LoadedModule;
@@ -495,7 +524,7 @@ static bool apply_rela_section(int fd, [[maybe_unused]] const elf_dyn_info *info
         if (type == R_AARCH64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))r.r_addend;
         else if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT || type == R_AARCH64_ABS64) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) return false;
+            if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
             value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))r.r_addend : 0;
         } else if (type == R_AARCH64_TLS_DTPMOD) {
             value = info->tls_mod_id;
@@ -514,7 +543,7 @@ static bool apply_rela_section(int fd, [[maybe_unused]] const elf_dyn_info *info
         if (type == R_X86_64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))r.r_addend;
         else if (type == R_X86_64_GLOB_DAT || type == R_X86_64_JUMP_SLOT || type == R_X86_64_64) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) return false;
+            if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
             value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))r.r_addend : 0;
         } else if (type == R_X86_64_DTPMOD64) {
             value = info->tls_mod_id;
@@ -561,7 +590,7 @@ static bool apply_rel_section(int fd, [[maybe_unused]] const elf_dyn_info *info,
             value = (ElfW(Addr))load_bias + addend;
         } else if (type == R_ARM_GLOB_DAT || type == R_ARM_JUMP_SLOT || type == R_ARM_ABS32) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) return false;
+            if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
             if (sym_addr == 0) value = 0;
             else if (type == R_ARM_ABS32) {
                 addend = *reinterpret_cast<ElfW(Addr)*>(target);
@@ -586,7 +615,7 @@ static bool apply_rel_section(int fd, [[maybe_unused]] const elf_dyn_info *info,
             value = (ElfW(Addr))load_bias + addend;
         } else if (type == R_386_GLOB_DAT || type == R_386_JMP_SLOT || type == R_386_32) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) return false;
+            if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
             if (sym_addr == 0) value = 0;
             else if (type == R_386_32) {
                 addend = *reinterpret_cast<ElfW(Addr)*>(target);
@@ -694,7 +723,7 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
             if (current_type == R_AARCH64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
             else if (current_type == R_AARCH64_GLOB_DAT || current_type == R_AARCH64_JUMP_SLOT || current_type == R_AARCH64_ABS64) {
                 uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) return false;
+                if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
                 value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
             } else if (current_type == R_AARCH64_TLS_DTPMOD) {
                 value = info->tls_mod_id;
@@ -713,7 +742,7 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
             if (current_type == R_X86_64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
             else if (current_type == R_X86_64_GLOB_DAT || current_type == R_X86_64_JUMP_SLOT || current_type == R_X86_64_64) {
                 uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) return false;
+                if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
                 value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
             } else if (current_type == R_X86_64_DTPMOD64) {
                 value = info->tls_mod_id;
@@ -734,7 +763,7 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
                 value = (ElfW(Addr))load_bias + addend_rel;
             } else if (current_type == R_ARM_GLOB_DAT || current_type == R_ARM_JUMP_SLOT || current_type == R_ARM_ABS32) {
                 uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) return false;
+                if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
                 if (sym_addr == 0) value = 0;
                 else if (current_type == R_ARM_ABS32) {
                     ElfW(Addr) addend_rel = *reinterpret_cast<ElfW(Addr)*>(target);
@@ -759,7 +788,7 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
                 value = (ElfW(Addr))load_bias + addend_rel;
             } else if (current_type == R_386_GLOB_DAT || current_type == R_386_JMP_SLOT || current_type == R_386_32) {
                 uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) return false;
+                if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
                 if (sym_addr == 0) value = 0;
                 else if (current_type == R_386_32) {
                     ElfW(Addr) addend_rel = *reinterpret_cast<ElfW(Addr)*>(target);
@@ -830,9 +859,19 @@ static bool apply_relr_section(int fd, uintptr_t load_bias, off_t relr_off, size
     return true;
 }
 
-static bool apply_module_relocations(LoadedModule& mod, const std::vector<LoadedModule>& loaded_modules) {
-    UniqueFd fd(open(mod.path.c_str(), O_RDONLY | O_CLOEXEC));
-    if (fd < 0) return false;
+static bool apply_module_relocations(int memfd, LoadedModule& mod, const std::vector<LoadedModule>& loaded_modules) {
+    UniqueFd fd;
+
+    if (mod.path == "main_module" && memfd >= 0) {
+        fd = UniqueFd(dup(memfd));
+    } else {
+        fd = UniqueFd(open(mod.path.c_str(), O_RDONLY | O_CLOEXEC));
+    }
+
+    if (fd < 0) {
+        LOGE("Failed to open module file for relocations: %s", mod.path.c_str());
+        return false;
+    }
 
     std::vector<const char*> needed_paths(mod.dinfo.needed_str_offsets.size(), nullptr);
     for (size_t i = 0; i < mod.dinfo.needed_str_offsets.size(); i++) {
@@ -850,18 +889,25 @@ static bool apply_module_relocations(LoadedModule& mod, const std::vector<Loaded
         }
     }
 
-    if (mod.dinfo.rela_sz && mod.dinfo.rela_off) apply_rela_section(fd, &mod.dinfo, needed_paths, loaded_modules, mod.load_bias, mod.dinfo.rela_off, mod.dinfo.rela_sz);
-    if (mod.dinfo.rel_sz && mod.dinfo.rel_off) apply_rel_section(fd, &mod.dinfo, needed_paths, loaded_modules, mod.load_bias, mod.dinfo.rel_off, mod.dinfo.rel_sz);
+    if (mod.dinfo.rela_sz && mod.dinfo.rela_off) {
+        if (!apply_rela_section(fd, &mod.dinfo, needed_paths, loaded_modules, mod.load_bias, mod.dinfo.rela_off, mod.dinfo.rela_sz)) return false;
+    }
+    if (mod.dinfo.rel_sz && mod.dinfo.rel_off) {
+        if (!apply_rel_section(fd, &mod.dinfo, needed_paths, loaded_modules, mod.load_bias, mod.dinfo.rel_off, mod.dinfo.rel_sz)) return false;
+    }
     if (mod.dinfo.jmprel_sz && mod.dinfo.jmprel_off) {
-        if (mod.dinfo.pltrel_type == DT_RELA) apply_rela_section(fd, &mod.dinfo, needed_paths, loaded_modules, mod.load_bias, mod.dinfo.jmprel_off, mod.dinfo.jmprel_sz);
-        else apply_rel_section(fd, &mod.dinfo, needed_paths, loaded_modules, mod.load_bias, mod.dinfo.jmprel_off, mod.dinfo.jmprel_sz);
+        if (mod.dinfo.pltrel_type == DT_RELA) {
+            if (!apply_rela_section(fd, &mod.dinfo, needed_paths, loaded_modules, mod.load_bias, mod.dinfo.jmprel_off, mod.dinfo.jmprel_sz)) return false;
+        } else {
+            if (!apply_rel_section(fd, &mod.dinfo, needed_paths, loaded_modules, mod.load_bias, mod.dinfo.jmprel_off, mod.dinfo.jmprel_sz)) return false;
+        }
     }
 
     if (mod.dinfo.android_rel_sz && mod.dinfo.android_rel_off) {
-        apply_android_relocations(fd, &mod.dinfo, needed_paths, loaded_modules, mod.load_bias, mod.dinfo.android_rel_off, mod.dinfo.android_rel_sz, mod.dinfo.android_is_rela);
+        if (!apply_android_relocations(fd, &mod.dinfo, needed_paths, loaded_modules, mod.load_bias, mod.dinfo.android_rel_off, mod.dinfo.android_rel_sz, mod.dinfo.android_is_rela)) return false;
     }
     if (mod.dinfo.relr_sz && mod.dinfo.relr_off) {
-        apply_relr_section(fd, mod.load_bias, mod.dinfo.relr_off, mod.dinfo.relr_sz);
+        if (!apply_relr_section(fd, mod.load_bias, mod.dinfo.relr_off, mod.dinfo.relr_sz)) return false;
     }
 
     return true;
@@ -1054,7 +1100,10 @@ static bool load_dependencies_recursive(const char *lib_path, int memfd, std::ve
     }
 
     // If not loaded by us, check if system linker has it
-    if (dlsym(RTLD_DEFAULT, soname) != nullptr) { // Rough check
+    void* existing_handle = dlopen(soname, RTLD_NOLOAD | RTLD_NOW);
+    if (existing_handle != nullptr) {
+        // The library is already in the operating system memory (e.g. libc.so, libdl.so)
+        dlclose(existing_handle); // We decrease the reference counter
         return true;
     }
 
@@ -1086,6 +1135,14 @@ static bool load_dependencies_recursive(const char *lib_path, int memfd, std::ve
     return true;
 }
 
+static inline void cleanup_failed_load(const std::vector<LoadedModule>& loaded_modules) {
+    for (const auto& mod : loaded_modules) {
+        if (mod.base != 0 && mod.size != 0) {
+            munmap(reinterpret_cast<void*>(mod.base), mod.size);
+        }
+    }
+}
+
 // ---------------- MAIN ----------------
 extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_total_size, uintptr_t *out_entry, uintptr_t *out_init_array, size_t *out_init_count) {
     std::vector<LoadedModule> loaded_modules;
@@ -1093,6 +1150,7 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
     // Give a dummy name for the main module
     if (!load_dependencies_recursive("main_module", memfd, loaded_modules)) {
         LOGE("Failed to recursively load main module and its dependencies");
+        cleanup_failed_load(loaded_modules);
         return false;
     }
 
@@ -1118,8 +1176,9 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
             }
         }
 
-        if (!apply_module_relocations(mod, loaded_modules)) {
+        if (!apply_module_relocations(memfd, mod, loaded_modules)) {
             LOGE("Failed to apply relocations for module %s", mod.path.c_str());
+            cleanup_failed_load(loaded_modules);
             return false;
         }
     }
@@ -1140,5 +1199,9 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
     *out_init_array = main_mod.dinfo.init_array_vaddr ? ((uintptr_t)main_mod.load_bias + main_mod.dinfo.init_array_vaddr) : 0;
     *out_init_count = main_mod.dinfo.init_arraysz ? (main_mod.dinfo.init_arraysz / sizeof(ElfW(Addr))) : 0;
 
+    {
+        std::lock_guard<std::mutex> lock(g_custom_regions_lock);
+        g_custom_regions.push_back({main_mod.base, main_mod.size});
+    }
     return true;
 }
