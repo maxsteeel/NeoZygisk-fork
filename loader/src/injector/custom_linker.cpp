@@ -1269,7 +1269,9 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
 
     ElfW(Addr) entry_value = 0;
     if (!find_dynsym_value(&main_mod.dinfo, "zygisk_module_entry", &entry_value)) {
-        // Fallback or handle differently
+        LOGE("Module %s does not export 'zygisk_module_entry'. Invalid Zygisk module.", main_mod.path.c_str());
+        cleanup_failed_load(loaded_modules);
+        return false;
     }
 
     *out_base = main_mod.base;
