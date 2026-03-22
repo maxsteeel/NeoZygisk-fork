@@ -29,6 +29,7 @@
 #include "misc.hpp"
 #include "module.hpp"
 #include "zygisk.hpp"
+#include "custom_linker.hpp"
 
 using namespace std;
 
@@ -416,6 +417,18 @@ DCL_HOOK_FUNC(int, prctl, int option, unsigned long arg2, unsigned long arg3, un
     return old_prctl(option, arg2, arg3, arg4, arg5);
 }
 
+DCL_HOOK_FUNC(int, dladdr, const void* addr, Dl_info* info) {
+    if (is_custom_linker_address(addr)) {
+        info->dli_fname = "/system/lib64/libandroid_runtime.so";
+        info->dli_fbase = const_cast<void*>(addr);
+        info->dli_sname = "JNI_OnLoad";
+        info->dli_saddr = const_cast<void*>(addr);
+        return 1;
+    }
+
+    return old_dladdr(addr, info);
+}
+
 #undef DCL_HOOK_FUNC
 
 // -----------------------------------------------------------------
@@ -515,6 +528,7 @@ void HookContext::hook_plt() {
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, __system_property_get);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, __system_property_read_callback);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, prctl);
+    PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, dladdr);
 
     if (!lsplt::CommitHook(cached_map_infos)) LOGE("HookContext::hook_plt failed");
 

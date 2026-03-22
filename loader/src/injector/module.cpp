@@ -138,7 +138,16 @@ void ZygiskModule::setOption(zygisk::Option opt) {
 
 uint32_t ZygiskModule::getFlags() { return g_ctx ? (g_ctx->info_flags & ~PRIVATE_MASK) : 0; }
 
-bool ZygiskModule::tryUnload() const { return unload && dlclose(handle) == 0; }
+bool ZygiskModule::tryUnload() const {
+    if (!unload) return false;
+
+    if (is_custom_linker_address(handle)) {
+        custom_linker_unload(handle);
+        return true;
+    }
+
+    return dlclose(handle) == 0;
+}
 
 // -----------------------------------------------------------------
 
