@@ -45,3 +45,34 @@ bool is_kernel_5_9_or_newer() {
     result = (major > 5 || (major == 5 && minor >= 9));
     return result;
 }
+
+/**
+ * These stubs prevent the linker from pulling in the massive 
+ * mangling parser used by libunwind and libc++.
+ */
+
+#define KEEP __attribute__((used, visibility("default")))
+namespace __cxxabiv1 {
+    extern "C" {
+        // This is the main entry point for demangling. 
+        // Returning nullptr tells the caller that demangling failed.
+        KEEP char* __cxa_demangle(const char*, char*, size_t*, int* status) {
+            if (status) *status = -1;
+            return nullptr;
+        }
+    }
+}
+
+extern "C" {
+    KEEP void _ZN12_GLOBAL__N_117itanium_demangle22AbstractManglingParserINS0_14ManglingParserINS_16DefaultAllocatorEEES3_E9parseTypeEv() {}
+    KEEP void _ZN12_GLOBAL__N_117itanium_demangle22AbstractManglingParserINS0_14ManglingParserINS_16DefaultAllocatorEEES3_E9parseExprEv() {}
+    KEEP void _ZN12_GLOBAL__N_117itanium_demangle22AbstractManglingParserINS0_14ManglingParserINS_16DefaultAllocatorEEES3_E13parseEncodingEb() {}
+    KEEP void _ZNSt6__ndk117__assoc_sub_state16__on_zero_sharedEv() {}
+    KEEP void _ZNSt6__ndk117__assoc_sub_state9__executeEv() {}
+    KEEP void _ZNSt6__ndk117__assoc_sub_state12__make_readyEv() {}
+    KEEP int __cxa_guard_acquire(long* g) { return !(*(char*)(g)); }
+    KEEP void __cxa_guard_release(long* g) { *(char*)g = 1; }
+    KEEP void __cxa_guard_abort(long*) {}
+    KEEP void __cxa_pure_virtual() { for (;;); }
+    KEEP int __gxx_personality_v0(...) { return 0; }
+}

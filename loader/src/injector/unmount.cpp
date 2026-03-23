@@ -89,8 +89,13 @@ std::vector<mount_info> check_zygote_traces(uint32_t info_flags) {
 
     if (traces.empty()) return traces;
 
-    std::sort(traces.begin(), traces.end(),
-              [](const mount_info& a, const mount_info& b) { return a.id > b.id; });
+    qsort(traces.data(), traces.size(), sizeof(mount_info), +[](const void* a, const void* b) -> int {
+        const auto* m1 = static_cast<const mount_info*>(a);
+        const auto* m2 = static_cast<const mount_info*>(b);
+        if (m2->id > m1->id) return 1;
+        if (m2->id < m1->id) return -1;
+        return 0;
+    });
 
     LOGV("found %zu mounting traces to revert.", traces.size());
     return traces;

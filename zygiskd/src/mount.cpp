@@ -199,8 +199,10 @@ bool MountNamespaceManager::clean_mount_namespace() {
         }
     }
 
-    std::sort(unmount_targets.begin(), unmount_targets.end(), [](const MountInfo& a, const MountInfo& b) {
-        return a.mnt_id > b.mnt_id;
+    qsort(unmount_targets.data(), unmount_targets.size(), sizeof(MountInfo), [](const void* a, const void* b) {
+        const auto* m1 = (const MountInfo*)a;
+        const auto* m2 = (const MountInfo*)b;
+        return (m2->mnt_id - m1->mnt_id); // Descending order
     });
 
     for (const auto& target : unmount_targets) {

@@ -492,14 +492,24 @@ void HookContext::register_hook(dev_t dev, ino_t inode, const char *symbol, void
 void HookContext::refresh_map_infos() {
     map_info_cache.clear();
     cached_map_infos = lsplt::MapInfo::Scan();
+    map_info_cache.reserve(cached_map_infos.size());
+
     for (const auto &map : cached_map_infos) {
         if (map.path[0] != '\0') {
             std::string_view path(map.path);
             size_t last_slash = path.find_last_of('/');
-            if (last_slash != std::string_view::npos) {
-                map_info_cache.try_emplace(path.substr(last_slash + 1), &map);
-            } else {
-                map_info_cache.try_emplace(path, &map);
+            std::string_view filename = (last_slash != std::string_view::npos) 
+                                        ? path.substr(last_slash + 1) 
+                                        : path;
+            bool exists = false;
+            for (const auto& [name, _] : map_info_cache) {
+                if (name == filename) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                map_info_cache.emplace_back(filename, &map);
             }
         }
     }
@@ -511,14 +521,14 @@ void HookContext::hook_plt() {
 
     refresh_map_infos();
 
-    if (auto it = map_info_cache.find("libandroid_runtime.so"); it != map_info_cache.end()) {
-        android_runtime_inode = it->second->inode;
-        android_runtime_dev = it->second->dev;
+    if (const auto* info = find_in_cache(map_info_cache, "libandroid_runtime.so")) {
+        android_runtime_inode = info->inode;
+        android_runtime_dev = info->dev;
     }
 
-    if (auto it = map_info_cache.find("libart.so"); it != map_info_cache.end()) {
-        g_art_inode = it->second->inode;
-        g_art_dev = it->second->dev;
+    if (const auto* info = find_in_cache(map_info_cache, "libart.so")) {
+        g_art_inode = info->inode;
+        g_art_dev = info->dev;
     }
 
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, fork);
@@ -542,9 +552,9 @@ void HookContext::hook_unloader() {
     clear_map_paths();
     refresh_map_infos();
     if (g_art_inode == 0 || g_art_dev == 0) {
-        if (auto it = map_info_cache.find("libart.so"); it != map_info_cache.end()) {
-            g_art_inode = it->second->inode;
-            g_art_dev = it->second->dev;
+        if (const auto* info = find_in_cache(map_info_cache, "libart.so")) {
+            g_art_inode = info->inode;
+            g_art_dev = info->dev;
         }
     }
 
@@ -631,8 +641,8 @@ void HookContext::hook_zygote_jni() {
     auto get_created_java_vms = reinterpret_cast<jint (*)(JavaVM **, jsize, jsize *)>(
         dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs"));
     if (!get_created_java_vms) {
-        if (auto it = map_info_cache.find("libnativehelper.so"); it != map_info_cache.end()) {
-            void *h = dlopen(it->second->path, RTLD_LAZY);
+        if (const auto* info = find_in_cache(map_info_cache, "libnativehelper.so")) {
+            void *h = dlopen(info->path, RTLD_LAZY);
             if (!h) {
                 LOGW("cannot dlopen libnativehelper.so: %s", dlerror());
             } else {
@@ -681,8 +691,12 @@ void hook_entry(void *start_addr, size_t block_size) {
     LoadPropConfig();
     InitRandomVbmeta();
 
-    std::sort(g_spoof_props.begin(), g_spoof_props.end(), [](const Property& a, const Property& b) {
-        return a.key < b.key;
+    qsort(g_spoof_props.data(), g_spoof_props.size(), sizeof(Property), +[](const void* a, const void* b) -> int {
+        const auto* p1 = static_cast<const Property*>(a);
+        const auto* p2 = static_cast<const Property*>(b);
+        if (p1->key < p2->key) return -1;
+        if (p1->key > p2->key) return 1;
+        return 0;
     });
 
     UniqueFd shm_fd = UniqueFd(zygiskd::GetZygiskSharedData());

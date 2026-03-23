@@ -141,8 +141,8 @@ bool is_socket_alive(int fd) {
     return (pfd.revents & ~POLLIN) == 0;
 }
 
-std::optional<std::string> exec_command(const std::vector<std::string>& args) {
-    if (args.empty()) return std::nullopt;
+std::optional<std::string> exec_command(std::initializer_list<const char*> args) {
+    if (args.size() == 0) return std::nullopt;
 
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) == -1) {
@@ -176,7 +176,7 @@ std::optional<std::string> exec_command(const std::vector<std::string>& args) {
         std::vector<char*> c_args;
         c_args.reserve(args.size() + 1);
         for (const auto& arg : args) {
-            c_args.push_back(const_cast<char*>(arg.c_str()));
+            c_args.push_back(const_cast<char*>(arg));
         }
         c_args.push_back(nullptr);
 

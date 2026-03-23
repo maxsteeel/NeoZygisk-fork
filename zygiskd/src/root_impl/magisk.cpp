@@ -10,8 +10,7 @@
 #include <sys/mman.h>
 #include <mutex>
 #include <shared_mutex>
-#include <unordered_set>
-#include <unordered_map>
+#include <algorithm>
 #include <dlfcn.h>
 
 #include "constants.hpp"
@@ -24,10 +23,10 @@ namespace magisk {
 struct Cache {
     struct timespec db_mtime = {0, -1};
     struct timespec pkg_mtime = {0, -1};
-    std::unordered_set<int32_t> granted_uids;
-    std::unordered_set<int32_t> denylist_uids;
-    std::unordered_set<std::string> denylist_pkgs;
-    std::unordered_set<int32_t> all_known_uids;
+    std::vector<int32_t> granted_uids;
+    std::vector<int32_t> denylist_uids;
+    std::vector<std::string> denylist_pkgs;
+    std::vector<int32_t> all_known_uids;
     bool manager_resolved = false;
     int32_t manager_uid = -1;
 };
@@ -238,6 +237,31 @@ public:
     }
 };
 
+template<typename T>
+static bool vector_contains(const std::vector<T>& vec, const T& value) {
+    return std::binary_search(vec.begin(), vec.end(), value);
+}
+
+static inline int cmp_int(const void* a, const void* b) {
+    return (*(int32_t*)a - *(int32_t*)b);
+}
+
+static inline int cmp_str(const void* a, const void* b) {
+    return static_cast<const std::string*>(a)->compare(*static_cast<const std::string*>(b));
+}
+
+static void sort_uids(std::vector<int32_t>& vec) {
+    if (vec.empty()) return;
+    qsort(vec.data(), vec.size(), sizeof(int32_t), cmp_int);
+    vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
+}
+
+static void sort_pkgs(std::vector<std::string>& vec) {
+    if (vec.empty()) return;
+    qsort(vec.data(), vec.size(), sizeof(std::string), cmp_str);
+    vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
+}
+
 // --- General Magisk Detection ---
 
 static void detect_variant() {
@@ -260,7 +284,7 @@ std::optional<Version> detect_version() {
     auto version_str = utils::exec_command({"magisk", "-V"});
     if (!version_str) return std::nullopt;
 
-    int version = std::stoi(version_str.value());
+    int version = fast_atoi(version_str.value().c_str());
     detect_variant();
 
     if (version >= MIN_MAGISK_VERSION) {
@@ -316,8 +340,8 @@ static void update_cache() {
     std::vector<std::string> denylist_pkgs;
 
     if (db.is_valid()) {
-        auto uids = db.get_int_list("SELECT uid FROM policies WHERE policy=2");
-        g_cache.granted_uids.insert(uids.begin(), uids.end());
+        g_cache.granted_uids = db.get_int_list("SELECT uid FROM policies WHERE policy=2");
+        sort_uids(g_cache.granted_uids);
 
         denylist_pkgs = db.get_string_list("SELECT package_name FROM denylist");
 
@@ -342,9 +366,10 @@ static void update_cache() {
                 std::string uid_str = out.substr(pos, end - pos);
                 int32_t parsed_uid = fast_atoi(uid_str.c_str());
                 if (parsed_uid > 0) {
-                    g_cache.granted_uids.insert(parsed_uid);
+                    g_cache.granted_uids.push_back(parsed_uid);
                 }
             }
+            sort_uids(g_cache.granted_uids);
         }
 
         if (auto output = utils::exec_command({"magisk", "--sqlite", "SELECT package_name FROM denylist"})) {
@@ -388,11 +413,9 @@ static void update_cache() {
 
     // Resolve denylist packages to UIDs via packages.list once
     // and track all known UIDs to prevent fallback N+1 executions
-    std::unordered_set<std::string_view> target_pkgs;
-    for (const auto& pkg : denylist_pkgs) {
-        target_pkgs.insert(pkg);
-        g_cache.denylist_pkgs.insert(pkg);
-    }
+    std::vector<std::string> target_pkgs = denylist_pkgs;
+    sort_pkgs(target_pkgs);
+    g_cache.denylist_pkgs = target_pkgs;
 
     UniqueFile fp(fopen("/data/system/packages.list", "re"));
     if (fp) {
@@ -408,12 +431,14 @@ static void update_cache() {
             if (space2) *space2 = '\0';
 
             int32_t parsed_uid = atoi(uid_str);
-            g_cache.all_known_uids.insert(parsed_uid);
+            g_cache.all_known_uids.push_back(parsed_uid);
 
-            if (target_pkgs.find(pkg_name) != target_pkgs.end()) {
-                g_cache.denylist_uids.insert(parsed_uid);
+            if (std::binary_search(target_pkgs.begin(), target_pkgs.end(), pkg_name)) {
+                g_cache.denylist_uids.push_back(parsed_uid);
             }
         }
+        sort_uids(g_cache.all_known_uids); 
+        sort_uids(g_cache.denylist_uids);
     }
 
     g_cache.db_mtime = db_st.st_mtim;
@@ -484,18 +509,14 @@ static bool get_package_by_uid_from_xml(int32_t uid, std::string& pkg_name) {
 bool uid_granted_root(int32_t uid) {
     update_cache();
     std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
-    return g_cache.granted_uids.find(uid) != g_cache.granted_uids.end();
+    return vector_contains(g_cache.granted_uids, uid);
 }
 
 bool uid_should_umount(int32_t uid) {
     update_cache();
     std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
-    if (g_cache.denylist_uids.find(uid) != g_cache.denylist_uids.end()) {
-        return true;
-    }
-    if (g_cache.all_known_uids.find(uid) != g_cache.all_known_uids.end()) {
-        return false;
-    }
+    if (vector_contains(g_cache.denylist_uids, uid)) return true;
+    if (vector_contains(g_cache.all_known_uids, uid)) return false;
     lock.unlock(); // Release lock before executing external command
 
     // Fallback for missing packages in packages.list (e.g. freshly installed or system apps)
@@ -507,7 +528,7 @@ bool uid_should_umount(int32_t uid) {
     if (pkg_name.empty() || !is_valid_pkg_name(pkg_name)) return false;
 
     lock.lock();
-    return g_cache.denylist_pkgs.find(pkg_name) != g_cache.denylist_pkgs.end();
+    return vector_contains(g_cache.denylist_pkgs, pkg_name);
 }
 
 bool uid_is_manager(int32_t uid) {
