@@ -66,7 +66,7 @@ struct Module {
 };
 
 struct AppContext {
-    std::vector<std::unique_ptr<Module>> modules;
+    std::vector<Module*> modules;
     std::shared_ptr<MountNamespaceManager> mount_manager;
 };
 
@@ -129,15 +129,19 @@ static bool initialize_globals() {
     return true;
 }
 
-static bool send_startup_info(const std::vector<std::unique_ptr<Module>>& modules) {
-    std::vector<uint8_t> msg;
+static void append_bytes(std::vector<uint8_t>& vec, const void* data, size_t size) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(data);
+    vec.insert(vec.end(), p, p + size);
+}
 
+static bool send_startup_info(const std::vector<Module*>& modules) {
+    std::vector<uint8_t> msg;
     auto root = root_impl::get();
     std::string info;
 
     if (root == root_impl::RootImpl::APatch || root == root_impl::RootImpl::KernelSU || root == root_impl::RootImpl::Magisk) {
         uint32_t magic = constants::DAEMON_SET_INFO;
-        msg.insert(msg.end(), reinterpret_cast<uint8_t*>(&magic), reinterpret_cast<uint8_t*>(&magic) + 4);
+        append_bytes(msg, &magic, 4);
 
         std::string root_name;
         if (root == root_impl::RootImpl::APatch) root_name = "APatch";
@@ -145,7 +149,7 @@ static bool send_startup_info(const std::vector<std::unique_ptr<Module>>& module
         else if (root == root_impl::RootImpl::Magisk) root_name = "Magisk";
 
         if (!modules.empty()) {
-            info = "\t\tRoot: " + root_name + "\n\t\tModules (" + std::to_string(modules.size()) + "):\n\t\t\t";
+            info = "\t\tRoot: " + root_name + "\n\t\tModules (" + to_str(modules.size()) + "):\n\t\t\t";
             for (size_t i = 0; i < modules.size(); ++i) {
                 info += modules[i]->name;
                 if (i != modules.size() - 1) info += "\n\t\t\t";
@@ -155,14 +159,13 @@ static bool send_startup_info(const std::vector<std::unique_ptr<Module>>& module
         }
     } else {
         uint32_t magic = constants::DAEMON_SET_ERROR_INFO;
-        msg.insert(msg.end(), reinterpret_cast<uint8_t*>(&magic), reinterpret_cast<uint8_t*>(&magic) + 4);
+        append_bytes(msg, &magic, 4);
         info = "\t\tInvalid root implementation.";
     }
 
     uint32_t len = info.size() + 1;
-    msg.insert(msg.end(), reinterpret_cast<uint8_t*>(&len), reinterpret_cast<uint8_t*>(&len) + 4);
-    msg.insert(msg.end(), info.begin(), info.end());
-    msg.push_back('\0');
+    append_bytes(msg, &len, 4);
+    append_bytes(msg, info.c_str(), len);
 
     return utils::unix_datagram_sendto(CONTROLLER_SOCKET.c_str(), msg.data(), msg.size());
 }
@@ -207,9 +210,9 @@ static int create_library_fd(const char* so_path) {
     return memfd.release();
 }
 
-static std::vector<std::unique_ptr<Module>> load_modules() {
+static std::vector<Module*> load_modules() {
+    std::vector<Module*> modules;
     std::string arch = get_arch();
-    std::vector<std::unique_ptr<Module>> modules;
 
     if (arch.empty()) {
         LOGE("Unsupported system architecture");
@@ -240,10 +243,10 @@ static std::vector<std::unique_ptr<Module>> load_modules() {
         LOGI("Loading module `%s`...", entry->d_name);
         int lib_fd = create_library_fd(so_path);
         if (lib_fd >= 0) {
-            auto mod = std::make_unique<Module>();
+            Module* mod = new Module(); 
             mod->name = entry->d_name;
             mod->lib_fd = lib_fd;
-            modules.push_back(std::move(mod));
+            modules.push_back(mod);
         } else {
             LOGW("Failed to create memfd for `%s`", entry->d_name);
         }

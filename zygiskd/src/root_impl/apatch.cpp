@@ -156,8 +156,10 @@ static const ConfigData* get_config() {
         }
     }
 
-    std::sort(new_config->packages.begin(), new_config->packages.end(), [](uint32_t a, uint32_t b) {
-        return (a & 0x3FFFFFFF) < (b & 0x3FFFFFFF);
+    qsort(new_config->packages.data(), new_config->packages.size(), sizeof(uint32_t), [](const void* a, const void* b) {
+        uint32_t v1 = *(uint32_t*)a & 0x3FFFFFFF;
+        uint32_t v2 = *(uint32_t*)b & 0x3FFFFFFF;
+        return (v1 > v2) - (v1 < v2);
     });
 
     // Store new configuration

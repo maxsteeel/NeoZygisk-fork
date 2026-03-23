@@ -577,8 +577,9 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
             // Fork and execute the external injector daemon.
             auto p = fork_dont_care();
             if (p == 0) {
-                execl(tracer, basename(tracer), "trace", std::to_string(pid).c_str(), "--restart",
-                      nullptr);
+                char pid_str[12];
+                snprintf(pid_str, sizeof(pid_str), "%d", pid);
+                execl(tracer, basename(tracer), "trace", pid_str, "--restart", nullptr);
                 PLOGE("execute injector daemon");
                 kill(pid, SIGKILL);
                 _exit(1);

@@ -269,7 +269,7 @@ struct ZygiskContext {
     pid_t pid;
     uint32_t flags;
     uint32_t info_flags;
-    std::vector<bool> allowed_fds;
+    std::vector<uint8_t> allowed_fds;
     std::vector<int> exempted_fds;
 
     struct RegisterInfo {
@@ -335,7 +335,7 @@ struct HookContext {
     jint MODIFIER_NATIVE = 0;
     jmethodID member_getModifiers = nullptr;
     std::vector<lsplt::MapInfo> cached_map_infos = {};
-    std::unordered_map<std::string_view, const lsplt::MapInfo*> map_info_cache;
+    std::vector<std::pair<std::string_view, const lsplt::MapInfo*>> map_info_cache;
     std::vector<std::tuple<dev_t, ino_t, const char *, void **>> plt_backup;
     std::vector<mount_info> zygote_traces;
 
@@ -353,3 +353,10 @@ struct HookContext {
 private:
     void register_hook(dev_t dev, ino_t inode, const char *symbol, void *new_func, void **old_func);
 };
+
+inline const lsplt::MapInfo* find_in_cache(const std::vector<std::pair<std::string_view, const lsplt::MapInfo*>>& cache, std::string_view name) {
+    for (const auto& [key, value] : cache) {
+        if (key == name) return value;
+    }
+    return nullptr;
+}

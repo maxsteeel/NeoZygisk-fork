@@ -232,7 +232,7 @@ void ZygiskContext::plt_hook_process_regex() {
         if (map.offset != 0 || !map.is_private || !(map.perms & PROT_READ)) continue;
 
         // Pre-evaluate ignore rules that only depend on map.path
-        std::vector<bool> ign_matches(ignore_info.size());
+        std::vector<uint8_t> ign_matches(ignore_info.size());
         for (size_t i = 0; i < ignore_info.size(); ++i) {
             auto &ign = ignore_info[i];
             if (!ign.is_regex) {
