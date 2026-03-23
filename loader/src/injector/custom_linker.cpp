@@ -1270,10 +1270,19 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
     LoadedModule& main_mod = loaded_modules[0];
 
     ElfW(Addr) entry_value = 0;
-    if (!find_dynsym_value(&main_mod.dinfo, "zygisk_module_entry", &entry_value)) {
-        LOGE("Module %s does not export 'zygisk_module_entry'. Invalid Zygisk module.", main_mod.path.c_str());
-        cleanup_failed_load(loaded_modules);
-        return false;
+    // Look for the normal Zygote entry
+    bool has_module_entry = find_dynsym_value(&main_mod.dinfo, "zygisk_module_entry", &entry_value);
+
+    // If don't have it, look for the entry in the Companion
+    if (!has_module_entry) {
+        bool has_companion_entry = find_dynsym_value(&main_mod.dinfo, "zygisk_companion_entry", &entry_value);
+
+        // If it has NEITHER of the two, then it is an invalid module
+        if (!has_companion_entry) {
+            LOGE("Module %s exports neither 'zygisk_module_entry' nor 'zygisk_companion_entry'. Invalid module.", main_mod.path.c_str());
+            cleanup_failed_load(loaded_modules);
+            return false;
+        }
     }
 
     *out_base = main_mod.base;
