@@ -391,6 +391,35 @@ bool ZygiskContext::can_exempt_fd() const {
     return (flags & APP_FORK_AND_SPECIALIZE) && args.app->fds_to_ignore;
 }
 
+void ZygiskContext::post_specialize_cleanup() {
+    // Open the current process file descriptor directory
+    UniqueFd fd_dir(open("/proc/self/fd", O_RDONLY | O_DIRECTORY));
+    if (fd_dir >= 0) {
+        char buf[4096];
+        int nread;
+        // Use getdents64 to iterate over FDs without allocating extra memory
+        while ((nread = syscall(__NR_getdents64, (int)fd_dir, buf, sizeof(buf))) > 0) {
+            for (int bpos = 0; bpos < nread;) {
+                auto d = reinterpret_cast<struct linux_dirent64 *>(buf + bpos);
+                if (d->d_name[0] >= '0' && d->d_name[0] <= '9') {
+                    int fd = fast_atoi(d->d_name);
+                    char path[PATH_MAX];
+                    // Resolve the symbolic link to get the actual file path
+                    ssize_t len = readlinkat(fd_dir, d->d_name, path, sizeof(path) - 1);
+                    if (len != -1) {
+                        path[len] = '\0';
+                        // Close FDs pointing to sensitive locations to bypass detection
+                        if (strstr(path, "/data/adb") || strstr(path, "lsposed") || strstr(path, ".apk")) {
+                            close(fd);
+                        }
+                    }
+                }
+                bpos += d->d_reclen;
+            }
+        }
+    }
+}
+
 static int sigmask(int how, int signum) {
     sigset_t set;
     sigemptyset(&set);
@@ -762,6 +791,7 @@ void ZygiskContext::nativeForkAndSpecialize_post() {
         LOGV("post forkAndSpecialize [%s]", process);
         zygiskd::UnmapSharedMemory();
         app_specialize_post();
+        post_specialize_cleanup();
     }
     fork_post();
 }
