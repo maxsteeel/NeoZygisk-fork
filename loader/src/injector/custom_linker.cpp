@@ -67,7 +67,8 @@ static bool compute_load_layout(int fd, size_t page_size, ElfW(Ehdr) *eh,
     for (int i = 0; i < eh->e_phnum; i++) {
         if (out_phdr[i].p_type != PT_LOAD) continue;
         if (out_phdr[i].p_vaddr < lo) lo = out_phdr[i].p_vaddr;
-        ElfW(Addr) end = out_phdr[i].p_vaddr + out_phdr[i].p_memsz;
+        ElfW(Addr) end;
+        if (__builtin_add_overflow(out_phdr[i].p_vaddr, out_phdr[i].p_memsz, &end)) return false;
         if (end > hi) hi = end;
     }
 
@@ -93,44 +94,92 @@ static bool vaddr_to_offset(const std::vector<ElfW(Phdr)>& phdr, ElfW(Addr) vadd
 #define STT_GNU_IFUNC 10
 #endif
 
-static std::mutex g_custom_regions_lock;
-struct CustomRegion {
-    uintptr_t base;
-    size_t size;
-
-    std::vector<std::function<void()>> destructors;
-};
-static std::vector<CustomRegion> g_custom_regions;
-
-bool is_custom_linker_address(const void* addr) {
-    uintptr_t ptr = reinterpret_cast<uintptr_t>(addr);
-    std::lock_guard<std::mutex> lock(g_custom_regions_lock);
-    for (const auto& reg : g_custom_regions) {
-        if (ptr >= reg.base && ptr < reg.base + reg.size) return true;
-    }
-    return false;
-}
-
-void custom_linker_unload(void* handle) {
-    uintptr_t base = reinterpret_cast<uintptr_t>(handle);
-    std::lock_guard<std::mutex> lock(g_custom_regions_lock);
-    for (auto it = g_custom_regions.begin(); it != g_custom_regions.end(); ++it) {
-        if (it->base == base) {
-            for (const auto& destructor : it->destructors) {
-                destructor();
-            }
-
-            munmap(handle, it->size);
-            g_custom_regions.erase(it);
-            return;
-        }
-    }
-}
+extern "C" void __register_frame(void*) __attribute__((weak));
+extern "C" void __deregister_frame(void*) __attribute__((weak));
 
 struct CustomTlsInfo {
     size_t module_id;
     pthread_key_t key;
 };
+
+struct DestructorAction {
+    enum Type { FUNC_PTR, TLS_CLEANUP, DWARF_CLEANUP } type;
+    union {
+        void (*func_ptr)();
+        size_t mod_id;
+        uintptr_t frame_ptr;
+    };
+};
+
+struct MemMap {
+    uintptr_t base;
+    size_t size;
+};
+
+struct CustomRegion {
+    uintptr_t handle; // Main module identifier (for unload)
+    std::vector<MemMap> maps; // List of all mapped memories (main + deps)
+    std::vector<DestructorAction> destructors;
+};
+
+// Pointers and thread-safe initialization flag
+static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
+static std::mutex* g_custom_regions_lock = nullptr;
+static std::vector<CustomRegion>* g_custom_regions = nullptr;
+
+/* Actual allocator function called only once */
+static void do_init_tracking() {
+    g_custom_regions_lock = new std::mutex();
+    g_custom_regions = new std::vector<CustomRegion>();
+}
+
+static void init_region_tracking() {
+    // pthread_once guarantees do_init_tracking runs strictly once, 
+    // even if 100 threads call it at the exact same nanosecond.
+    pthread_once(&g_init_once, do_init_tracking);
+}
+
+bool is_custom_linker_address(const void* addr) {
+    init_region_tracking();
+    uintptr_t ptr = reinterpret_cast<uintptr_t>(addr);
+    std::lock_guard<std::mutex> lock(*g_custom_regions_lock);
+    for (const auto& reg : *g_custom_regions) {
+        for (const auto& map : reg.maps) {
+            if (ptr >= map.base && ptr < map.base + map.size) return true;
+        }
+    }
+    return false;
+}
+
+void custom_linker_unload(void* handle) {
+    init_region_tracking();
+    uintptr_t base = reinterpret_cast<uintptr_t>(handle);
+    std::lock_guard<std::mutex> lock(*g_custom_regions_lock);
+    for (auto it = g_custom_regions->begin(); it != g_custom_regions->end(); ++it) {
+        if (it->handle == base) {
+            for (const auto& d : it->destructors) {
+                if (d.type == DestructorAction::FUNC_PTR && d.func_ptr) {
+                    d.func_ptr();
+                } else if (d.type == DestructorAction::TLS_CLEANUP) {
+                    CustomTlsInfo* tls_info = reinterpret_cast<CustomTlsInfo*>(d.mod_id);
+                    pthread_key_delete(tls_info->key);
+                    delete tls_info;
+                } else if (d.type == DestructorAction::DWARF_CLEANUP && __deregister_frame) {
+                    __deregister_frame(reinterpret_cast<void*>(d.frame_ptr));
+                }
+            }
+
+            for (const auto& map : it->maps) {
+                if (map.base != 0 && map.size != 0) {
+                    munmap(reinterpret_cast<void*>(map.base), map.size);
+                }
+            }
+
+            g_custom_regions->erase(it);
+            return;
+        }
+    }
+}
 
 struct LoadedModule;
 
@@ -150,6 +199,8 @@ struct elf_dyn_info {
 
     ElfW(Addr) eh_frame_hdr_vaddr = 0; size_t eh_frame_hdr_sz = 0;
 
+    ElfW(Addr) relro_vaddr = 0; size_t relro_sz = 0;
+
     size_t tls_mod_id = 0;
     ElfW(Addr) tls_segment_vaddr = 0;
     size_t tls_segment_memsz = 0;
@@ -160,6 +211,12 @@ struct elf_dyn_info {
     bool android_is_rela = false;
 
     off_t relr_off = 0; size_t relr_sz = 0;
+
+    uint32_t gnu_symndx = 0;
+    uint32_t gnu_shift2 = 0;
+    std::vector<ElfW(Addr)> gnu_bloom_filter;
+    std::vector<uint32_t> gnu_buckets;
+    std::vector<uint32_t> gnu_chains;
 
     std::vector<char> strtab; std::vector<size_t> needed_str_offsets;
     std::vector<ElfW(Sym)> symtab;
@@ -187,6 +244,9 @@ static bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, con
         if (p.p_type == PT_GNU_EH_FRAME) {
             out->eh_frame_hdr_vaddr = p.p_vaddr;
             out->eh_frame_hdr_sz = p.p_memsz;
+        } else if (p.p_type == PT_GNU_RELRO) {
+            out->relro_vaddr = p.p_vaddr;
+            out->relro_sz = p.p_memsz;
         }
     }
 
@@ -280,42 +340,44 @@ static bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, con
             uint32_t header[4];
             if (read_loop_offset(fd, header, sizeof(header), gnu_hash_off)) {
                 uint32_t nbuckets = header[0];
-                uint32_t symoffset = header[1];
+                out->gnu_symndx = header[1];
                 uint32_t bloom_size = header[2];
-                off_t buckets_off = gnu_hash_off + 16 + (off_t)(bloom_size * sizeof(ElfW(Addr)));
+                out->gnu_shift2 = header[3];
 
+                // 1. Read Bloom Filter
+                out->gnu_bloom_filter.resize(bloom_size);
+                off_t bloom_off = gnu_hash_off + 16;
+                read_loop_offset(fd, out->gnu_bloom_filter.data(), bloom_size * sizeof(ElfW(Addr)), bloom_off);
+
+                // 2. Read Buckets
+                off_t buckets_off = bloom_off + (off_t)(bloom_size * sizeof(ElfW(Addr)));
+                out->gnu_buckets.resize(nbuckets);
+                read_loop_offset(fd, out->gnu_buckets.data(), nbuckets * sizeof(uint32_t), buckets_off);
+
+                // Find max_bucket to calculate the total number of symbols (nsyms)
                 uint32_t max_bucket = 0;
-                bool fast_path_success = false;
-
-                // Only use the fast path if nbuckets is reasonable (e.g. <= 1M elements, 4MB)
-                if (nbuckets <= 1024 * 1024) {
-                    std::vector<uint32_t> buckets(nbuckets);
-                    if (read_loop_offset(fd, buckets.data(), nbuckets * sizeof(uint32_t), buckets_off)) {
-                        for (uint32_t b = 0; b < nbuckets; b++) {
-                            if (buckets[b] > max_bucket) max_bucket = buckets[b];
-                        }
-                        fast_path_success = true;
-                    }
+                for (uint32_t b = 0; b < nbuckets; b++) {
+                    if (out->gnu_buckets[b] > max_bucket) max_bucket = out->gnu_buckets[b];
                 }
 
-                if (!fast_path_success) {
-                    for (uint32_t b = 0; b < nbuckets; b++) {
-                        uint32_t bucket_val;
-                        if (!read_loop_offset(fd, &bucket_val, sizeof(bucket_val), buckets_off + (off_t)(b * 4))) break;
-                        if (bucket_val > max_bucket) max_bucket = bucket_val;
-                    }
-                }
-
-                if (max_bucket >= symoffset) {
-                    off_t chains_off = buckets_off + (off_t)(nbuckets * 4);
-                    uint32_t chain_idx = max_bucket - symoffset;
+                off_t chains_off = buckets_off + (off_t)(nbuckets * 4);
+                if (max_bucket >= out->gnu_symndx) {
+                    uint32_t chain_idx = max_bucket - out->gnu_symndx;
                     uint32_t chain_val;
                     while (read_loop_offset(fd, &chain_val, sizeof(chain_val), chains_off + (off_t)(chain_idx * 4))) {
                         if (chain_val & 1) { out->nsyms = max_bucket + 1; break; }
                         max_bucket++; chain_idx++;
                     }
-                    if (!out->nsyms) out->nsyms = max_bucket + 1;
-                } else out->nsyms = symoffset;
+                } else {
+                    out->nsyms = out->gnu_symndx;
+                }
+
+                // 3. Read Chains (the hash values for each symbol)
+                if (out->nsyms > out->gnu_symndx) {
+                    uint32_t num_chains = out->nsyms - out->gnu_symndx;
+                    out->gnu_chains.resize(num_chains);
+                    read_loop_offset(fd, out->gnu_chains.data(), num_chains * sizeof(uint32_t), chains_off);
+                }
             }
         }
     }
@@ -329,7 +391,53 @@ static bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, con
     return true;
 }
 
+static uint32_t calc_gnu_hash(const char *name) {
+    uint32_t h = 5381;
+    for (unsigned char c = *name; c != '\0'; c = *++name) {
+        h = (h << 5) + h + c;
+    }
+    return h;
+}
+
 static bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr) *out_value, uint8_t *out_type = nullptr) {
+    // GNU HASH (O(1) average lookup)
+    if (!info->gnu_buckets.empty() && !info->gnu_bloom_filter.empty()) {
+        uint32_t hash = calc_gnu_hash(sym_name);
+        uint32_t h2 = hash >> info->gnu_shift2;
+        uint32_t word_num = (hash / (sizeof(ElfW(Addr)) * 8)) & (info->gnu_bloom_filter.size() - 1);
+
+        ElfW(Addr) mask = (((ElfW(Addr))1) << (hash % (sizeof(ElfW(Addr)) * 8))) |
+                          (((ElfW(Addr))1) << (h2 % (sizeof(ElfW(Addr)) * 8)));
+
+        // 1. Bloom filter check: Rejects non-existent symbols instantly via bitmask
+        if ((info->gnu_bloom_filter[word_num] & mask) == mask) {
+            uint32_t sym_idx = info->gnu_buckets[hash % info->gnu_buckets.size()];
+            if (sym_idx >= info->gnu_symndx) {
+                uint32_t chain_idx = sym_idx - info->gnu_symndx;
+
+                // 2. Hash chain check: Only compare strings if the 32-bit hash matches
+                while (chain_idx < info->gnu_chains.size()) {
+                    uint32_t chain_val = info->gnu_chains[chain_idx];
+                    if ((chain_val | 1) == (hash | 1)) {
+                        const ElfW(Sym)& sym = info->symtab[sym_idx];
+                        const char *name = &info->strtab[sym.st_name];
+                        // 3. Final check: ONLY NOW do we run strcmp (which is NEON accelerated)
+                        if (strcmp(name, sym_name) == 0 && sym.st_shndx != SHN_UNDEF) {
+                            *out_value = sym.st_value;
+                            if (out_type) *out_type = ELF_ST_TYPE(sym.st_info);
+                            return true;
+                        }
+                    }
+                    if (chain_val & 1) break; // End of chain
+                    chain_idx++;
+                    sym_idx++;
+                }
+            }
+        }
+        return false; // Definitively not in this module
+    }
+
+    // Fallback: Linear Search (O(N)) for very old/non-GNU ELFs
     for (size_t i = 0; i < info->nsyms; i++) {
         const ElfW(Sym)& sym = info->symtab[i];
         if (sym.st_name == 0 || sym.st_name >= info->strsz) continue;
@@ -513,34 +621,57 @@ static uintptr_t decode_eh_value(uint8_t enc, const uint8_t **p, uintptr_t base,
 
     uintptr_t value = 0;
     switch (fmt) {
-        case DW_EH_PE_ptr:
+        case DW_EH_PE_ptr: {
 #ifdef __LP64__
-            if (read_u64(p, end, (uint64_t *)&value) != 0) return 0;
+            uint64_t raw = 0;
+            if (read_u64(p, end, &raw) != 0) return 0;
+            value = (uintptr_t)raw;
 #else
-            if (read_u32(p, end, (uint32_t *)&value) != 0) return 0;
+            uint32_t raw = 0;
+            if (read_u32(p, end, &raw) != 0) return 0;
+            value = (uintptr_t)raw;
 #endif
             break;
+        }
         case DW_EH_PE_uleb128:
             value = (uintptr_t)read_uleb128(p, end);
             break;
-        case DW_EH_PE_udata2:
-            if (read_u16(p, end, (uint16_t *)&value) != 0) return 0;
+        case DW_EH_PE_udata2: {
+            uint16_t raw = 0;
+            if (read_u16(p, end, &raw) != 0) return 0;
+            value = (uintptr_t)raw;
             break;
-        case DW_EH_PE_udata4:
-            if (read_u32(p, end, (uint32_t *)&value) != 0) return 0;
+        }
+        case DW_EH_PE_udata4: {
+            uint32_t raw = 0;
+            if (read_u32(p, end, &raw) != 0) return 0;
+            value = (uintptr_t)raw;
             break;
-        case DW_EH_PE_udata8:
-            if (read_u64(p, end, (uint64_t *)&value) != 0) return 0;
+        }
+        case DW_EH_PE_udata8: {
+            uint64_t raw = 0;
+            if (read_u64(p, end, &raw) != 0) return 0;
+            value = (uintptr_t)raw;
             break;
-        case DW_EH_PE_sdata2:
-            if (read_u16(p, end, (uint16_t *)&value) != 0) return 0;
+        }
+        case DW_EH_PE_sdata2: {
+            uint16_t raw = 0;
+            if (read_u16(p, end, &raw) != 0) return 0;
+            value = (uintptr_t)(intptr_t)(int16_t)raw;
             break;
-        case DW_EH_PE_sdata4:
-            if (read_u32(p, end, (uint32_t *)&value) != 0) return 0;
+        }
+        case DW_EH_PE_sdata4: {
+            uint32_t raw = 0;
+            if (read_u32(p, end, &raw) != 0) return 0;
+            value = (uintptr_t)(intptr_t)(int32_t)raw;
             break;
-        case DW_EH_PE_sdata8:
-            if (read_u64(p, end, (uint64_t *)&value) != 0) return 0;
+        }
+        case DW_EH_PE_sdata8: {
+            uint64_t raw = 0;
+            if (read_u64(p, end, &raw) != 0) return 0;
+            value = (uintptr_t)(intptr_t)(int64_t)raw;
             break;
+        }
         default: return 0;
     }
 
@@ -963,9 +1094,6 @@ static bool apply_module_relocations(int memfd, LoadedModule& mod, const std::ve
     return true;
 }
 
-extern "C" void __register_frame(void*) __attribute__((weak));
-extern "C" void __deregister_frame(void*) __attribute__((weak));
-
 static bool load_single_library(const char *lib_path, int memfd, LoadedModule* out_module) {
     long page_size_long = sysconf(_SC_PAGESIZE);
     size_t page_size = (size_t)page_size_long;
@@ -1225,6 +1353,22 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
             return false;
         }
 
+        if (mod.dinfo.relro_vaddr && mod.dinfo.relro_sz) {
+            size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+            uintptr_t relro_start = mod.load_bias + mod.dinfo.relro_vaddr;
+            uintptr_t relro_end = relro_start + mod.dinfo.relro_sz;
+
+            // We align the end down (page_start instead of page_end).
+            // This avoids making the adjacent page read-only if the compiler 
+            // it didn't zero-padded it perfectly, protecting neighboring global variables.
+            uintptr_t commit_start = page_start(relro_start, page_size);
+            uintptr_t commit_end = page_start(relro_end, page_size);
+
+            if (commit_end > commit_start) {
+                mprotect(reinterpret_cast<void*>(commit_start), commit_end - commit_start, PROT_READ);
+            }
+        }
+
         // Register DWARF immediately after relocation
         if (__register_frame && mod.dinfo.eh_frame_hdr_sz && mod.dinfo.eh_frame_hdr_vaddr) {
             uintptr_t hdr_addr = mod.load_bias + mod.dinfo.eh_frame_hdr_vaddr;
@@ -1292,23 +1436,36 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
     *out_init_count = main_mod.dinfo.init_arraysz ? (main_mod.dinfo.init_arraysz / sizeof(ElfW(Addr))) : 0;
 
     {
-        std::lock_guard<std::mutex> lock(g_custom_regions_lock);
+        init_region_tracking();
+        std::lock_guard<std::mutex> lock(*g_custom_regions_lock);
         CustomRegion region;
-        region.base = main_mod.base;
-        region.size = main_mod.size;
+        region.handle = main_mod.base; // Use this as primary ID
+
+        // We save the memory addresses of all modules (Main + Dependencies)
+        for (const auto& mod : loaded_modules) {
+            if (mod.base != 0 && mod.size != 0) {
+                MemMap map;
+                map.base = mod.base;
+                map.size = mod.size;
+                region.maps.push_back(map);
+            }
+        }
 
         // We collect all destroyers in reverse order of loading
         for (auto it = loaded_modules.rbegin(); it != loaded_modules.rend(); ++it) {
             const auto& mod = *it;
 
-            // 1. FINI_ARRAY is executed in reverse order (from the end of the array to the beginning)
+            // 1. FINI_ARRAY is executed in reverse order
             if (mod.dinfo.fini_array_vaddr && mod.dinfo.fini_arraysz) {
                 size_t count = mod.dinfo.fini_arraysz / sizeof(ElfW(Addr));
                 ElfW(Addr)* array_addr = reinterpret_cast<ElfW(Addr)*>(mod.load_bias + mod.dinfo.fini_array_vaddr);
                 for (size_t i = 0; i < count; ++i) {
                     if (array_addr[count - 1 - i]) {
                         auto func = reinterpret_cast<void (*)()>(array_addr[count - 1 - i]);
-                        region.destructors.push_back(func);
+                        DestructorAction action;
+                        action.type = DestructorAction::FUNC_PTR;
+                        action.func_ptr = func;
+                        region.destructors.push_back(action);
                     }
                 }
             }
@@ -1316,28 +1473,29 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
             // 2. DT_FINI is executed after FINI_ARRAY
             if (mod.dinfo.fini_vaddr) {
                 auto func = reinterpret_cast<void (*)()>(mod.load_bias + mod.dinfo.fini_vaddr);
-                region.destructors.push_back(func);
+                DestructorAction action;
+                action.type = DestructorAction::FUNC_PTR;
+                action.func_ptr = func;
+                region.destructors.push_back(action);
             }
 
             // 3. It's also the perfect time to clean up TLS and DWARF
             if (mod.dinfo.tls_mod_id) {
-                size_t mod_id = mod.dinfo.tls_mod_id;
-                region.destructors.push_back([mod_id]() {
-                    CustomTlsInfo* tls_info = reinterpret_cast<CustomTlsInfo*>(mod_id);
-                    pthread_key_delete(tls_info->key);
-                    delete tls_info;
-                });
+                DestructorAction action;
+                action.type = DestructorAction::TLS_CLEANUP;
+                action.mod_id = mod.dinfo.tls_mod_id;
+                region.destructors.push_back(action);
             }
 
             if (mod.eh_registered && __deregister_frame) {
-                uintptr_t frame_ptr = mod.eh_frame_ptr;
-                region.destructors.push_back([frame_ptr]() {
-                    __deregister_frame(reinterpret_cast<void*>(frame_ptr));
-                });
+                DestructorAction action;
+                action.type = DestructorAction::DWARF_CLEANUP;
+                action.frame_ptr = mod.eh_frame_ptr;
+                region.destructors.push_back(action);
             }
         }
 
-        g_custom_regions.push_back(std::move(region));
+        g_custom_regions->push_back(std::move(region));
     }
     return true;
 }
