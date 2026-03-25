@@ -307,7 +307,6 @@ struct ZygiskContext {
     void sanitize_fds();
     bool exempt_fd(int fd);
     bool can_exempt_fd() const;
-    void post_specialize_cleanup();
     bool is_child() const { return pid <= 0; }
 
     // Compatibility shim
