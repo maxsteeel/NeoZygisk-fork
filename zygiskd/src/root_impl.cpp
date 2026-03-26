@@ -10,6 +10,7 @@ namespace apatch {
     bool uid_granted_root(int32_t uid);
     bool uid_should_umount(int32_t uid);
     bool uid_is_manager(int32_t uid);
+    bool uid_is_manager(int32_t uid, int64_t now_ms);
 }
 
 namespace kernelsu {
@@ -18,6 +19,7 @@ namespace kernelsu {
     bool uid_granted_root(int32_t uid);
     bool uid_should_umount(int32_t uid);
     bool uid_is_manager(int32_t uid);
+    bool uid_is_manager(int32_t uid, int64_t now_ms);
 }
 
 namespace magisk {
@@ -95,6 +97,14 @@ bool uid_is_manager(int32_t uid) {
         case RootImpl::APatch: return apatch::uid_is_manager(uid);
         case RootImpl::KernelSU: return kernelsu::uid_is_manager(uid);
         case RootImpl::Magisk: return magisk::uid_is_manager(uid);
+        default: return false;
+    }
+}
+
+bool uid_is_manager(int32_t uid, int64_t now_ms) {
+    switch (get()) {
+        case RootImpl::APatch: return apatch::uid_is_manager(uid, now_ms);
+        case RootImpl::KernelSU: return kernelsu::uid_is_manager(uid, now_ms);
         default: return false;
     }
 }

@@ -20,7 +20,8 @@ namespace kernelsu {
 static std::once_flag ksu_result_flag;
 static int g_ksu_fd = -1;
 static std::optional<Version> g_ksu_version;
-static std::atomic<int32_t> g_manager_uid{-1};
+static std::atomic<int32_t> g_ksu_manager_uid{-1};
+static std::atomic<int64_t> g_ksu_last_stat_time_ms{0};
 
 static bool (*uid_granted_root_impl)(int32_t) = [](int32_t) { return false; };
 static bool (*uid_should_umount_impl)(int32_t) = [](int32_t) { return false; };
@@ -290,14 +291,25 @@ bool uid_should_umount(int32_t uid) {
     return uid_should_umount_impl(uid);
 }
 
-bool uid_is_manager(int32_t uid) {
-    int32_t manager_uid = g_manager_uid.load(std::memory_order_relaxed);
-    if (manager_uid == -1) {
-        manager_uid = get_manager_uid_impl();
-        g_manager_uid.store(manager_uid, std::memory_order_relaxed);
+bool uid_is_manager(int32_t uid, int64_t now_ms) {
+    int32_t manager_uid = g_ksu_manager_uid.load(std::memory_order_relaxed);
+    int64_t last_stat = g_ksu_last_stat_time_ms.load(std::memory_order_relaxed);
+
+    if (manager_uid <= -1 || now_ms - last_stat > 1000) {
+        manager_uid = get_manager_uid_impl(); 
+        g_ksu_manager_uid.store(manager_uid, std::memory_order_relaxed);
+        g_ksu_last_stat_time_ms.store(now_ms, std::memory_order_relaxed);
     }
+
     if (manager_uid < 0) return false;
     return static_cast<int32_t>(uid) == manager_uid;
+}
+
+bool uid_is_manager(int32_t uid) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    return uid_is_manager(uid, now_ms);
 }
 
 } // namespace kernelsu

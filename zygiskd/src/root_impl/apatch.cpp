@@ -199,21 +199,29 @@ bool uid_should_umount(int32_t uid) {
     return (pkg & (1U << 31)) != 0;
 }
 
-bool uid_is_manager(int32_t uid) {
+bool uid_is_manager(int32_t uid, int64_t now_ms) {
     static std::atomic<int32_t> g_manager_uid{-1};
+    static std::atomic<int64_t> last_manager_stat_time_ms{0};
     int32_t manager_uid = g_manager_uid.load(std::memory_order_relaxed);
 
-    if (manager_uid == -1) {
+    if (manager_uid <= -1 || now_ms - last_manager_stat_time_ms.load(std::memory_order_relaxed) > 1000) {
         struct stat st;
         if (stat("/data/user_de/0/me.bmax.apatch", &st) == 0) {
             manager_uid = static_cast<int32_t>(st.st_uid);
         } else {
-            manager_uid = -2; // Not found or error, avoid re-stating
+            manager_uid = -2; 
         }
         g_manager_uid.store(manager_uid, std::memory_order_relaxed);
+        last_manager_stat_time_ms.store(now_ms, std::memory_order_relaxed);
     }
-
     return manager_uid == uid;
+}
+
+bool uid_is_manager(int32_t uid) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now_ms = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+    return uid_is_manager(uid, now_ms);
 }
 
 } // namespace apatch
