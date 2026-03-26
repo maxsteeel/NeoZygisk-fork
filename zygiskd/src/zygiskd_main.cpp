@@ -129,6 +129,54 @@ static bool initialize_globals() {
     return true;
 }
 
+static void shm_refresh_thread() {
+    prctl(PR_SET_NAME, "zygiskd-refresh");
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+
+        if (!g_shm_base) continue;
+
+        // Calculate time once per loop
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        int64_t now_ms = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+
+        bool changed = false;
+
+        for (size_t i = 0; i < constants::SHM_HASH_MAP_SIZE; ++i) {
+            uint32_t uid = g_shm_base->entries[i].uid.load(std::memory_order_relaxed);
+            if (uid == UINT32_MAX) continue;
+
+            ProcessFlags new_flags = ProcessFlags::NONE;
+            // Pass now_ms to avoid redundant syscalls
+            if (root_impl::uid_is_manager(uid, now_ms)) {
+                new_flags |= ProcessFlags::PROCESS_IS_MANAGER;
+            } else {
+                if (root_impl::uid_granted_root(uid)) new_flags |= ProcessFlags::PROCESS_GRANTED_ROOT;
+                if (root_impl::uid_should_umount(uid)) new_flags |= ProcessFlags::PROCESS_ON_DENYLIST;
+            }
+
+            uint32_t new_val = static_cast<uint32_t>(new_flags);
+            uint32_t old_val = g_shm_base->entries[i].flags.load(std::memory_order_relaxed);
+
+            if (new_val != old_val) {
+                // Lock only when a change is detected
+                std::lock_guard<std::mutex> lock(g_shm_write_mutex);
+
+                uint32_t current_ver = g_shm_base->version.load(std::memory_order_relaxed);
+                g_shm_base->version.store(current_ver + 1, std::memory_order_release);
+                g_shm_base->entries[i].flags.store(new_val, std::memory_order_relaxed);
+                g_shm_base->version.store(current_ver + 2, std::memory_order_release);
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            LOGD("Refresh thread updated process flags based on system changes.");
+        }
+    }
+}
+
 static void append_bytes(std::vector<uint8_t>& vec, const void* data, size_t size) {
     const uint8_t* p = reinterpret_cast<const uint8_t*>(data);
     vec.insert(vec.end(), p, p + size);
@@ -371,7 +419,6 @@ static void handle_get_process_flags(int stream) {
     else if (root == root_impl::RootImpl::Magisk) flags |= ProcessFlags::PROCESS_ROOT_IS_MAGISK;
 
     uint32_t flags_val = static_cast<uint32_t>(flags);
-    socket_utils::write_u32(stream, flags_val);
 
     if (g_shm_base) {
         std::lock_guard<std::mutex> lock(g_shm_write_mutex);
@@ -405,6 +452,8 @@ static void handle_get_process_flags(int stream) {
         // Finish update
         g_shm_base->version.store(g_shm_base->version.load(std::memory_order_relaxed) + 1, std::memory_order_release);
     }
+
+    socket_utils::write_u32(stream, flags_val);
 }
 
 static void handle_update_mount_namespace(int stream, AppContext* context) {
@@ -576,6 +625,8 @@ int main() {
     if (!initialize_globals()) {
         return 1;
     }
+
+    std::thread(shm_refresh_thread).detach();
 
     auto modules = load_modules();
     send_startup_info(modules);

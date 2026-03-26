@@ -27,5 +27,6 @@ bool uid_should_umount(int32_t uid);
 
 // Checks if a given UID belongs to the active root manager application.
 bool uid_is_manager(int32_t uid);
+bool uid_is_manager(int32_t uid, int64_t now_ms);
 
 } // namespace root_impl
