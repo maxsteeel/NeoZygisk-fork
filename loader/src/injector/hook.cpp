@@ -29,7 +29,6 @@
 #include "misc.hpp"
 #include "module.hpp"
 #include "zygisk.hpp"
-#include "custom_linker.hpp"
 
 using namespace std;
 
@@ -254,7 +253,6 @@ DCL_HOOK_FUNC(static int, unshare, int flags) {
     }
 
     int res = old_unshare(flags);
-    errno = 0;  // Restore errno back to 0
     return res;
 }
 
@@ -328,6 +326,9 @@ DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *defau
                     ++it;
                 }
             }
+
+            // Clear the map paths here after all unhook operations are successfully completed
+            g_hook->clear_map_paths();
         }
     }
     return old_property_get(key, value, default_value);
@@ -341,22 +342,18 @@ DCL_HOOK_FUNC(static int, pthread_attr_setstacksize, void *target, size_t size) 
 
     if (unlikely(g_hook != nullptr && g_hook->should_unmap)) {
         // Only perform unloading on the main thread
+        HookContext* tmp = g_hook;
+        g_hook = nullptr; // Safety null-pointer assignment
+        tmp->restore_plt_hook();
+        void *addr = tmp->start_addr;
+        size_t size = tmp->block_size;
+        delete tmp;
 
-        g_hook->restore_plt_hook();
-        if (g_hook->should_unmap) {
-            void *start_addr = g_hook->start_addr;
-            size_t block_size = g_hook->block_size;
-
-            delete g_hook;
-            g_hook = nullptr; // Safety null-pointer assignment
-
-            // Because both `pthread_attr_setstacksize` and `munmap` have the same function
-            // signature, we can use `musttail` to let the compiler reuse our stack frame and thus
-            // `munmap` will directly return to the caller of `pthread_attr_setstacksize`.
-            LOGV("unmap libzygisk.so loaded at %p with size %zu", start_addr, block_size);
-            [[clang::musttail]] return munmap(start_addr, block_size);
-        }
-        delete g_hook;
+        // Because both `pthread_attr_setstacksize` and `munmap` have the same function
+        // signature, we can use `musttail` to let the compiler reuse our stack frame and thus
+        // `munmap` will directly return to the caller of `pthread_attr_setstacksize`.
+        LOGV("unmap libzygisk.so loaded at %p with size %zu", addr, size);
+        [[clang::musttail]] return munmap(addr, size);
     }
 
     return res;
@@ -415,18 +412,6 @@ DCL_HOOK_FUNC(int, prctl, int option, unsigned long arg2, unsigned long arg3, un
         }
     }
     return old_prctl(option, arg2, arg3, arg4, arg5);
-}
-
-DCL_HOOK_FUNC(int, dladdr, const void* addr, Dl_info* info) {
-    if (is_custom_linker_address(addr)) {
-        info->dli_fname = "/system/lib64/libandroid_runtime.so";
-        info->dli_fbase = const_cast<void*>(addr);
-        info->dli_sname = "JNI_OnLoad";
-        info->dli_saddr = const_cast<void*>(addr);
-        return 1;
-    }
-
-    return old_dladdr(addr, info);
 }
 
 #undef DCL_HOOK_FUNC
@@ -538,7 +523,6 @@ void HookContext::hook_plt() {
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, __system_property_get);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, __system_property_read_callback);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, prctl);
-    PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, dladdr);
 
     if (!lsplt::CommitHook(cached_map_infos)) LOGE("HookContext::hook_plt failed");
 
@@ -562,10 +546,12 @@ void HookContext::hook_unloader() {
     if (!lsplt::CommitHook(cached_map_infos)) {
         LOGE("HookContext::hook_unloader failed");
     }
-    clear_map_paths();
 }
 
 void HookContext::clear_map_paths() {
+    static std::atomic_flag clearing = ATOMIC_FLAG_INIT;
+    if (clearing.test_and_set()) return;
+
     for (auto &map : cached_map_infos) {
         size_t len = strnlen(map.path, sizeof(map.path));
         if (len > 0) memzero(map.path, len);
