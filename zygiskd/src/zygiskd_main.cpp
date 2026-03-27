@@ -255,6 +255,10 @@ static int create_library_fd(const char* so_path) {
         LOGW("Failed to add seals to memfd: %s", strerror(errno));
     }
 
+    if (fchmod(memfd, S_IRUSR | S_IRGRP | S_IROTH) == -1) {
+        LOGW("Failed to set read-only permissions: %s", strerror(errno));
+    }
+
     return memfd.release();
 }
 
