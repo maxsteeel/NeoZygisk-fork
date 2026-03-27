@@ -159,7 +159,7 @@ bool MountNamespaceManager::clean_mount_namespace() {
     else if (root == root_impl::RootImpl::KernelSU) root_source = "KSU";
     else if (root == root_impl::RootImpl::Magisk) root_source = "magisk";
 
-    bool is_ksu = (root == root_impl::RootImpl::KernelSU);
+    const bool is_ksu = (root == root_impl::RootImpl::KernelSU);
     char ksu_module_source[256] = {0};
 
     char line[1024];
@@ -175,21 +175,25 @@ bool MountNamespaceManager::clean_mount_namespace() {
 
         if (ret < 5) continue;
 
-        if (is_ksu && std::string_view(mount_point) == "/data/adb/modules") {
-            if (std::string_view(mount_source).starts_with("/dev/block/loop")) {
-                strlcpy(ksu_module_source, mount_source, sizeof(ksu_module_source));
-            }
-        }
-
         bool should_unmount = false;
         std::string_view root_view(root_path);
         std::string_view mp_view(mount_point);
         std::string_view src_view(mount_source);
+        std::string_view line_view(line);
 
-        if (root_view.starts_with("/adb/modules")) should_unmount = true;
-        else if (mp_view.starts_with("/data/adb/modules")) should_unmount = true;
-        else if (root_source && src_view == root_source) should_unmount = true;
-        else if (ksu_module_source[0] != '\0' && src_view == ksu_module_source) should_unmount = true;
+        if (is_ksu && mp_view == "/data/adb/modules" && src_view.starts_with("/dev/block/loop")) {
+            strlcpy(ksu_module_source, mount_source, sizeof(ksu_module_source));
+        }
+
+        if (root_source && src_view.find(root_source) != std::string_view::npos) should_unmount = true;
+        else if (root == root_impl::RootImpl::Magisk && src_view == "worker") should_unmount = true;
+        else if (root_view.find("/adb/") != std::string_view::npos) should_unmount = true;
+        else if (mp_view.find("/adb/") != std::string_view::npos) should_unmount = true;
+        else if (line_view.find("/adb/") != std::string_view::npos) should_unmount = true;
+        else if (root_view.find("zygisk") != std::string_view::npos) should_unmount = true;
+        else if (src_view.find("zygisk") != std::string_view::npos) should_unmount = true;
+        else if (line_view.find("zygisk") != std::string_view::npos) should_unmount = true;
+        else if (is_ksu && ksu_module_source[0] != '\0' && src_view == ksu_module_source) should_unmount = true;
 
         if (should_unmount) {
             MountInfo info;

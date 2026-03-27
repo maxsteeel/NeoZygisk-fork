@@ -693,15 +693,17 @@ void ZygiskContext::nativeSpecializeAppProcess_pre() {
 
         if (!abort_zygote_unmount(traces, info_flags)) {
             for (const auto &trace : traces) {
-                // Fix Magisk root loss: we omitted elements of "magisk"
-                if (trace.source == "magisk") continue;
-
-                LOGV("AppZygote unmounting %s", trace.target.c_str());
-                umount2(trace.target.c_str(), MNT_DETACH);
+                LOGV("AppZygote unmounting %s (Type: %s)", trace.target.c_str(), trace.type.c_str());
+                int layers = 0;
+                while (umount2(trace.target.c_str(), MNT_DETACH) == 0) {
+                    layers++;
+                }
+                if (layers == 0) {
+                    LOGE("AppZygote failed to unmount %s: %s", trace.target.c_str(), strerror(errno));
+                } else if (layers > 1) {
+                    LOGI("AppZygote cleaned %d stacked layers of %s", layers, trace.target.c_str());
+                }
             }
-            // After unmounting, we can clear the traces to prevent the SystemServer
-            // from inheriting them, which may cause issues with the SystemServer's
-            // resource overlay (JingMatrix/NeoZygisk#26)
             g_hook->zygote_unmounted = true;
             g_hook->zygote_traces.clear();
         }
@@ -726,14 +728,13 @@ void ZygiskContext::nativeForkAndSpecialize_pre() {
 
         if (!abort_zygote_unmount(g_hook->zygote_traces, info_flags)) {
             auto removal_predicate = [](const mount_info &trace) {
-                // Fix Magisk root loss: skip unmounting items tagged as "magisk"
-                if (trace.source == "magisk") {
-                    LOGV("skip magisk specific mounts for compatibility: %s",
-                         trace.raw_info.c_str());
-                    return false;  // Return false to keep this trace in the vector/mount list
+                LOGV("Unmounting %s (mnt_id: %u)", trace.target.c_str(), trace.id);
+                int layers = 0;
+                while (umount2(trace.target.c_str(), MNT_DETACH) == 0) {
+                    layers++;
                 }
-                LOGV("unmounting %s (mnt_id: %u)", trace.target.c_str(), trace.id);
-                if (umount2(trace.target.c_str(), MNT_DETACH) == 0) {
+                if (layers > 0) {
+                    if (layers > 1) LOGI("Cleaned %d layers stacked on %s", layers, trace.target.c_str());
                     return true;  // Success: Mark for removal.
                 } else {
                     LOGE("failed to unmount %s: %s", trace.target.c_str(), strerror(errno));
