@@ -7,6 +7,8 @@ allow zygote unlabeled file {read open}
 allow zygote zygote capability sys_chroot
 allow zygote su dir search
 allow zygote su {lnk_file file} read
+allow zygote ksu dir search
+allow zygote ksu {lnk_file file} read
 
 allow zygote adb_data_file dir search
 allow zygote zygote process execmem
