@@ -32,7 +32,7 @@ val defaultCFlags = arrayOf(
     "-fno-stack-protector", "-fomit-frame-pointer",
     "-ffunction-sections", "-fdata-sections",
     "-fno-ident", "-fmerge-all-constants",
-    "-fno-semantic-interposition", "-fno-plt",
+    "-fno-semantic-interposition",
     "-Wno-builtin-macro-redefined", "-D__FILE__=__FILE_NAME__",
     "-DWORK_DIRECTORY='\"${workDirectory}\"'"
 )
@@ -47,7 +47,7 @@ val releaseFlags = arrayOf(
 val linkerFlags = arrayOf(
     "-Wl,--exclude-libs,ALL", "-Wl,--gc-sections", 
     "-Wl,--strip-all", "-Wl,--lto-O3",
-    "-Wl,--build-id=none", "-Wl,-s",
+    "-Wl,--build-id=none", "-Wl,-s", "-fno-plt",
     "-Wl,--icf=all", "-Wl,--as-needed",
     "-Wl,-Bsymbolic", "-Wl,--hash-style=gnu"
 )

@@ -51,7 +51,25 @@ bool is_kernel_5_9_or_newer() {
  * mangling parser used by libunwind and libc++.
  */
 
-#define KEEP __attribute__((used, visibility("default")))
+/*
+ * visibility("hidden") is strictly required to prevent these stubs
+ * from poisoning the dynamic symbol table, avoiding ABI collisions
+ * when modules invoke dlopen() in the companion process.
+ */
+#define KEEP __attribute__((used, visibility("hidden")))
+
+// ABI guards MUST always be compiled (both Debug and Release) to prevent 
+// fatal 0x8 crashes during global static variable initialization.
+extern "C" {
+    KEEP int __cxa_guard_acquire(long* g) { return !(*(char*)(g)); }
+    KEEP void __cxa_guard_release(long* g) { *(char*)g = 1; }
+    KEEP void __cxa_guard_abort(long*) {}
+    KEEP void __cxa_pure_virtual() { for (;;); }
+    KEEP int __gxx_personality_v0(...) { return 0; }
+}
+
+// The massive demangler is only stripped in Release to save binary size.
+#ifdef NDEBUG
 namespace __cxxabiv1 {
     extern "C" {
         // This is the main entry point for demangling. 
@@ -64,15 +82,12 @@ namespace __cxxabiv1 {
 }
 
 extern "C" {
+    // These additional stubs are required to prevent the demangling parser from being linked in.
     KEEP void _ZN12_GLOBAL__N_117itanium_demangle22AbstractManglingParserINS0_14ManglingParserINS_16DefaultAllocatorEEES3_E9parseTypeEv() {}
     KEEP void _ZN12_GLOBAL__N_117itanium_demangle22AbstractManglingParserINS0_14ManglingParserINS_16DefaultAllocatorEEES3_E9parseExprEv() {}
     KEEP void _ZN12_GLOBAL__N_117itanium_demangle22AbstractManglingParserINS0_14ManglingParserINS_16DefaultAllocatorEEES3_E13parseEncodingEb() {}
     KEEP void _ZNSt6__ndk117__assoc_sub_state16__on_zero_sharedEv() {}
     KEEP void _ZNSt6__ndk117__assoc_sub_state9__executeEv() {}
     KEEP void _ZNSt6__ndk117__assoc_sub_state12__make_readyEv() {}
-    KEEP int __cxa_guard_acquire(long* g) { return !(*(char*)(g)); }
-    KEEP void __cxa_guard_release(long* g) { *(char*)g = 1; }
-    KEEP void __cxa_guard_abort(long*) {}
-    KEEP void __cxa_pure_virtual() { for (;;); }
-    KEEP int __gxx_personality_v0(...) { return 0; }
 }
+#endif // NDEBUG

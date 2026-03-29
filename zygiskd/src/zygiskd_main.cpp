@@ -24,6 +24,7 @@
 #include <sys/ptrace.h>
 
 #include "logging.hpp"
+#include "companion.hpp"
 #include "constants.hpp"
 #include "socket_utils.hpp"
 #include "utils.hpp"
@@ -320,12 +321,14 @@ static int create_daemon_socket() {
 
     if (bind(fd, reinterpret_cast<struct sockaddr*>(&addr), addr_len) < 0) {
         PLOGE("bind");
-        return -1;
+        // Use _exit(1) instead of return to prevent C++ global 
+        // destructors from crashing detached threads.
+        _exit(1);
     }
 
     if (listen(fd, 10) < 0) {
         PLOGE("listen");
-        return -1;
+        _exit(1);
     }
 
     return fd.release();
@@ -376,6 +379,10 @@ static int spawn_companion(const char* name) {
 
         // exec
         const char* argv[] = {arg0, "companion", fd_str, nullptr};
+
+        // set env for child process
+        setenv("ZYGISK_COMPANION_FD", fd_str, 1);
+
         execv(self_exe, const_cast<char**>(argv));
         PLOGE("execv");
         _exit(1);
