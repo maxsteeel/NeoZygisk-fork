@@ -379,9 +379,10 @@ static int spawn_companion(const char* name) {
 
         // exec
         const char* argv[] = {arg0, "companion", fd_str, nullptr};
-
+#ifndef NDEBUG
         // set env for child process
         setenv("ZYGISK_COMPANION_FD", fd_str, 1);
+#endif
 
         execv(self_exe, const_cast<char**>(argv));
         PLOGE("execv");
