@@ -58,14 +58,15 @@ std::string get_current_attr() {
     char buf[256] = {0};
     UniqueFd fd(open("/proc/self/attr/current", O_RDONLY | O_CLOEXEC));
     if (fd >= 0) {
-        ssize_t r = socket_utils::xread(fd, buf, sizeof(buf) - 1);
+        // Use normal 'read', since the file has variable size
+        ssize_t r = read(fd, buf, sizeof(buf) - 1); 
         if (r > 0) {
             // Trim trailing newline if any
             while (r > 0 && (buf[r-1] == '\n' || buf[r-1] == '\r')) {
                 buf[r-1] = '\0';
                 r--;
             }
-            return std::string(buf);
+            return std::string(buf, r);
         }
     }
     return "";

@@ -35,7 +35,7 @@
 #define PAGE_START(x) ((x) & ~(PAGE_SIZE - 1))
 #define PAGE_END(x) PAGE_START((x) + (PAGE_SIZE - 1))
 
-static int DlIterateCallback(struct dl_phdr_info *info, size_t size, void *data) {
+static int DlIterateCallback(struct dl_phdr_info *info, [[maybe_unused]] size_t size, void *data) {
     auto *info_vec = static_cast<std::vector<MapInfo> *>(data);
 
     const char *name = info->dlpi_name;

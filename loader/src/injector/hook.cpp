@@ -29,21 +29,9 @@
 #include "misc.hpp"
 #include "module.hpp"
 #include "zygisk.hpp"
+#include "constants.hpp"
 
 using namespace std;
-
-namespace constants {
-    constexpr size_t SHM_HASH_MAP_SIZE = 8192;
-    struct ShmEntry {
-        std::atomic<uint32_t> uid;
-        std::atomic<uint32_t> flags;
-    };
-    struct ZygiskSharedData {
-        std::atomic<uint32_t> version;
-        std::atomic<uint32_t> global_root_flags;
-        ShmEntry entries[SHM_HASH_MAP_SIZE];
-    };
-}
 
 extern constants::ZygiskSharedData* g_shared_data;
 const char *moduleId = "zygisksu";

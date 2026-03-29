@@ -29,10 +29,6 @@ struct EventHandler {
  */
 class EventLoop {
 public:
-    EventLoop();
-
-    // Disable copy and move
-    EventLoop(const EventLoop &) = delete;
     EventLoop &operator=(const EventLoop &) = delete;
 
     bool Init();

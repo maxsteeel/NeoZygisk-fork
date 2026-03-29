@@ -9,8 +9,6 @@
 #include "daemon.hpp"
 #include "logging.hpp"
 
-EventLoop::EventLoop() : running(false) {}
-
 bool EventLoop::Init() {
     epoll_fd_ = UniqueFd(epoll_create(1));
     

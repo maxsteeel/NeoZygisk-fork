@@ -75,7 +75,7 @@ androidComponents.onVariants { variant ->
             include("**/zygiskd")
         }
         into("lib") {
-            from(project(":loader").layout.buildDirectory.dir("intermediates/stripped_native_libs/$variantLowered/strip${variantCapped}DebugSymbols/out/lib"))
+            from(project(":loader").layout.buildDirectory.dir("out"))
         }
 
         doLast {

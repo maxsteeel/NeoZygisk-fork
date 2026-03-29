@@ -9,20 +9,7 @@
 #include "logging.hpp"
 #include "misc.hpp"
 #include "socket_utils.hpp"
-
-// Forward declaration of ZygiskSharedData since we can't include zygiskd constants here
-namespace constants {
-    constexpr size_t SHM_HASH_MAP_SIZE = 8192;
-    struct ShmEntry {
-        std::atomic<uint32_t> uid;
-        std::atomic<uint32_t> flags;
-    };
-    struct ZygiskSharedData {
-        std::atomic<uint32_t> version;
-        std::atomic<uint32_t> global_root_flags;
-        ShmEntry entries[SHM_HASH_MAP_SIZE];
-    };
-}
+#include "constants.hpp"
 
 constants::ZygiskSharedData* g_shared_data = nullptr;
 

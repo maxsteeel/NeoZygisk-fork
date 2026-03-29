@@ -18,8 +18,7 @@
 // --- AppMonitor Method Implementations ---
 
 AppMonitor::AppMonitor()
-    : event_loop_(),
-      socket_handler_(*this),
+    : socket_handler_(*this),
       ptrace_handler_(*this),
 #if defined(__LP64__)
       zygote_(*this, true),
