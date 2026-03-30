@@ -21,6 +21,14 @@
 #endif
 #endif
 
+#ifndef PAC_STRIP
+#if defined(__aarch64__)
+#define PAC_STRIP(addr) ((uintptr_t)(addr) & 0xFFFFFFFFFFFFULL)
+#else
+#define PAC_STRIP(addr) (addr)
+#endif
+#endif
+
 static inline uintptr_t page_start(uintptr_t addr, size_t page_size) { return ALIGN_DOWN(addr, page_size); }
 static inline uintptr_t page_end(uintptr_t addr, size_t page_size) { return ALIGN_DOWN(addr + page_size - 1, page_size); }
 

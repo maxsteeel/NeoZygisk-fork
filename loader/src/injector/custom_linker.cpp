@@ -153,9 +153,10 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
         uintptr_t addr = (uintptr_t)load_bias + (uintptr_t)sym.st_value;
         if (ELF_ST_TYPE(sym.st_info) == STT_GNU_IFUNC) {
             auto ifunc = reinterpret_cast<void* (*)()>(addr);
-            addr = reinterpret_cast<uintptr_t>(ifunc());
+            // IFUNC resolvers can return PAC-signed pointers
+            addr = PAC_STRIP(reinterpret_cast<uintptr_t>(ifunc()));
         }
-        *out_addr = addr; 
+        *out_addr = PAC_STRIP(addr); 
         return true; 
     }
     if (sym.st_name == 0 || sym.st_name >= info->strsz) return false;
@@ -169,9 +170,9 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
         uintptr_t addr = (uintptr_t)load_bias + local_val;
         if (local_type == STT_GNU_IFUNC) {
             auto ifunc = reinterpret_cast<void* (*)()>(addr);
-            addr = reinterpret_cast<uintptr_t>(ifunc());
+            addr = PAC_STRIP(reinterpret_cast<uintptr_t>(ifunc()));
         }
-        *out_addr = addr;
+        *out_addr = PAC_STRIP(addr);
         return true;
     }
 
@@ -186,9 +187,9 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
                     uintptr_t addr = (uintptr_t)mod.load_bias + mod_val;
                     if (mod_type == STT_GNU_IFUNC) {
                         auto ifunc = reinterpret_cast<void* (*)()>(addr);
-                        addr = reinterpret_cast<uintptr_t>(ifunc());
+                        addr = PAC_STRIP(reinterpret_cast<uintptr_t>(ifunc()));
                     }
-                    *out_addr = addr;
+                    *out_addr = PAC_STRIP(addr);
                     return true;
                 }
             }
@@ -198,7 +199,9 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
     // Fallback to dlsym
     void* sym_ptr = dlsym(RTLD_DEFAULT, name);
     if (sym_ptr) {
-        *out_addr = reinterpret_cast<uintptr_t>(sym_ptr);
+        // dlsym returns PAC-signed pointers in Android 14+ ARMv9.
+        // We MUST strip it before it gets added to r.r_addend in relocations.
+        *out_addr = PAC_STRIP(reinterpret_cast<uintptr_t>(sym_ptr));
         return true;
     }
 
@@ -1019,7 +1022,8 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
             if (sym.st_name != 0 && sym.st_name < mod.dinfo.strsz) {
                 const char *name = &mod.dinfo.strtab[sym.st_name];
                 if (strcmp(name, "__tls_get_addr") == 0) {
-                    sym.st_value = reinterpret_cast<uintptr_t>(&custom_tls_get_addr) - mod.load_bias;
+                    // PAC Strip local function pointer before writing
+                    sym.st_value = PAC_STRIP(reinterpret_cast<uintptr_t>(&custom_tls_get_addr)) - mod.load_bias;
                     sym.st_shndx = 1;
                 }
             }

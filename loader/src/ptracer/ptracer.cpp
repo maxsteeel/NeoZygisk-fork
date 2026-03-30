@@ -190,33 +190,14 @@ static bool execute_remote_injection(int pid, const char *lib_path, uintptr_t en
     memcpy(&backup, &regs, sizeof(regs));
     auto map = MapInfo::Scan(pid);  // Re-scan maps as they may have changed.
     auto local_map = MapInfo::Scan();
-    
-    // Find libc.so return address and path for Remote-Custom Linker
-    auto libc_return_addr = find_module_return_addr(map, "libc.so");
-    const char* libc_path_str = nullptr;
-    for (const auto &info : map) {
-        // Strict check: make sure the filename is exactly libc.so
-        const char *filename = strrchr(info.path, '/');
-        filename = filename ? filename + 1 : info.path;
-        if (strcmp(filename, "libc.so") == 0) {
-            libc_path_str = info.path;
-            break;
-        }
-    }
-
-    if (libc_path_str == nullptr) {
-        LOGE("could not locate libc.so in remote maps");
-        return false;
-    }
-
     uintptr_t remote_base = 0;
     size_t remote_size = 0;
     uintptr_t injector_entry = 0;
     uintptr_t init_array = 0;
     size_t init_count = 0;
 
-    if (!remote_custom_linker_load_and_resolve_entry(pid, &regs, (uintptr_t)libc_return_addr, 
-                                                 local_map, map, libc_path_str,
+    if (!remote_custom_linker_load_and_resolve_entry(pid, &regs, 
+                                                 local_map, map, 
                                                  lib_path, &remote_base, &remote_size, &injector_entry,
                                                  &init_array, &init_count)) {
         LOGE("Remote-Custom Linker failed to map the library remotely");
@@ -236,13 +217,13 @@ static bool execute_remote_injection(int pid, const char *lib_path, uintptr_t en
         (long)init_count  // Argument 5
     };
 
-    remote_call(pid, regs, injector_entry, (uintptr_t)libc_return_addr, args, 5);
+    remote_call(pid, regs, injector_entry, 0x0, args, 5);
 
     bool injector_ok = false;
 #if defined(__arm__)
-    injector_ok = (((uintptr_t)regs.REG_IP & ~1u) == ((uintptr_t)libc_return_addr & ~1u));
+    injector_ok = (((uintptr_t)regs.REG_IP & ~1u) == 0x0);
 #else
-    injector_ok = ((uintptr_t)regs.REG_IP == (uintptr_t)libc_return_addr);
+    injector_ok = ((uintptr_t)regs.REG_IP == 0x0);
 #endif
 
     if (!injector_ok) {

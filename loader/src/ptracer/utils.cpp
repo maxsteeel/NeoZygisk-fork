@@ -28,6 +28,7 @@
 #include <memory>
 
 #include "logging.hpp"
+#include "elf_utils.hpp"
 
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
@@ -325,21 +326,6 @@ bool set_regs(int pid, struct user_regs_struct &regs) {
 }
 
 /**
- * @brief Finds a suitable address within a module to use as a return address for remote calls.
- *        This heuristic looks for the first non-executable segment of the library.
- *        Using such an address ensures that when our remote call "returns", it traps
- *        with a SIGSEGV instead of executing unknown code, allowing us to regain control.
- */
-void *find_module_return_addr(const std::vector<MapInfo> &info, std::string_view suffix) {
-    for (const auto &map : info) {
-        if ((map.perms & PROT_EXEC) == 0 && std::string_view(map.path).ends_with(suffix)) {
-            return (void *) map.start;
-        }
-    }
-    return nullptr;
-}
-
-/**
  * @brief Finds the base address of a loaded module (the first mapping with zero offset).
  */
 void *find_module_base(const std::vector<MapInfo> &info, std::string_view suffix) {
@@ -367,7 +353,7 @@ void *find_func_addr(const std::vector<MapInfo> &local_info,
         LOGE("failed to open lib %s: %s", module.data(), dlerror());
         return nullptr;
     }
-    auto local_sym = reinterpret_cast<uintptr_t>(dlsym(lib, func.data()));
+    auto local_sym = PAC_STRIP(reinterpret_cast<uintptr_t>(dlsym(lib, func.data())));
     dlclose(lib);  // Close the library handle immediately to avoid resource leaks.
     if (local_sym == 0) {
         LOGE("failed to find sym %s in %s: %s", func.data(), module.data(), dlerror());
@@ -761,4 +747,141 @@ bool get_program(int pid, char* buf, size_t buf_size) {
     }
     buf[sz] = 0;
     return true;
+}
+
+uintptr_t find_syscall_gadget([[maybe_unused]] int pid, const std::vector<MapInfo> &local_info, const std::vector<MapInfo> &remote_info) {
+    void* local_syscall = dlsym(RTLD_DEFAULT, "syscall");
+    if (!local_syscall) {
+        LOGE("Failed to find local syscall function");
+        return 0;
+    }
+
+    // Clean the cryptographic signature before pointer arithmetic
+    local_syscall = (void*)PAC_STRIP(local_syscall);
+    uintptr_t gadget = 0;
+
+    // Scan for a syscall execution instruction
+    uint8_t* ptr = (uint8_t*)local_syscall;
+    for (int i = 0; i < 1024; i += 4) {
+#if defined(__aarch64__)
+        if (*(uint32_t*)(ptr + i) == 0xd4000001) { // svc #0
+            gadget = (uintptr_t)(ptr + i);
+            break;
+        }
+#elif defined(__x86_64__)
+        if (*(uint16_t*)(ptr + i) == 0x050f) { // syscall
+            gadget = (uintptr_t)(ptr + i);
+            break;
+        }
+#elif defined(__arm__)
+        if (*(uint32_t*)(ptr + i) == 0xef000000 || *(uint32_t*)(ptr + i) == 0xdf00) { // swi 0 or svc 0
+            gadget = (uintptr_t)(ptr + i);
+            break;
+        }
+#elif defined(__i386__)
+        if (*(uint16_t*)(ptr + i) == 0x80cd) { // int 0x80
+            gadget = (uintptr_t)(ptr + i);
+            break;
+        }
+#endif
+    }
+
+    if (!gadget) {
+        LOGE("Failed to find syscall gadget in local memory");
+        return 0;
+    }
+
+    uintptr_t local_base = (uintptr_t)find_module_base(local_info, "libc.so");
+    uintptr_t remote_base = (uintptr_t)find_module_base(remote_info, "libc.so");
+
+    if (!local_base || !remote_base) {
+        LOGE("Failed to find libc.so base for syscall gadget translation");
+        return 0;
+    }
+
+    return remote_base + (gadget - local_base);
+}
+
+#ifdef __aarch64__
+// BTI compatibility mask
+#define AARCH64_PSTATE_BTYPE_MASK (3ull << 10)
+#endif
+
+long remote_syscall(int pid, struct user_regs_struct &regs, uintptr_t syscall_gadget, long sysnr, const long *args, size_t args_size) {
+    LOGV("remote syscall %ld args %zu at gadget 0x%" PRIxPTR, sysnr, args_size, syscall_gadget);
+
+    // Save current registers to avoid state corruption
+    struct user_regs_struct saved_regs = regs;
+
+#if defined(__aarch64__)
+    regs.regs[8] = sysnr;
+    for (size_t i = 0; i < args_size && i < 6; i++) {
+        regs.regs[i] = args[i];
+    }
+    regs.REG_IP = syscall_gadget;
+    // Clear BTYPE so stepping the aarch64 vDSO svc will be accepted by the CPU
+    regs.pstate &= ~AARCH64_PSTATE_BTYPE_MASK;
+#elif defined(__arm__)
+    regs.uregs[7] = sysnr;
+    for (size_t i = 0; i < args_size && i < 6; i++) {
+        regs.uregs[i] = args[i];
+    }
+    regs.REG_IP = syscall_gadget;
+#elif defined(__x86_64__)
+    regs.orig_rax = sysnr;
+    regs.rax = sysnr;
+    if (args_size > 0) regs.rdi = args[0];
+    if (args_size > 1) regs.rsi = args[1];
+    if (args_size > 2) regs.rdx = args[2];
+    if (args_size > 3) regs.r10 = args[3]; // syscall instruction uses r10 instead of rcx
+    if (args_size > 4) regs.r8 = args[4];
+    if (args_size > 5) regs.r9 = args[5];
+    regs.REG_IP = syscall_gadget;
+#elif defined(__i386__)
+    regs.orig_eax = sysnr;
+    regs.eax = sysnr;
+    if (args_size > 0) regs.ebx = args[0];
+    if (args_size > 1) regs.ecx = args[1];
+    if (args_size > 2) regs.edx = args[2];
+    if (args_size > 3) regs.esi = args[3];
+    if (args_size > 4) regs.edi = args[4];
+    if (args_size > 5) regs.ebp = args[5];
+    regs.REG_IP = syscall_gadget;
+#endif
+
+    if (!set_regs(pid, regs)) {
+        LOGE("Failed to set registers for remote syscall");
+        return -1;
+    }
+
+    if (ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == -1) {
+        PLOGE("PTRACE_SINGLESTEP syscall");
+        set_regs(pid, saved_regs); // Safe restore
+        return -1;
+    }
+
+    int status;
+    wait_for_trace(pid, &status, __WALL);
+
+    if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
+        LOGE("remote syscall unexpected stop: %s", parse_status(status).c_str());
+        set_regs(pid, saved_regs);
+        return -1;
+    }
+
+    if (!get_regs(pid, regs)) {
+        LOGE("failed to get regs after syscall");
+        set_regs(pid, saved_regs);
+        return -1;
+    }
+
+    long ret = (long)regs.REG_RET;
+
+    // Restore full original context so the target process logic isn't corrupted
+    if (!set_regs(pid, saved_regs)) {
+        LOGE("failed to restore regs after syscall");
+        return -1;
+    }
+
+    return ret;
 }

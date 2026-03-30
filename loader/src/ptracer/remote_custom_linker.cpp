@@ -276,12 +276,19 @@ static bool is_memfd_supported_by_kernel() {
     return supported == 1;
 }
 
+static long remote_mmap_offset_arg(off_t file_offset, size_t page_size) {
+  #if defined(__NR_mmap2) && defined(SYS_mmap) && SYS_mmap == __NR_mmap2
+    return (long)(file_offset / (off_t)page_size);
+  #else
+    (void)page_size;
+    return (long)file_offset;
+  #endif
+}
+
 // ---------------- MAIN ----------------
 bool remote_custom_linker_load_and_resolve_entry(int pid, struct user_regs_struct *regs,
-                                             uintptr_t libc_return_addr, 
                                              const std::vector<MapInfo>& local_map,
                                              const std::vector<MapInfo>& remote_map, 
-                                             const char *libc_path,
                                              const char *lib_path, uintptr_t *out_base,
                                              size_t *out_total_size, uintptr_t *out_entry,
                                              uintptr_t *out_init_array, size_t *out_init_count) {
@@ -300,93 +307,62 @@ bool remote_custom_linker_load_and_resolve_entry(int pid, struct user_regs_struc
 
     if (!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size)) { return false; }
 
-    void *mmap_addr = find_func_addr(local_map, remote_map, libc_path, "mmap");
-    void *mprotect_addr = find_func_addr(local_map, remote_map, libc_path, "mprotect");
-    void *open_addr = find_func_addr(local_map, remote_map, libc_path, "open");
-    void *close_addr = find_func_addr(local_map, remote_map, libc_path, "close");
-    void *syscall_addr = find_func_addr(local_map, remote_map, libc_path, "syscall");
-    void *munmap_addr = find_func_addr(local_map, remote_map, libc_path, "munmap");
-    if (!mmap_addr || !mprotect_addr || !open_addr || !close_addr || !syscall_addr || !munmap_addr) { return false; }
+    uintptr_t syscall_gadget = find_syscall_gadget(pid, local_map, remote_map);
+    if (!syscall_gadget) {
+        LOGE("Failed to find syscall gadget for Remote-Custom Linker");
+        return false;
+    }
 
     size_t path_len = strlen(lib_path) + 1;
     const char* fake_name = "jit-cache";
     size_t fake_name_len = strlen(fake_name) + 1;
 
-    long args_mmap1[] = {0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
-    struct user_regs_struct call_regs = regs_saved;
-    uintptr_t remote_str_block = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args_mmap1, 6);
-    if (!remote_str_block || remote_str_block == (uintptr_t)MAP_FAILED) { return false; }
+    uintptr_t remote_str_block = regs_saved.REG_SP - ALIGN_UP(path_len + fake_name_len, 16);
+    uintptr_t remote_fake_name = remote_str_block + path_len;
 
-    std::vector<char> str_buffer(4096, 0);
+    std::vector<char> str_buffer(path_len + fake_name_len, 0);
     memcpy(str_buffer.data(), lib_path, path_len);
-    memcpy(str_buffer.data() + 2048, fake_name, fake_name_len);
-    write_proc(pid, remote_str_block, str_buffer.data(), 4096);
+    memcpy(str_buffer.data() + path_len, fake_name, fake_name_len);
+    write_proc(pid, remote_str_block, str_buffer.data(), str_buffer.size());
 
-    long args_open[] = {(long)remote_str_block, O_RDONLY | O_CLOEXEC, 0};
-    call_regs = regs_saved;
-    long remote_fd = (long)remote_call(pid, call_regs, (uintptr_t)open_addr, libc_return_addr, args_open, 3);
+    struct user_regs_struct call_regs = regs_saved;
+    call_regs.REG_SP = remote_str_block;
+
+    long args_open[] = {AT_FDCWD, (long)remote_str_block, O_RDONLY | O_CLOEXEC, 0};
+    long remote_fd = remote_syscall(pid, call_regs, syscall_gadget, SYS_openat, args_open, 4);
 
     if (remote_fd < 0) {
-        long args_munmap1[] = {(long)remote_str_block, 4096};
-        call_regs = regs_saved;
-        remote_call(pid, call_regs, (uintptr_t)munmap_addr, libc_return_addr, args_munmap1, 2);
+        LOGE("Failed to open remote file via raw syscall");
         return false;
     }
 
     long memfd = -1;
     if (is_memfd_supported_by_kernel()) {
-        long memfd_syscall_num = 0;
-#if defined(__aarch64__)
-        memfd_syscall_num = 279;
-#elif defined(__x86_64__)
-        memfd_syscall_num = 319;
-#elif defined(__arm__)
-        memfd_syscall_num = 385;
-#elif defined(__i386__)
-        memfd_syscall_num = 356;
-#endif
-
-        long args_syscall_memfd[] = {memfd_syscall_num, (long)(remote_str_block + 2048), MFD_CLOEXEC};
-        call_regs = regs_saved;
-        memfd = (long)remote_call(pid, call_regs, (uintptr_t)syscall_addr, libc_return_addr, args_syscall_memfd, 3);
+        long args_memfd[] = {(long)remote_fake_name, MFD_CLOEXEC};
+        memfd = remote_syscall(pid, call_regs, syscall_gadget, SYS_memfd_create, args_memfd, 2);
     }
-
-    long args_munmap1[] = {(long)remote_str_block, 4096};
-    call_regs = regs_saved;
-    remote_call(pid, call_regs, (uintptr_t)munmap_addr, libc_return_addr, args_munmap1, 2);
 
     uintptr_t remote_base = 0;
 
     if (memfd >= 0) {
-        long ftruncate_syscall = 0;
-#if defined(__aarch64__)
-        ftruncate_syscall = 46;
-#elif defined(__x86_64__)
-        ftruncate_syscall = 77;
-#elif defined(__arm__)
-        ftruncate_syscall = 93;
-#elif defined(__i386__)
-        ftruncate_syscall = 93;
-#endif
-        long args_syscall_ftruncate[] = {ftruncate_syscall, memfd, (long)map_size};
-        call_regs = regs_saved;
-        remote_call(pid, call_regs, (uintptr_t)syscall_addr, libc_return_addr, args_syscall_ftruncate, 3);
+        long args_ftruncate[] = {memfd, (long)map_size};
+        remote_syscall(pid, call_regs, syscall_gadget, SYS_ftruncate, args_ftruncate, 2);
 
         long args_mmap_shared[] = {0, (long)map_size, PROT_NONE, MAP_SHARED, memfd, 0};
-        call_regs = regs_saved;
-        remote_base = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args_mmap_shared, 6);
+        remote_base = remote_syscall(pid, call_regs, syscall_gadget, SYS_mmap, args_mmap_shared, 6);
 
-        long args_close[] = {memfd};
-        call_regs = regs_saved;
-        remote_call(pid, call_regs, (uintptr_t)close_addr, libc_return_addr, args_close, 1);
+        long args_close_memfd[] = {memfd};
+        remote_syscall(pid, call_regs, syscall_gadget, SYS_close, args_close_memfd, 1);
     } else {
-        LOGW("remote_custom_linker: memfd_create failed, falling back to anonymous memory");
         long args_mmap_anon[] = {0, (long)map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
-        call_regs = regs_saved;
-        remote_base = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args_mmap_anon, 6);
+        remote_base = remote_syscall(pid, call_regs, syscall_gadget, SYS_mmap, args_mmap_anon, 6);
     }
 
-    if (!remote_base || remote_base == (uintptr_t)MAP_FAILED) { return false; }
+    if (!remote_base || remote_base == (uintptr_t)MAP_FAILED) {
+        long args_close_fd[] = {remote_fd};
+        remote_syscall(pid, call_regs, syscall_gadget, SYS_close, args_close_fd, 1);
+        return false;
+    }
 
     uintptr_t load_bias = remote_base - (uintptr_t)min_vaddr;
     struct SegInfo { uintptr_t addr; size_t len; int prot; };
@@ -407,9 +383,9 @@ bool remote_custom_linker_load_and_resolve_entry(int pid, struct user_regs_struc
         uintptr_t file_page_end = page_end(file_end, page_size);
 
         if (phdr[i].p_filesz > 0) {
-            call_regs = regs_saved;
-            long args_mmap_seg[] = {(long)seg_page, (long)(file_page_end - seg_page), PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, remote_fd, (long)file_page_offset};
-            uintptr_t seg_map = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args_mmap_seg, 6);
+            long offset_arg = remote_mmap_offset_arg(file_page_offset, page_size);
+            long args_mmap_seg[] = {(long)seg_page, (long)(file_page_end - seg_page), PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, remote_fd, offset_arg};
+            uintptr_t seg_map = remote_syscall(pid, call_regs, syscall_gadget, SYS_mmap, args_mmap_seg, 6);
             if (!seg_map || seg_map == (uintptr_t)MAP_FAILED) return false;
 
             if (is_writable && file_page_end > file_end) {
@@ -419,9 +395,8 @@ bool remote_custom_linker_load_and_resolve_entry(int pid, struct user_regs_struc
             }
         }
         if (seg_page_end > file_page_end) {
-            call_regs = regs_saved;
             long args_mmap_bss[] = {(long)file_page_end, (long)(seg_page_end - file_page_end), PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
-            uintptr_t bss_map = remote_call(pid, call_regs, (uintptr_t)mmap_addr, libc_return_addr, args_mmap_bss, 6);
+            uintptr_t bss_map = remote_syscall(pid, call_regs, syscall_gadget, SYS_mmap, args_mmap_bss, 6);
             if (!bss_map || bss_map == (uintptr_t)MAP_FAILED) return false;
         }
         int prot = 0;
@@ -431,9 +406,8 @@ bool remote_custom_linker_load_and_resolve_entry(int pid, struct user_regs_struc
         segs.push_back({seg_page, seg_page_len, prot});
     }
 
-    call_regs = regs_saved;
     long args_close_fd[] = {remote_fd};
-    remote_call(pid, call_regs, (uintptr_t)close_addr, libc_return_addr, args_close_fd, 1);
+    remote_syscall(pid, call_regs, syscall_gadget, SYS_close, args_close_fd, 1);
 
     elf_dyn_info dinfo;
     if (!elf_load_dyn_info(fd, &eh, phdr, &dinfo)) return false;
@@ -457,9 +431,8 @@ bool remote_custom_linker_load_and_resolve_entry(int pid, struct user_regs_struc
 
     for (const auto& s : segs) {
         if (s.prot == (PROT_READ | PROT_WRITE)) continue;
-        call_regs = regs_saved;
         long args_mprotect[] = {(long)s.addr, (long)s.len, s.prot};
-        remote_call(pid, call_regs, (uintptr_t)mprotect_addr, libc_return_addr, args_mprotect, 3);
+        remote_syscall(pid, call_regs, syscall_gadget, SYS_mprotect, args_mprotect, 3);
     }
 
     ElfW(Addr) entry_value = 0;

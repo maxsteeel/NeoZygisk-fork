@@ -149,4 +149,9 @@ inline const char *sigabbrev_np(int sig) {
 }
 
 bool get_program(int pid, char* buf, size_t buf_size);
-void *find_module_return_addr(const std::vector<MapInfo> &info, std::string_view suffix);
+
+// Finds a raw 'svc 0' or 'syscall' gadget in the remote libc.so
+uintptr_t find_syscall_gadget(int pid, const std::vector<MapInfo> &local_info, const std::vector<MapInfo> &remote_info);
+
+// Executes a raw kernel syscall in the remote process, bypassing BTI and libc wrappers.
+long remote_syscall(int pid, struct user_regs_struct &regs, uintptr_t syscall_gadget, long sysnr, const long *args, size_t args_size);
