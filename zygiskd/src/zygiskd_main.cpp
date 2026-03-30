@@ -66,9 +66,11 @@ struct Module {
     Module() = default;   
 };
 
+#define MAX_MODULES 32
 struct AppContext {
-    std::vector<Module*> modules;
-    std::shared_ptr<MountNamespaceManager> mount_manager;
+    Module* modules[MAX_MODULES];
+    size_t module_count = 0;
+    MountNamespaceManager* mount_manager;
 };
 
 static std::string TMP_PATH;
@@ -178,45 +180,49 @@ static void shm_refresh_thread() {
     }
 }
 
-static void append_bytes(std::vector<uint8_t>& vec, const void* data, size_t size) {
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(data);
-    vec.insert(vec.end(), p, p + size);
-}
+static bool send_startup_info(Module** modules, size_t module_count) {
+    uint8_t msg[4096];
+    size_t msg_len = 0;
 
-static bool send_startup_info(const std::vector<Module*>& modules) {
-    std::vector<uint8_t> msg;
+    auto append = [&](const void* data, size_t size) {
+        if (msg_len + size <= sizeof(msg)) {
+            memcpy(msg + msg_len, data, size);
+            msg_len += size;
+        }
+    };
+    
     auto root = root_impl::get();
     std::string info;
+    std::string root_name;
 
     if (root == root_impl::RootImpl::APatch || root == root_impl::RootImpl::KernelSU || root == root_impl::RootImpl::Magisk) {
         uint32_t magic = constants::DAEMON_SET_INFO;
-        append_bytes(msg, &magic, 4);
+        append(&magic, 4);
 
-        std::string root_name;
         if (root == root_impl::RootImpl::APatch) root_name = "APatch";
         else if (root == root_impl::RootImpl::KernelSU) root_name = "KernelSU";
         else if (root == root_impl::RootImpl::Magisk) root_name = "Magisk";
 
-        if (!modules.empty()) {
-            info = "\t\tRoot: " + root_name + "\n\t\tModules (" + to_str(modules.size()) + "):\n\t\t\t";
-            for (size_t i = 0; i < modules.size(); ++i) {
+        if (module_count > 0) {
+            info = "\t\tRoot: " + root_name + "\n\t\tModules (" + to_str(module_count) + "):\n\t\t\t";
+            for (size_t i = 0; i < module_count; ++i) {
                 info += modules[i]->name;
-                if (i != modules.size() - 1) info += "\n\t\t\t";
+                if (i != module_count - 1) info += "\n\t\t\t";
             }
         } else {
             info = "\t\tRoot: " + root_name;
         }
     } else {
         uint32_t magic = constants::DAEMON_SET_ERROR_INFO;
-        append_bytes(msg, &magic, 4);
+        append(&magic, 4);
         info = "\t\tInvalid root implementation.";
     }
 
     uint32_t len = info.size() + 1;
-    append_bytes(msg, &len, 4);
-    append_bytes(msg, info.c_str(), len);
+    append(&len, 4);
+    append(info.c_str(), len);
 
-    return utils::unix_datagram_sendto(CONTROLLER_SOCKET.c_str(), msg.data(), msg.size());
+    return utils::unix_datagram_sendto(CONTROLLER_SOCKET.c_str(), msg, msg_len);
 }
 
 static std::string get_arch() {
@@ -263,13 +269,13 @@ static int create_library_fd(const char* so_path) {
     return memfd.release();
 }
 
-static std::vector<Module*> load_modules() {
-    std::vector<Module*> modules;
+static void load_modules(AppContext* context) {
+    context->module_count = 0;
     std::string arch = get_arch();
 
     if (arch.empty()) {
         LOGE("Unsupported system architecture");
-        return modules;
+        return;
     }
 
     LOGD("Daemon architecture: %s", arch.c_str());
@@ -277,12 +283,17 @@ static std::vector<Module*> load_modules() {
     UniqueDir dir(opendir(constants::PATH_MODULES_DIR));
     if (!dir) {
         LOGW("Failed to read modules directory %s", constants::PATH_MODULES_DIR);
-        return modules;
+        return;
     }
 
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
         if (entry->d_name[0] == '.') continue;
+
+        if (context->module_count >= MAX_MODULES) {
+            LOGW("Max modules limit (%d) reached! Skipping `%s`", MAX_MODULES, entry->d_name);
+            break;
+        }
 
         char disable_path[256];
         snprintf(disable_path, sizeof(disable_path), "%s/%s/disable", constants::PATH_MODULES_DIR, entry->d_name);
@@ -299,13 +310,12 @@ static std::vector<Module*> load_modules() {
             Module* mod = new Module(); 
             mod->name = entry->d_name;
             mod->lib_fd = lib_fd;
-            modules.push_back(mod);
+            context->modules[context->module_count] = mod;
+            context->module_count++;
         } else {
             LOGW("Failed to create memfd for `%s`", entry->d_name);
         }
     }
-
-    return modules;
 }
 
 static int create_daemon_socket() {
@@ -483,8 +493,9 @@ static void handle_update_mount_namespace(int stream, AppContext* context) {
 }
 
 static void handle_read_modules(int stream, AppContext* context) {
-    socket_utils::write_usize(stream, context->modules.size());
-    for (const auto& module : context->modules) {
+    socket_utils::write_usize(stream, context->module_count);
+    for (size_t i = 0; i < context->module_count; ++i) {
+        auto module = context->modules[i];
         socket_utils::write_string(stream, module->name);
         socket_utils::send_fd(stream, module->lib_fd);
     }
@@ -492,12 +503,12 @@ static void handle_read_modules(int stream, AppContext* context) {
 
 static void handle_request_companion_socket(int stream, AppContext* context) {
     size_t index = socket_utils::read_usize(stream);
-    if (index >= context->modules.size()) {
+    if (index >= context->module_count) {
         socket_utils::write_u8(stream, 0);
         return;
     }
 
-    auto& module = context->modules[index];
+    auto module = context->modules[index];
     std::lock_guard<std::mutex> lock(module->companion_mutex);
 
     if (module->companion_fd >= 0) {
@@ -529,8 +540,8 @@ static void handle_request_companion_socket(int stream, AppContext* context) {
 
 static void handle_get_module_dir(int stream, AppContext* context) {
     size_t index = socket_utils::read_usize(stream);
-    if (index >= context->modules.size()) return;
-    auto& module = context->modules[index];
+    if (index >= context->module_count) return;
+    auto module = context->modules[index];
     char dir_path[256];
     snprintf(dir_path, sizeof(dir_path), "%s/%s", constants::PATH_MODULES_DIR, module->name.c_str());
     UniqueFd dir_fd(open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
@@ -538,18 +549,18 @@ static void handle_get_module_dir(int stream, AppContext* context) {
 }
 
 
-static void handle_threaded_action(DaemonSocketAction action, int stream, std::shared_ptr<AppContext> context) {
+static void handle_threaded_action(DaemonSocketAction action, int stream, AppContext* context) {
     switch (action) {
         case DaemonSocketAction::GetProcessFlags: handle_get_process_flags(stream); break;
-        case DaemonSocketAction::UpdateMountNamespace: handle_update_mount_namespace(stream, context.get()); break;
-        case DaemonSocketAction::ReadModules: handle_read_modules(stream, context.get()); break;
-        case DaemonSocketAction::RequestCompanionSocket: handle_request_companion_socket(stream, context.get()); break;
-        case DaemonSocketAction::GetModuleDir: handle_get_module_dir(stream, context.get()); break;
+        case DaemonSocketAction::UpdateMountNamespace: handle_update_mount_namespace(stream, context); break;
+        case DaemonSocketAction::ReadModules: handle_read_modules(stream, context); break;
+        case DaemonSocketAction::RequestCompanionSocket: handle_request_companion_socket(stream, context); break;
+        case DaemonSocketAction::GetModuleDir: handle_get_module_dir(stream, context); break;
         default: break;
     }
 }
 
-static void handle_connection(UniqueFd stream, std::shared_ptr<AppContext> context) {
+static void handle_connection(UniqueFd stream, AppContext* context) {
     uint8_t action_val = socket_utils::read_u8(stream);
     auto action = static_cast<DaemonSocketAction>(action_val);
 
@@ -567,7 +578,8 @@ static void handle_connection(UniqueFd stream, std::shared_ptr<AppContext> conte
         }
         case DaemonSocketAction::ZygoteRestart: {
             LOGI("Zygote restarted, cleaning up companion sockets.");
-            for (auto& module : context->modules) {
+            for (size_t i = 0; i < context->module_count; ++i) {
+                auto module = context->modules[i];
                 std::lock_guard<std::mutex> lock(module->companion_mutex);
                 if (module->companion_fd >= 0) {
                     module->companion_fd = UniqueFd();
@@ -592,10 +604,15 @@ static void handle_connection(UniqueFd stream, std::shared_ptr<AppContext> conte
         }
         default: {
             int raw_fd = stream.release(); 
-            std::thread([action, raw_fd, context]() {
+            spawn_thread([action, raw_fd, context]() {
                 UniqueFd thread_stream(raw_fd);
                 handle_threaded_action(action, thread_stream, context);
-            }).detach();
+            #ifdef M_PURGE
+                // Force the allocator to release cached free memory back to the OS
+                // after the companion client disconnects and the thread finishes.
+                mallopt(M_PURGE, 0);
+            #endif
+            });
             break;
         }
     }
@@ -638,14 +655,16 @@ int main() {
         return 1;
     }
 
-    std::thread(shm_refresh_thread).detach();
+    spawn_thread([](void*) -> void* {
+        shm_refresh_thread();
+        return nullptr;
+    }, nullptr);
 
-    auto modules = load_modules();
-    send_startup_info(modules);
+    AppContext* context = new AppContext();
+    context->mount_manager = new MountNamespaceManager();
+    load_modules(context); 
 
-    auto context = std::make_shared<AppContext>();
-    context->modules = std::move(modules);
-    context->mount_manager = std::make_shared<MountNamespaceManager>();
+    send_startup_info(context->modules, context->module_count);
 
     UniqueFd listener(create_daemon_socket());
     if (listener < 0) {

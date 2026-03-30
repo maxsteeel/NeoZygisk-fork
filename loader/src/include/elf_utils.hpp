@@ -5,6 +5,7 @@
 #include <sys/types.h>
 #include <vector>
 #include <cstdint>
+#include <memory>
 
 #ifndef ALIGN_DOWN
 #define ALIGN_DOWN(x, a) ((x) & ~((a)-1))
@@ -63,22 +64,26 @@ struct elf_dyn_info {
 
     uint32_t gnu_symndx = 0;
     uint32_t gnu_shift2 = 0;
-    std::vector<ElfW(Addr)> gnu_bloom_filter;
-    std::vector<uint32_t> gnu_buckets;
-    std::vector<uint32_t> gnu_chains;
-
-    std::vector<char> strtab; std::vector<size_t> needed_str_offsets;
-    std::vector<ElfW(Sym)> symtab;
+    std::unique_ptr<ElfW(Addr)[]> gnu_bloom_filter;
+    size_t gnu_bloom_filter_size = 0;
+    std::unique_ptr<uint32_t[]> gnu_buckets;
+    size_t gnu_buckets_size = 0;
+    std::unique_ptr<uint32_t[]> gnu_chains;
+    size_t gnu_chains_size = 0;
+    std::unique_ptr<char[]> strtab;
+    size_t needed_str_offsets[128];
+    size_t needed_count = 0;
+    std::unique_ptr<ElfW(Sym)[]> symtab;
 };
 
 bool read_loop_offset(int fd, void *buf, size_t count, off_t offset);
 
 bool compute_load_layout(int fd, size_t page_size, ElfW(Ehdr) *eh,
-                        std::vector<ElfW(Phdr)>& out_phdr, ElfW(Addr) *out_min_vaddr,
-                        size_t *out_map_size);
+                         std::unique_ptr<ElfW(Phdr)[]>& out_phdr, ElfW(Addr) *out_min_vaddr,
+                         size_t *out_map_size);
 
-bool vaddr_to_offset(const std::vector<ElfW(Phdr)>& phdr, ElfW(Addr) vaddr, off_t *out_off);
+bool vaddr_to_offset(const std::unique_ptr<ElfW(Phdr)[]>& phdr, size_t phnum, ElfW(Addr) vaddr, off_t *out_off);
 
-bool elf_load_dyn_info(int fd, const ElfW(Ehdr) *eh, const std::vector<ElfW(Phdr)>& phdr, elf_dyn_info *out);
+bool elf_load_dyn_info(int fd, const ElfW(Ehdr) *eh, const std::unique_ptr<ElfW(Phdr)[]>& phdr, elf_dyn_info *out);
 
 bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr) *out_value, uint8_t *out_type = nullptr);

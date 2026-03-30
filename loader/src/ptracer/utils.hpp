@@ -1,7 +1,11 @@
 #pragma once
+#include "../../../zygiskd/src/include/utils.hpp"
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <cstdint>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <cinttypes>
 #include <signal.h>
 #include <string.h>
 
@@ -34,7 +38,47 @@ struct MapInfo {
     /// \brief Scans /proc/self/maps and returns a list of \ref MapInfo entries.
     /// This is useful to find out the inode of the library to hook.
     /// \return A list of \ref MapInfo entries.
-    static std::vector<MapInfo> Scan(int pid = -1);
+    template <typename Callback>
+    static void Scan(int pid, Callback cb) {
+        char map_path[64];
+        if (pid == -1 || pid == getpid()) {
+            strcpy(map_path, "/proc/self/maps");
+        } else {
+            snprintf(map_path, sizeof(map_path), "/proc/%d/maps", pid);
+        }
+
+        UniqueFile fp(fopen(map_path, "re"));
+        if (!fp) return;
+
+        char line[512];
+        while (fgets(line, sizeof(line), fp)) {
+            MapInfo info{};
+            info.perms = 0;
+            char perms_str[5] = {0};
+            uint64_t temp_inode = 0; 
+          
+            // Standard proc maps format: 
+            // 7f9c000000-7f9c001000 r-xp 00000000 103:04 123456 /system/lib64/libc.so
+            int matched = sscanf(line, "%" PRIxPTR "-%" PRIxPTR " %4s %" PRIxPTR " %*x:%*x %" PRIu64 " %255s",
+                                 &info.start, &info.end, perms_str, &info.offset, &temp_inode, info.path);
+            info.inode = static_cast<ino_t>(temp_inode);
+
+            if (matched >= 4) {
+                if (perms_str[0] == 'r') info.perms |= PROT_READ;
+                if (perms_str[1] == 'w') info.perms |= PROT_WRITE;
+                if (perms_str[2] == 'x') info.perms |= PROT_EXEC;
+                info.is_private = (perms_str[3] == 'p');
+                
+                // If scanf did not read the path (because it was anonymous memory), path remains empty
+                if (matched < 6) info.path[0] = '\0';
+
+                // Execute the callback. If it returns true, we stop scanning.
+                if (cb(info)) {
+                    break; 
+                }
+            }
+        }
+    }
 };
 
 #if defined(__x86_64__)
@@ -68,11 +112,9 @@ bool get_regs(int pid, struct user_regs_struct &regs);
 
 bool set_regs(int pid, struct user_regs_struct &regs);
 
-void *find_module_base(const std::vector<MapInfo> &info, std::string_view suffix);
+void *find_module_base(int pid, std::string_view suffix);
 
-void *find_func_addr(const std::vector<MapInfo> &local_info,
-                     const std::vector<MapInfo> &remote_info, std::string_view module,
-                     std::string_view func);
+void *find_func_addr(int local_pid, int remote_pid, std::string_view module, std::string_view func);
 
 void align_stack(struct user_regs_struct &regs, long preserve = 0);
 
@@ -151,7 +193,7 @@ inline const char *sigabbrev_np(int sig) {
 bool get_program(int pid, char* buf, size_t buf_size);
 
 // Finds a raw 'svc 0' or 'syscall' gadget in the remote libc.so
-uintptr_t find_syscall_gadget(int pid, const std::vector<MapInfo> &local_info, const std::vector<MapInfo> &remote_info);
+uintptr_t find_syscall_gadget(int local_pid, int remote_pid);
 
 // Executes a raw kernel syscall in the remote process, bypassing BTI and libc wrappers.
 long remote_syscall(int pid, struct user_regs_struct &regs, uintptr_t syscall_gadget, long sysnr, const long *args, size_t args_size);

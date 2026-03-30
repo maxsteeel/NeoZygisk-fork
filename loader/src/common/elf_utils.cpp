@@ -16,14 +16,14 @@ bool read_loop_offset(int fd, void *buf, size_t count, off_t offset) {
 }
 
 bool compute_load_layout(int fd, size_t page_size, ElfW(Ehdr) *eh,
-                        std::vector<ElfW(Phdr)>& out_phdr, ElfW(Addr) *out_min_vaddr,
-                        size_t *out_map_size) {
+                         std::unique_ptr<ElfW(Phdr)[]>& out_phdr, ElfW(Addr) *out_min_vaddr,
+                         size_t *out_map_size) {
     if (!read_loop_offset(fd, eh, sizeof(*eh), 0)) return false;
     if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) return false;
 
     size_t phdr_sz = (size_t)eh->e_phnum * sizeof(ElfW(Phdr));
-    out_phdr.resize(eh->e_phnum);
-    if (!read_loop_offset(fd, out_phdr.data(), phdr_sz, (off_t)eh->e_phoff)) return false;
+    out_phdr = std::make_unique<ElfW(Phdr)[]>(eh->e_phnum);
+    if (!read_loop_offset(fd, out_phdr.get(), phdr_sz, eh->e_phoff)) return false;
 
     ElfW(Addr) lo = (ElfW(Addr))UINTPTR_MAX;
     ElfW(Addr) hi = 0;
@@ -42,8 +42,9 @@ bool compute_load_layout(int fd, size_t page_size, ElfW(Ehdr) *eh,
     return true;
 }
 
-bool vaddr_to_offset(const std::vector<ElfW(Phdr)>& phdr, ElfW(Addr) vaddr, off_t *out_off) {
-    for (const auto& p : phdr) {
+bool vaddr_to_offset(const std::unique_ptr<ElfW(Phdr)[]>& phdr, size_t phnum, ElfW(Addr) vaddr, off_t *out_off) {
+    for (size_t i = 0; i < phnum; i++) {
+        const auto& p = phdr[i];
         if (p.p_type != PT_LOAD) continue;
         ElfW(Addr) seg_start = p.p_vaddr;
         ElfW(Addr) seg_end = p.p_vaddr + p.p_filesz;
@@ -54,14 +55,20 @@ bool vaddr_to_offset(const std::vector<ElfW(Phdr)>& phdr, ElfW(Addr) vaddr, off_
     return false;
 }
 
-bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, const std::vector<ElfW(Phdr)>& phdr, elf_dyn_info *out) {
+bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, const std::unique_ptr<ElfW(Phdr)[]>& phdr, elf_dyn_info *out) {
     const ElfW(Phdr) *dyn_phdr = nullptr;
-    for (const auto& p : phdr) { if (p.p_type == PT_DYNAMIC) { dyn_phdr = &p; break; } }
+    for (size_t i = 0; i < eh->e_phnum; i++) {
+        if (phdr[i].p_type == PT_DYNAMIC) {
+            dyn_phdr = &phdr[i];
+            break;
+        }
+    }
     if (!dyn_phdr || dyn_phdr->p_filesz == 0) return false;
 
     out->dyn_off = (off_t)dyn_phdr->p_offset;
 
-    for (const auto& p : phdr) {
+    for (size_t i = 0; i < eh->e_phnum; i++) {
+        const auto& p = phdr[i];
         if (p.p_type == PT_GNU_EH_FRAME) {
             out->eh_frame_hdr_vaddr = p.p_vaddr;
             out->eh_frame_hdr_sz = p.p_memsz;
@@ -78,8 +85,8 @@ bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, const std:
 
     out->dyn_sz = (size_t)dyn_phdr->p_filesz;
     size_t dyn_count = out->dyn_sz / sizeof(ElfW(Dyn));
-    std::vector<ElfW(Dyn)> dyn(dyn_count);
-    if (!read_loop_offset(fd, dyn.data(), dyn_count * sizeof(ElfW(Dyn)), out->dyn_off)) return false;
+    auto dyn = std::make_unique<ElfW(Dyn)[]>(dyn_count);
+    if (!read_loop_offset(fd, dyn.get(), dyn_count * sizeof(ElfW(Dyn)), out->dyn_off)) return false;
 
     ElfW(Addr) symtab_vaddr = 0, strtab_vaddr = 0, gnu_hash_vaddr = 0, rel_vaddr = 0, rela_vaddr = 0, jmprel_vaddr = 0;
     size_t rel_sz = 0, rela_sz = 0, jmprel_sz = 0, strsz = 0, syment = 0;
@@ -88,36 +95,37 @@ bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, const std:
     ElfW(Addr) relr_vaddr = 0; size_t relr_sz = 0;
 
     for (size_t i = 0; i < dyn_count; i++) {
-        uintptr_t tag = (uintptr_t)dyn[i].d_tag;
-        switch (tag) {
-            case DT_SYMTAB: symtab_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; break;
-            case DT_STRTAB: strtab_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; break;
-            case DT_STRSZ: strsz = (size_t)dyn[i].d_un.d_val; break;
-            case DT_SYMENT: syment = (size_t)dyn[i].d_un.d_val; break;
-            case DT_REL: rel_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; break;
-            case DT_RELSZ: rel_sz = (size_t)dyn[i].d_un.d_val; break;
-            case DT_RELA: rela_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; break;
-            case DT_RELASZ: rela_sz = (size_t)dyn[i].d_un.d_val; break;
-            case DT_JMPREL: jmprel_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; break;
-            case DT_PLTRELSZ: jmprel_sz = (size_t)dyn[i].d_un.d_val; break;
-            case DT_PLTREL: out->pltrel_type = (int)dyn[i].d_un.d_val; break;
-            case DT_GNU_HASH: gnu_hash_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; break;
-            case DT_NEEDED: out->needed_str_offsets.push_back((size_t)dyn[i].d_un.d_val); break;
-            case DT_INIT_ARRAY: out->init_array_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; break;
-            case DT_INIT_ARRAYSZ: out->init_arraysz = (size_t)dyn[i].d_un.d_val; break;
-            case DT_INIT: out->init_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; break;
-            case DT_FINI: out->fini_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; break;
-            case DT_FINI_ARRAY: out->fini_array_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; break;
-            case DT_FINI_ARRAYSZ: out->fini_arraysz = (size_t)dyn[i].d_un.d_val; break;
+        const auto& d = dyn[i]; 
+
+          switch (d.d_tag) {
+            case DT_SYMTAB: symtab_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
+            case DT_STRTAB: strtab_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
+            case DT_STRSZ: strsz = (size_t)d.d_un.d_val; break;
+            case DT_SYMENT: syment = (size_t)d.d_un.d_val; break;
+            case DT_REL: rel_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
+            case DT_RELSZ: rel_sz = (size_t)d.d_un.d_val; break;
+            case DT_RELA: rela_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
+            case DT_RELASZ: rela_sz = (size_t)d.d_un.d_val; break;
+            case DT_JMPREL: jmprel_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
+            case DT_PLTRELSZ: jmprel_sz = (size_t)d.d_un.d_val; break;
+            case DT_PLTREL: out->pltrel_type = (int)d.d_un.d_val; break;
+            case DT_GNU_HASH: gnu_hash_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
+            case DT_NEEDED: if (out->needed_count < 128) out->needed_str_offsets[out->needed_count++] = d.d_un.d_val; break;
+            case DT_INIT_ARRAY: out->init_array_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
+            case DT_INIT_ARRAYSZ: out->init_arraysz = (size_t)d.d_un.d_val; break;
+            case DT_INIT: out->init_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
+            case DT_FINI: out->fini_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
+            case DT_FINI_ARRAY: out->fini_array_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
+            case DT_FINI_ARRAYSZ: out->fini_arraysz = (size_t)d.d_un.d_val; break;
 #ifdef __ANDROID__
-            case DT_ANDROID_RELA: android_rel_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; android_is_rela = true; break;
-            case DT_ANDROID_RELASZ: android_rel_sz = (size_t)dyn[i].d_un.d_val; break;
-            case DT_ANDROID_REL: android_rel_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; android_is_rela = false; break;
-            case DT_ANDROID_RELSZ: android_rel_sz = (size_t)dyn[i].d_un.d_val; break;
+            case DT_ANDROID_RELA: android_rel_vaddr = (ElfW(Addr))d.d_un.d_ptr; android_is_rela = true; break;
+            case DT_ANDROID_RELASZ: android_rel_sz = (size_t)d.d_un.d_val; break;
+            case DT_ANDROID_REL: android_rel_vaddr = (ElfW(Addr))d.d_un.d_ptr; android_is_rela = false; break;
+            case DT_ANDROID_RELSZ: android_rel_sz = (size_t)d.d_un.d_val; break;
             case DT_ANDROID_RELR:
-            case DT_RELR: relr_vaddr = (ElfW(Addr))dyn[i].d_un.d_ptr; break;
+            case DT_RELR: relr_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
             case DT_ANDROID_RELRSZ:
-            case DT_RELRSZ: relr_sz = (size_t)dyn[i].d_un.d_val; break;
+            case DT_RELRSZ: relr_sz = (size_t)d.d_un.d_val; break;
 #endif
             case DT_NULL: i = dyn_count; break;
         }
@@ -125,34 +133,34 @@ bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, const std:
 
     if (!syment) syment = sizeof(ElfW(Sym));
     if (!symtab_vaddr || !strtab_vaddr || !strsz) return false;
-    if (!vaddr_to_offset(phdr, symtab_vaddr, &out->symtab_off) || !vaddr_to_offset(phdr, strtab_vaddr, &out->strtab_off)) return false;
+    if (!vaddr_to_offset(phdr, eh->e_phnum, symtab_vaddr, &out->symtab_off) || !vaddr_to_offset(phdr, eh->e_phnum, strtab_vaddr, &out->strtab_off)) return false;
 
-    if (rel_vaddr && rel_sz) { if (!vaddr_to_offset(phdr, rel_vaddr, &out->rel_off)) return false; out->rel_sz = rel_sz; }
-    if (rela_vaddr && rela_sz) { if (!vaddr_to_offset(phdr, rela_vaddr, &out->rela_off)) return false; out->rela_sz = rela_sz; }
-    if (jmprel_vaddr && jmprel_sz) { if (!vaddr_to_offset(phdr, jmprel_vaddr, &out->jmprel_off)) return false; out->jmprel_sz = jmprel_sz; }
+    if (rel_vaddr && rel_sz) { if (!vaddr_to_offset(phdr, eh->e_phnum, rel_vaddr, &out->rel_off)) return false; out->rel_sz = rel_sz; }
+    if (rela_vaddr && rela_sz) { if (!vaddr_to_offset(phdr, eh->e_phnum, rela_vaddr, &out->rela_off)) return false; out->rela_sz = rela_sz; }
+    if (jmprel_vaddr && jmprel_sz) { if (!vaddr_to_offset(phdr, eh->e_phnum, jmprel_vaddr, &out->jmprel_off)) return false; out->jmprel_sz = jmprel_sz; }
 
     if (android_rel_vaddr && android_rel_sz) {
-        if (vaddr_to_offset(phdr, android_rel_vaddr, &out->android_rel_off)) {
+        if (vaddr_to_offset(phdr, eh->e_phnum, android_rel_vaddr, &out->android_rel_off)) {
             out->android_rel_sz = android_rel_sz;
             out->android_is_rela = android_is_rela;
         }
     }
 
     if (relr_vaddr && relr_sz) {
-        if (vaddr_to_offset(phdr, relr_vaddr, &out->relr_off)) {
+        if (vaddr_to_offset(phdr, eh->e_phnum, relr_vaddr, &out->relr_off)) {
             out->relr_sz = relr_sz;
         }
     }
 
-    out->strtab.resize(strsz + 1);
-    if (!read_loop_offset(fd, out->strtab.data(), strsz, out->strtab_off)) return false;
+    out->strtab = std::make_unique<char[]>(strsz + 1);
+    if (!read_loop_offset(fd, out->strtab.get(), strsz, out->strtab_off)) return false;
     out->strtab[strsz] = '\0';
     out->syment = syment;
     out->strsz = strsz;
 
     if (gnu_hash_vaddr) {
         off_t gnu_hash_off = 0;
-        if (vaddr_to_offset(phdr, gnu_hash_vaddr, &gnu_hash_off)) {
+        if (vaddr_to_offset(phdr, eh->e_phnum, gnu_hash_vaddr, &gnu_hash_off)) {
             uint32_t header[4];
             if (read_loop_offset(fd, header, sizeof(header), gnu_hash_off)) {
                 uint32_t nbuckets = header[0];
@@ -169,8 +177,9 @@ bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, const std:
 
                 // Safety check for large nbuckets
                 if (nbuckets <= 1024 * 1024) {
-                    out->gnu_buckets.resize(nbuckets);
-                    if (read_loop_offset(fd, out->gnu_buckets.data(), nbuckets * sizeof(uint32_t), buckets_off)) {
+                    out->gnu_buckets = std::make_unique<uint32_t[]>(nbuckets);
+                    out->gnu_buckets_size = nbuckets;
+                    if (read_loop_offset(fd, out->gnu_buckets.get(), nbuckets * sizeof(uint32_t), buckets_off)) {
                         for (uint32_t b = 0; b < nbuckets; b++) {
                             if (out->gnu_buckets[b] > max_bucket) max_bucket = out->gnu_buckets[b];
                         }
@@ -198,13 +207,15 @@ bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, const std:
                         out->nsyms = out->gnu_symndx;
                     }
 
-                    out->gnu_bloom_filter.resize(bloom_size);
-                    read_loop_offset(fd, out->gnu_bloom_filter.data(), bloom_size * sizeof(ElfW(Addr)), bloom_off);
+                    out->gnu_bloom_filter = std::make_unique<ElfW(Addr)[]>(bloom_size);
+                    out->gnu_bloom_filter_size = bloom_size;
+                    read_loop_offset(fd, out->gnu_bloom_filter.get(), bloom_size * sizeof(ElfW(Addr)), bloom_off);
 
                     if (out->nsyms > out->gnu_symndx) {
                         uint32_t num_chains = out->nsyms - out->gnu_symndx;
-                        out->gnu_chains.resize(num_chains);
-                        read_loop_offset(fd, out->gnu_chains.data(), num_chains * sizeof(uint32_t), chains_off);
+                        out->gnu_chains = std::make_unique<uint32_t[]>(num_chains);
+                        out->gnu_chains_size = num_chains;
+                        read_loop_offset(fd, out->gnu_chains.get(), num_chains * sizeof(uint32_t), chains_off);
                     }
                 }
             }
@@ -212,8 +223,8 @@ bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, const std:
     }
 
     if (out->nsyms > 0) {
-        out->symtab.resize(out->nsyms);
-        if (!read_loop_offset(fd, out->symtab.data(), out->nsyms * sizeof(ElfW(Sym)), out->symtab_off)) {
+        out->symtab = std::make_unique<ElfW(Sym)[]>(out->nsyms);
+        if (!read_loop_offset(fd, out->symtab.get(), out->nsyms * sizeof(ElfW(Sym)), out->symtab_off)) {
             return false;
         }
     }
@@ -229,20 +240,20 @@ static uint32_t calc_gnu_hash(const char *name) {
 }
 
 bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr) *out_value, uint8_t *out_type) {
-    if (!info->gnu_buckets.empty() && !info->gnu_bloom_filter.empty()) {
+    if (info->gnu_buckets != nullptr && info->gnu_bloom_filter != nullptr) {
         uint32_t hash = calc_gnu_hash(sym_name);
         uint32_t h2 = hash >> info->gnu_shift2;
-        uint32_t word_num = (hash / (sizeof(ElfW(Addr)) * 8)) & (info->gnu_bloom_filter.size() - 1);
+        uint32_t word_num = (hash / (sizeof(ElfW(Addr)) * 8)) & (info->gnu_bloom_filter_size - 1);
 
         ElfW(Addr) mask = (((ElfW(Addr))1) << (hash % (sizeof(ElfW(Addr)) * 8))) |
                           (((ElfW(Addr))1) << (h2 % (sizeof(ElfW(Addr)) * 8)));
 
         if ((info->gnu_bloom_filter[word_num] & mask) == mask) {
-            uint32_t sym_idx = info->gnu_buckets[hash % info->gnu_buckets.size()];
+            uint32_t sym_idx = info->gnu_buckets[hash % info->gnu_buckets_size];
             if (sym_idx >= info->gnu_symndx) {
                 uint32_t chain_idx = sym_idx - info->gnu_symndx;
 
-                while (chain_idx < info->gnu_chains.size()) {
+                while (chain_idx < info->gnu_chains_size) {
                     uint32_t chain_val = info->gnu_chains[chain_idx];
                     if ((chain_val | 1) == (hash | 1)) {
                         const ElfW(Sym)& sym = info->symtab[sym_idx];

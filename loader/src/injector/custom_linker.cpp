@@ -142,7 +142,7 @@ struct LoadedModule {
 #endif
 
 static bool resolve_symbol_addr(const elf_dyn_info *info,
-                                const std::vector<const char*>& needed_paths,
+                                const char** needed_paths, size_t needed_count,
                                 const std::vector<LoadedModule>& loaded_modules,
                                 uintptr_t load_bias, size_t sym_idx, uintptr_t *out_addr) {
 
@@ -176,7 +176,8 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
         return true;
     }
 
-    for (const auto& mod_path : needed_paths) {
+    for (size_t k = 0; k < needed_count; k++) {
+        const char* mod_path = needed_paths[k];
         if (!mod_path || !*mod_path) continue;
         // First try to resolve within our newly loaded modules
         for (const auto& mod : loaded_modules) {
@@ -372,12 +373,13 @@ static uintptr_t decode_eh_value(uint8_t enc, const uint8_t **p, uintptr_t base,
 }
 
 static bool apply_rela_section(int fd, [[maybe_unused]] const elf_dyn_info *info,
-                               [[maybe_unused]] const std::vector<const char*>& needed_paths,
+                               [[maybe_unused]] const char** needed_paths, 
+                               [[maybe_unused]] size_t needed_count,
                                [[maybe_unused]] const std::vector<LoadedModule>& loaded_modules,
                                uintptr_t load_bias, off_t rela_off, size_t rela_sz) {
     size_t count = rela_sz / sizeof(ElfW(Rela));
-    std::vector<ElfW(Rela)> rels(count);
-    if (!read_loop_offset(fd, rels.data(), rela_sz, rela_off)) return false;
+    auto rels = std::make_unique<ElfW(Rela)[]>(count);
+    if (!read_loop_offset(fd, rels.get(), rela_sz, rela_off)) return false;
 
     for (size_t i = 0; i < count; i++) {
         const ElfW(Rela)& r = rels[i];
@@ -391,7 +393,7 @@ static bool apply_rela_section(int fd, [[maybe_unused]] const elf_dyn_info *info
         if (type == R_AARCH64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))r.r_addend;
         else if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT || type == R_AARCH64_ABS64) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
+            if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
             value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))r.r_addend : 0;
         } else if (type == R_AARCH64_TLS_DTPMOD) {
             value = info->tls_mod_id;
@@ -402,7 +404,7 @@ static bool apply_rela_section(int fd, [[maybe_unused]] const elf_dyn_info *info
             uintptr_t sym_addr = 0;
             if (sym == 0) {
                 value = info->tls_segment_vaddr + r.r_addend;
-            } else if (resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) {
+            } else if (resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) {
                 value = sym_addr - load_bias + info->tls_segment_vaddr;
             }
         } else return false;
@@ -410,7 +412,7 @@ static bool apply_rela_section(int fd, [[maybe_unused]] const elf_dyn_info *info
         if (type == R_X86_64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))r.r_addend;
         else if (type == R_X86_64_GLOB_DAT || type == R_X86_64_JUMP_SLOT || type == R_X86_64_64) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
+            if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
             value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))r.r_addend : 0;
         } else if (type == R_X86_64_DTPMOD64) {
             value = info->tls_mod_id;
@@ -421,7 +423,7 @@ static bool apply_rela_section(int fd, [[maybe_unused]] const elf_dyn_info *info
             uintptr_t sym_addr = 0;
             if (sym == 0) {
                 value = info->tls_segment_vaddr + r.r_addend;
-            } else if (resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) {
+            } else if (resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) {
                 value = sym_addr - load_bias + info->tls_segment_vaddr;
             }
         } else return false;
@@ -435,12 +437,13 @@ static bool apply_rela_section(int fd, [[maybe_unused]] const elf_dyn_info *info
 }
 
 static bool apply_rel_section(int fd, [[maybe_unused]] const elf_dyn_info *info,
-                              [[maybe_unused]] const std::vector<const char*>& needed_paths,
+                              [[maybe_unused]] const char** needed_paths,
+                              [[maybe_unused]] size_t needed_count,
                               [[maybe_unused]] const std::vector<LoadedModule>& loaded_modules,
                               uintptr_t load_bias, off_t rel_off, size_t rel_sz) {
     size_t count = rel_sz / sizeof(ElfW(Rel));
-    std::vector<ElfW(Rel)> rels(count);
-    if (!read_loop_offset(fd, rels.data(), rel_sz, rel_off)) return false;
+    auto rels = std::make_unique<ElfW(Rel)[]>(count);
+    if (!read_loop_offset(fd, rels.get(), rel_sz, rel_off)) return false;
 
     for (size_t i = 0; i < count; i++) {
         const ElfW(Rel)& r = rels[i];
@@ -457,7 +460,7 @@ static bool apply_rel_section(int fd, [[maybe_unused]] const elf_dyn_info *info,
             value = (ElfW(Addr))load_bias + addend;
         } else if (type == R_ARM_GLOB_DAT || type == R_ARM_JUMP_SLOT || type == R_ARM_ABS32) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
+            if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
             if (sym_addr == 0) value = 0;
             else if (type == R_ARM_ABS32) {
                 addend = *reinterpret_cast<ElfW(Addr)*>(target);
@@ -472,7 +475,7 @@ static bool apply_rel_section(int fd, [[maybe_unused]] const elf_dyn_info *info,
             uintptr_t sym_addr = 0;
             if (sym == 0) {
                 value = info->tls_segment_vaddr;
-            } else if (resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) {
+            } else if (resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) {
                 value = sym_addr - load_bias + info->tls_segment_vaddr;
             }
         } else return false;
@@ -482,7 +485,7 @@ static bool apply_rel_section(int fd, [[maybe_unused]] const elf_dyn_info *info,
             value = (ElfW(Addr))load_bias + addend;
         } else if (type == R_386_GLOB_DAT || type == R_386_JMP_SLOT || type == R_386_32) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
+            if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
             if (sym_addr == 0) value = 0;
             else if (type == R_386_32) {
                 addend = *reinterpret_cast<ElfW(Addr)*>(target);
@@ -497,7 +500,7 @@ static bool apply_rel_section(int fd, [[maybe_unused]] const elf_dyn_info *info,
             uintptr_t sym_addr = 0;
             if (sym == 0) {
                 value = info->tls_segment_vaddr;
-            } else if (resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, sym, &sym_addr)) {
+            } else if (resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) {
                 value = sym_addr - load_bias + info->tls_segment_vaddr;
             }
         } else return false;
@@ -510,19 +513,19 @@ static bool apply_rel_section(int fd, [[maybe_unused]] const elf_dyn_info *info,
 }
 
 static bool apply_android_relocations(int fd, const elf_dyn_info *info,
-                                      const std::vector<const char*>& needed_paths,
+                                      const char** needed_paths, size_t needed_count,
                                       const std::vector<LoadedModule>& loaded_modules,
                                       uintptr_t load_bias, off_t reloc_off, size_t reloc_sz, bool is_rela) {
-    std::vector<uint8_t> reloc_data(reloc_sz);
-    if (!read_loop_offset(fd, reloc_data.data(), reloc_sz, reloc_off)) return false;
+    auto reloc_data = std::make_unique<uint8_t[]>(reloc_sz);
+    if (!read_loop_offset(fd, reloc_data.get(), reloc_sz, reloc_off)) return false;
 
-    if (reloc_sz < 4 || memcmp(reloc_data.data(), "APS2", 4) != 0) {
+    if (reloc_sz < 4 || memcmp(reloc_data.get(), "APS2", 4) != 0) {
         LOGE("Invalid Android REL/RELA magic");
         return false;
     }
 
     sleb128_decoder decoder;
-    sleb128_decoder_init(&decoder, reloc_data.data() + 4, reloc_sz - 4);
+    sleb128_decoder_init(&decoder, reloc_data.get() + 4, reloc_sz - 4);
 
     uint64_t num_relocs = sleb128_decode(&decoder);
     ElfW(Addr) current_offset = sleb128_decode(&decoder);
@@ -590,7 +593,7 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
             if (current_type == R_AARCH64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
             else if (current_type == R_AARCH64_GLOB_DAT || current_type == R_AARCH64_JUMP_SLOT || current_type == R_AARCH64_ABS64) {
                 uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
+                if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
                 value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
             } else if (current_type == R_AARCH64_TLS_DTPMOD) {
                 value = info->tls_mod_id;
@@ -601,7 +604,7 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
                 uintptr_t sym_addr = 0;
                 if (current_sym_idx == 0) {
                     value = info->tls_segment_vaddr + current_addend;
-                } else if (resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+                } else if (resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
                     value = sym_addr - load_bias + info->tls_segment_vaddr; // Rough TPREL emulation without tpidr thread-context
                 }
             } else return false;
@@ -609,7 +612,7 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
             if (current_type == R_X86_64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
             else if (current_type == R_X86_64_GLOB_DAT || current_type == R_X86_64_JUMP_SLOT || current_type == R_X86_64_64) {
                 uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
+                if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
                 value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
             } else if (current_type == R_X86_64_DTPMOD64) {
                 value = info->tls_mod_id;
@@ -620,7 +623,7 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
                 uintptr_t sym_addr = 0;
                 if (current_sym_idx == 0) {
                     value = info->tls_segment_vaddr + current_addend;
-                } else if (resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+                } else if (resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
                     value = sym_addr - load_bias + info->tls_segment_vaddr;
                 }
             } else return false;
@@ -630,7 +633,7 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
                 value = (ElfW(Addr))load_bias + addend_rel;
             } else if (current_type == R_ARM_GLOB_DAT || current_type == R_ARM_JUMP_SLOT || current_type == R_ARM_ABS32) {
                 uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
+                if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
                 if (sym_addr == 0) value = 0;
                 else if (current_type == R_ARM_ABS32) {
                     ElfW(Addr) addend_rel = *reinterpret_cast<ElfW(Addr)*>(target);
@@ -645,7 +648,7 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
                 uintptr_t sym_addr = 0;
                 if (current_sym_idx == 0) {
                     value = info->tls_segment_vaddr + current_addend;
-                } else if (resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+                } else if (resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
                     value = sym_addr - load_bias + info->tls_segment_vaddr;
                 }
             } else return false;
@@ -655,7 +658,7 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
                 value = (ElfW(Addr))load_bias + addend_rel;
             } else if (current_type == R_386_GLOB_DAT || current_type == R_386_JMP_SLOT || current_type == R_386_32) {
                 uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
+                if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
                 if (sym_addr == 0) value = 0;
                 else if (current_type == R_386_32) {
                     ElfW(Addr) addend_rel = *reinterpret_cast<ElfW(Addr)*>(target);
@@ -670,7 +673,7 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
                 uintptr_t sym_addr = 0;
                 if (current_sym_idx == 0) {
                     value = info->tls_segment_vaddr + current_addend;
-                } else if (resolve_symbol_addr(info, needed_paths, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+                } else if (resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
                     value = sym_addr - load_bias + info->tls_segment_vaddr;
                 }
             } else return false;
@@ -687,8 +690,8 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
 
 static bool apply_relr_section(int fd, uintptr_t load_bias, off_t relr_off, size_t relr_sz) {
     size_t count = relr_sz / sizeof(ElfW(Addr));
-    std::vector<ElfW(Addr)> relr(count);
-    if (!read_loop_offset(fd, relr.data(), relr_sz, relr_off)) return false;
+    auto relr = std::make_unique<ElfW(Addr)[]>(count);
+    if (!read_loop_offset(fd, relr.get(), relr_sz, relr_off)) return false;
 
     const size_t bits_per_entry = sizeof(ElfW(Addr)) * 8;
     ElfW(Addr) base_offset = 0;
@@ -740,8 +743,11 @@ static bool apply_module_relocations(int memfd, LoadedModule& mod, const std::ve
         return false;
     }
 
-    std::vector<const char*> needed_paths(mod.dinfo.needed_str_offsets.size(), nullptr);
-    for (size_t i = 0; i < mod.dinfo.needed_str_offsets.size(); i++) {
+    size_t needed_count = mod.dinfo.needed_count;
+    const char** needed_paths = (const char**)alloca(needed_count * sizeof(const char*));
+    memset(needed_paths, 0, needed_count * sizeof(const char*));
+
+    for (size_t i = 0; i < needed_count; i++) {
         size_t off = mod.dinfo.needed_str_offsets[i];
         if (off < mod.dinfo.strsz) {
             const char *soname = &mod.dinfo.strtab[off];
@@ -757,21 +763,21 @@ static bool apply_module_relocations(int memfd, LoadedModule& mod, const std::ve
     }
 
     if (mod.dinfo.rela_sz && mod.dinfo.rela_off) {
-        if (!apply_rela_section(fd, &mod.dinfo, needed_paths, loaded_modules, mod.load_bias, mod.dinfo.rela_off, mod.dinfo.rela_sz)) return false;
+        if (!apply_rela_section(fd, &mod.dinfo, needed_paths, needed_count, loaded_modules, mod.load_bias, mod.dinfo.rela_off, mod.dinfo.rela_sz)) return false;
     }
     if (mod.dinfo.rel_sz && mod.dinfo.rel_off) {
-        if (!apply_rel_section(fd, &mod.dinfo, needed_paths, loaded_modules, mod.load_bias, mod.dinfo.rel_off, mod.dinfo.rel_sz)) return false;
+        if (!apply_rel_section(fd, &mod.dinfo, needed_paths, needed_count, loaded_modules, mod.load_bias, mod.dinfo.rel_off, mod.dinfo.rel_sz)) return false;
     }
     if (mod.dinfo.jmprel_sz && mod.dinfo.jmprel_off) {
         if (mod.dinfo.pltrel_type == DT_RELA) {
-            if (!apply_rela_section(fd, &mod.dinfo, needed_paths, loaded_modules, mod.load_bias, mod.dinfo.jmprel_off, mod.dinfo.jmprel_sz)) return false;
+            if (!apply_rela_section(fd, &mod.dinfo, needed_paths, needed_count, loaded_modules, mod.load_bias, mod.dinfo.jmprel_off, mod.dinfo.jmprel_sz)) return false;
         } else {
-            if (!apply_rel_section(fd, &mod.dinfo, needed_paths, loaded_modules, mod.load_bias, mod.dinfo.jmprel_off, mod.dinfo.jmprel_sz)) return false;
+            if (!apply_rel_section(fd, &mod.dinfo, needed_paths, needed_count, loaded_modules, mod.load_bias, mod.dinfo.jmprel_off, mod.dinfo.jmprel_sz)) return false;
         }
     }
 
     if (mod.dinfo.android_rel_sz && mod.dinfo.android_rel_off) {
-        if (!apply_android_relocations(fd, &mod.dinfo, needed_paths, loaded_modules, mod.load_bias, mod.dinfo.android_rel_off, mod.dinfo.android_rel_sz, mod.dinfo.android_is_rela)) return false;
+        if (!apply_android_relocations(fd, &mod.dinfo, needed_paths, needed_count, loaded_modules, mod.load_bias, mod.dinfo.android_rel_off, mod.dinfo.android_rel_sz, mod.dinfo.android_is_rela)) return false;
     }
     if (mod.dinfo.relr_sz && mod.dinfo.relr_off) {
         if (!apply_relr_section(fd, mod.load_bias, mod.dinfo.relr_off, mod.dinfo.relr_sz)) return false;
@@ -793,7 +799,7 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
     if (fd < 0) return false;
 
     ElfW(Ehdr) eh;
-    std::vector<ElfW(Phdr)> phdr;
+    std::unique_ptr<ElfW(Phdr)[]> phdr;
     ElfW(Addr) min_vaddr = 0;
     size_t map_size = 0;
 
@@ -805,7 +811,8 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
 
     uintptr_t load_bias = remote_base - (uintptr_t)min_vaddr;
     struct SegInfo { uintptr_t addr; size_t len; int prot; };
-    std::vector<SegInfo> segs;
+    SegInfo segs[64];
+    size_t seg_count = 0;
 
     for (int i = 0; i < eh.e_phnum; i++) {
         if (phdr[i].p_type != PT_LOAD) continue;
@@ -836,7 +843,11 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
         if (phdr[i].p_flags & PF_R) prot |= PROT_READ;
         if (phdr[i].p_flags & PF_W) prot |= PROT_WRITE;
         if (phdr[i].p_flags & PF_X) prot |= PROT_EXEC;
-        segs.push_back({seg_page, seg_page_len, prot});
+        if (seg_count < 64) {
+            segs[seg_count++] = {seg_page, seg_page_len, prot};
+        } else {
+            LOGW("Too many segments in the ELF, some may not have correct permissions set");
+        }
     }
 
     elf_dyn_info dinfo;
@@ -944,10 +955,10 @@ static bool load_dependencies_recursive(const char *lib_path, int memfd, std::ve
 
     loaded_modules.push_back(std::move(mod));
     size_t current_idx = loaded_modules.size() - 1;
+    size_t offsets_count = loaded_modules[current_idx].dinfo.needed_count;
 
-    std::vector<size_t> needed_offsets = loaded_modules[current_idx].dinfo.needed_str_offsets;
-
-    for (size_t off : needed_offsets) {
+    for (size_t i = 0; i < offsets_count; i++) {
+        size_t off = loaded_modules[current_idx].dinfo.needed_str_offsets[i];
         if (off >= loaded_modules[current_idx].dinfo.strsz) continue;
 
         const char *dep_soname = &loaded_modules[current_idx].dinfo.strtab[off];

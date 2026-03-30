@@ -15,7 +15,8 @@
 
 #include "constants.hpp"
 #include "logging.hpp"
-#include "utils.hpp" // For UniquePipe
+#include "daemon.hpp" // UniqueFd
+#include "utils.hpp" // UniquePipe, StringList, IntList
 
 namespace magisk {
 
@@ -23,10 +24,10 @@ namespace magisk {
 struct Cache {
     struct timespec db_mtime = {0, -1};
     struct timespec pkg_mtime = {0, -1};
-    std::vector<int32_t> granted_uids;
-    std::vector<int32_t> denylist_uids;
-    std::vector<std::string> denylist_pkgs;
-    std::vector<int32_t> all_known_uids;
+    IntList granted_uids;
+    IntList denylist_uids;
+    StringList denylist_pkgs;
+    IntList all_known_uids;
     bool manager_resolved = false;
     int32_t manager_uid = -1;
 };
@@ -202,16 +203,16 @@ public:
         return result;
     }
 
-    std::vector<int32_t> get_int_list(const char* query) {
-        std::vector<int32_t> result;
+    IntList get_int_list(const char* query) {
+        IntList result;
         if (!is_valid() || !fn_prepare || !fn_step || !fn_column_text || !fn_finalize) return result;
         void* stmt = nullptr;
 
         if (fn_prepare(db, query, -1, &stmt, nullptr) == SQLITE_OK) {
             while (fn_step(stmt) == SQLITE_ROW) {
-                const unsigned char* text = fn_column_text(stmt, 0);
+                const char* text = (const char*)fn_column_text(stmt, 0);
                 if (text) {
-                    result.push_back(atoi((const char*)text));
+                    result.push_back(atoi(text));
                 }
             }
             fn_finalize(stmt);
@@ -219,16 +220,16 @@ public:
         return result;
     }
 
-    std::vector<std::string> get_string_list(const char* query) {
-        std::vector<std::string> result;
+    StringList get_string_list(const char* query) {
+        StringList result;
         if (!is_valid() || !fn_prepare || !fn_step || !fn_column_text || !fn_finalize) return result;
         void* stmt = nullptr;
 
         if (fn_prepare(db, query, -1, &stmt, nullptr) == SQLITE_OK) {
             while (fn_step(stmt) == SQLITE_ROW) {
-                const unsigned char* text = fn_column_text(stmt, 0);
+                const char* text = (const char*)fn_column_text(stmt, 0);
                 if (text) {
-                    result.push_back((const char*)text);
+                    result.push_back(text);
                 }
             }
             fn_finalize(stmt);
@@ -237,29 +238,50 @@ public:
     }
 };
 
-template<typename T>
-static bool vector_contains(const std::vector<T>& vec, const T& value) {
-    return std::binary_search(vec.begin(), vec.end(), value);
-}
-
 static inline int cmp_int(const void* a, const void* b) {
     return (*(int32_t*)a - *(int32_t*)b);
 }
 
 static inline int cmp_str(const void* a, const void* b) {
-    return static_cast<const std::string*>(a)->compare(*static_cast<const std::string*>(b));
+    return strcmp(*(const char**)a, *(const char**)b);
 }
 
-static void sort_uids(std::vector<int32_t>& vec) {
-    if (vec.empty()) return;
-    qsort(vec.data(), vec.size(), sizeof(int32_t), cmp_int);
-    vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
+static void sort_pkgs(StringList& list) {
+    if (list.size == 0) return;
+    qsort(list.data, list.size, sizeof(char*), cmp_str);
+
+    size_t unique_count = 1;
+    for (size_t i = 1; i < list.size; ++i) {
+        if (strcmp(list.data[i], list.data[unique_count - 1]) != 0) {
+            list.data[unique_count++] = list.data[i];
+        } else {
+            free(list.data[i]); 
+        }
+    }
+    list.size = unique_count;
 }
 
-static void sort_pkgs(std::vector<std::string>& vec) {
-    if (vec.empty()) return;
-    qsort(vec.data(), vec.size(), sizeof(std::string), cmp_str);
-    vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
+static void sort_uids(IntList& list) {
+    if (list.size == 0) return;
+    qsort(list.data, list.size, sizeof(int32_t), cmp_int);
+
+    size_t unique_count = 1;
+    for (size_t i = 1; i < list.size; ++i) {
+        if (list.data[i] != list.data[unique_count - 1]) {
+            list.data[unique_count++] = list.data[i];
+        }
+    }
+    list.size = unique_count;
+}
+
+static bool list_contains_uid(auto& list, int32_t value) {
+    if (list.size == 0) return false;
+    return bsearch(&value, list.data, list.size, sizeof(int32_t), cmp_int) != nullptr;
+}
+
+static bool list_contains_pkg(auto& list, auto value) {
+    if (list.size == 0) return false;
+    return bsearch(&value, list.data, list.size, sizeof(char*), cmp_str) != nullptr;
 }
 
 // --- General Magisk Detection ---
@@ -337,7 +359,7 @@ static void update_cache() {
     g_cache.manager_resolved = false;
 
     MagiskDB db;
-    std::vector<std::string> denylist_pkgs;
+    StringList denylist_pkgs;
 
     if (db.is_valid()) {
         g_cache.granted_uids = db.get_int_list("SELECT uid FROM policies WHERE policy=2");
@@ -379,7 +401,7 @@ static void update_cache() {
                 pos += 13;
                 size_t end = out.find('\n', pos);
                 if (end == std::string::npos) end = out.length();
-                denylist_pkgs.push_back(out.substr(pos, end - pos));
+                denylist_pkgs.push_back(std::string_view(out.data() + pos, end - pos));
             }
         }
 
@@ -413,9 +435,8 @@ static void update_cache() {
 
     // Resolve denylist packages to UIDs via packages.list once
     // and track all known UIDs to prevent fallback N+1 executions
-    std::vector<std::string> target_pkgs = denylist_pkgs;
-    sort_pkgs(target_pkgs);
-    g_cache.denylist_pkgs = target_pkgs;
+    sort_pkgs(denylist_pkgs);
+    g_cache.denylist_pkgs = std::move(denylist_pkgs);
 
     UniqueFile fp(fopen("/data/system/packages.list", "re"));
     if (fp) {
@@ -433,7 +454,7 @@ static void update_cache() {
             int32_t parsed_uid = atoi(uid_str);
             g_cache.all_known_uids.push_back(parsed_uid);
 
-            if (std::binary_search(target_pkgs.begin(), target_pkgs.end(), pkg_name)) {
+            if (bsearch(&pkg_name, g_cache.denylist_pkgs.data, g_cache.denylist_pkgs.size, sizeof(char*), cmp_str) != nullptr) {
                 g_cache.denylist_uids.push_back(parsed_uid);
             }
         }
@@ -445,7 +466,7 @@ static void update_cache() {
     g_cache.pkg_mtime = pkg_st.st_mtim;
 }
 
-static bool is_valid_pkg_name(const std::string& pkg_name) {
+static bool is_valid_pkg_name(const std::string_view& pkg_name) {
     if (pkg_name.empty() || pkg_name.length() > 255) return false;
     for (char c : pkg_name) {
         if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
@@ -457,18 +478,14 @@ static bool is_valid_pkg_name(const std::string& pkg_name) {
 }
 
 
-static bool get_package_by_uid_from_xml(int32_t uid, std::string& pkg_name) {
-    int fd = open("/data/system/packages.xml", O_RDONLY | O_CLOEXEC);
+static bool get_package_by_uid_from_xml(int32_t uid, auto& pkg_name) {
+    UniqueFd fd(open("/data/system/packages.xml", O_RDONLY | O_CLOEXEC));
     if (fd < 0) return false;
 
     struct stat st;
-    if (fstat(fd, &st) < 0) {
-        close(fd);
-        return false;
-    }
+    if (fstat(fd, &st) < 0) return false;
 
     const char* map = (const char*)mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
 
     if (map == MAP_FAILED) return false;
 
@@ -496,7 +513,7 @@ static bool get_package_by_uid_from_xml(int32_t uid, std::string& pkg_name) {
             name_pos += 6;
             const char* end_pos = (const char*)memchr(name_pos, '\"', pos - name_pos);
             if (end_pos) {
-                pkg_name.assign(name_pos, end_pos - name_pos);
+                pkg_name = std::string_view(name_pos, end_pos - name_pos);
                 found = true;
             }
         }
@@ -509,18 +526,18 @@ static bool get_package_by_uid_from_xml(int32_t uid, std::string& pkg_name) {
 bool uid_granted_root(int32_t uid) {
     update_cache();
     std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
-    return vector_contains(g_cache.granted_uids, uid);
+    return list_contains_uid(g_cache.granted_uids, uid);
 }
 
 bool uid_should_umount(int32_t uid) {
     update_cache();
     std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
-    if (vector_contains(g_cache.denylist_uids, uid)) return true;
-    if (vector_contains(g_cache.all_known_uids, uid)) return false;
+    if (list_contains_uid(g_cache.denylist_uids, uid)) return true;
+    if (list_contains_uid(g_cache.all_known_uids, uid)) return false;
     lock.unlock(); // Release lock before executing external command
 
     // Fallback for missing packages in packages.list (e.g. freshly installed or system apps)
-    std::string pkg_name;
+    std::string_view pkg_name;
     if (!get_package_by_uid_from_xml(uid, pkg_name)) {
         return false;
     }
@@ -528,7 +545,7 @@ bool uid_should_umount(int32_t uid) {
     if (pkg_name.empty() || !is_valid_pkg_name(pkg_name)) return false;
 
     lock.lock();
-    return vector_contains(g_cache.denylist_pkgs, pkg_name);
+    return list_contains_pkg(g_cache.denylist_pkgs, pkg_name);
 }
 
 bool uid_is_manager(int32_t uid) {

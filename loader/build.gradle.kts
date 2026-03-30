@@ -38,7 +38,7 @@ val defaultCFlags = arrayOf(
 )
 
 val releaseFlags = arrayOf(
-    "-O3", "-flto",
+    "-Oz", "-flto",
     "-Wno-unused", "-Wno-unused-parameter",
     "-fvisibility=hidden", "-fvisibility-inlines-hidden",
     "-fno-unwind-tables", "-fno-asynchronous-unwind-tables"
@@ -46,7 +46,7 @@ val releaseFlags = arrayOf(
 
 val linkerFlags = arrayOf(
     "-Wl,--exclude-libs,ALL", "-Wl,--gc-sections", 
-    "-Wl,--strip-all", "-Wl,--lto-O3",
+    "-Wl,--strip-all", "-Wl,-z,norelro",
     "-Wl,--build-id=none", "-Wl,-s", "-fno-plt",
     "-Wl,--icf=all", "-Wl,--as-needed",
     "-Wl,-Bsymbolic", "-Wl,--hash-style=gnu"

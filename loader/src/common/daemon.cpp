@@ -190,24 +190,37 @@ int UpdateMountNamespace(MountNamespace type) {
     return namespace_fd;
 }
 
-std::vector<Module> ReadModules() {
-    std::vector<Module> modules;
+size_t ReadModules(Module* out_modules, size_t max_modules) {
+    size_t count = 0;
     UniqueFd fd = Connect(1);
     if (fd == -1) {
         PLOGE("ReadModules");
-        return modules;
+        return count;
     }
-    socket_utils::write_u8(fd, (uint8_t) SocketAction::ReadModules);
-    size_t len = socket_utils::read_usize(fd);
-    for (size_t i = 0; i < len; i++) {
+
+    uint8_t request = static_cast<uint8_t>(constants::DaemonSocketAction::ReadModules);
+    socket_utils::write_u8(fd, request);
+
+    size_t total_modules = socket_utils::read_usize(fd);
+    for (size_t i = 0; i < total_modules; ++i) {
+        // Read directly into a raw stack buffer
         char name_buf[256];
         socket_utils::read_string(fd, name_buf, sizeof(name_buf));
-        int module_fd = socket_utils::recv_fd(fd);
-        modules.emplace_back(name_buf, module_fd);
-        memzero(&module_fd, sizeof(module_fd));
-        memzero(name_buf, sizeof(name_buf));
+        
+        // Receive the file descriptor (commonly named recv_fd or read_fd)
+        // Using assignment '=' prevents C++ "Most Vexing Parse" compiler bug
+        UniqueFd lib_fd = UniqueFd(socket_utils::recv_fd(fd)); 
+        
+        if (count < max_modules) {
+            // Safely copy the string into the module's raw char array
+            strlcpy(out_modules[count].name, name_buf, sizeof(out_modules[count].name));
+            // Transfer ownership of the file descriptor
+            out_modules[count].memfd = std::move(lib_fd);
+            count++;
+        }
+        // If count >= max_modules, lib_fd goes out of scope here and automatically closes
     }
-    return modules;
+    return count;
 }
 
 int ConnectCompanion(size_t index) {

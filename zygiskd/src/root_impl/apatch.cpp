@@ -21,7 +21,7 @@ namespace apatch {
 
 struct ConfigData {
     struct timespec mtim;
-    std::vector<uint32_t> packages; // bit-packed: 0-29 uid, 30 allow, 31 exclude
+    IntList packages; // bit-packed: 0-29 uid, 30 allow, 31 exclude
 };
 
 static const char* CONFIG_FILE = "/data/adb/ap/package_config";
@@ -103,13 +103,12 @@ static const ConfigData* get_config() {
             const char* end = start + st.st_size;
 
             // Count newlines to preallocate vector and avoid reallocations
-            size_t lines = 0;
+            [[maybe_unused]] size_t lines = 0;
             const char* p_count = start;
             while ((p_count = static_cast<const char*>(memchr(p_count, '\n', end - p_count)))) {
                 lines++;
                 p_count++;
             }
-            new_config->packages.reserve(lines);
 
             // Skip header: find first newline
             const char* p = static_cast<const char*>(memchr(start, '\n', end - start));
@@ -156,11 +155,17 @@ static const ConfigData* get_config() {
         }
     }
 
-    qsort(new_config->packages.data(), new_config->packages.size(), sizeof(uint32_t), [](const void* a, const void* b) {
-        uint32_t v1 = *(uint32_t*)a & 0x3FFFFFFF;
-        uint32_t v2 = *(uint32_t*)b & 0x3FFFFFFF;
-        return (v1 > v2) - (v1 < v2);
-    });
+    auto cmp_apatch_pkg = [](const void* a, const void* b) -> int {
+        uint32_t v1 = *(const uint32_t*)a & 0x3FFFFFFF;
+        uint32_t v2 = *(const uint32_t*)b & 0x3FFFFFFF;
+        if (v1 < v2) return -1;
+        if (v1 > v2) return 1;
+        return 0;
+    };
+
+    if (new_config->packages.size > 0) {
+        qsort(new_config->packages.data, new_config->packages.size, sizeof(uint32_t), cmp_apatch_pkg);
+    }
 
     // Store new configuration
     (void)config_cache_rcu.exchange(new_config, std::memory_order_release);
@@ -174,13 +179,21 @@ static const ConfigData* get_config() {
 }
 
 static uint32_t find_package(const ConfigData* config, int32_t uid) {
-    uint32_t target = static_cast<uint32_t>(uid) & 0x3FFFFFFF;
-    auto it = std::lower_bound(config->packages.begin(), config->packages.end(), target, [](uint32_t a, uint32_t b) {
-        return (a & 0x3FFFFFFF) < (b & 0x3FFFFFFF);
-    });
+    if (!config || config->packages.size == 0) return 0;
 
-    if (it != config->packages.end() && (*it & 0x3FFFFFFF) == target) {
-        return *it;
+    uint32_t target = static_cast<uint32_t>(uid) & 0x3FFFFFFF;
+    auto cmp_apatch_search = [](const void* key, const void* element) -> int {
+        uint32_t k = *(const uint32_t*)key;
+        uint32_t e = *(const uint32_t*)element & 0x3FFFFFFF;
+        if (k < e) return -1;
+        if (k > e) return 1;
+        return 0;
+    };
+
+    void* result = bsearch(&target, config->packages.data, config->packages.size, sizeof(uint32_t), cmp_apatch_search);
+
+    if (result) {
+        return *(static_cast<uint32_t*>(result));
     }
     return 0;
 }

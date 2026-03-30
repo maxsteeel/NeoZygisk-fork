@@ -59,6 +59,11 @@ struct Module {
     char name[256];
     UniqueFd memfd;
 
+    // Default constructor required for static array initialization
+    inline Module() : memfd(-1) {
+        name[0] = '\0';
+    }
+
     inline explicit Module(const char* n, int fd) : memfd(fd) {
         strlcpy(name, n ? n : "", sizeof(name));
     }
@@ -87,7 +92,7 @@ std::string GetModDir();
 
 bool PingHeartbeat();
 
-std::vector<Module> ReadModules();
+size_t ReadModules(Module* out_modules, size_t max_modules);
 
 uint32_t GetProcessFlags(uid_t uid);
 

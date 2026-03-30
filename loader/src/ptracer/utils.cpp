@@ -36,199 +36,6 @@
 #define PAGE_START(x) ((x) & ~(PAGE_SIZE - 1))
 #define PAGE_END(x) PAGE_START((x) + (PAGE_SIZE - 1))
 
-static int DlIterateCallback(struct dl_phdr_info *info, [[maybe_unused]] size_t size, void *data) {
-    auto *info_vec = static_cast<std::vector<MapInfo> *>(data);
-
-    const char *name = info->dlpi_name;
-    char exe_path[256];
-    if (!name || name[0] == '\0') {
-        ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-        if (len != -1) {
-            exe_path[len] = '\0';
-            name = exe_path;
-        } else {
-            name = "";
-        }
-    }
-
-    struct stat st;
-    ino_t inode = 0;
-    dev_t dev = 0;
-    if (name[0] == '/') {
-        char clean_name[256];
-        snprintf(clean_name, sizeof(clean_name), "%s", name);
-        char* exclamation = strstr(clean_name, "!/");
-        if (exclamation) {
-            *exclamation = '\0';
-        }
-        if (stat(clean_name, &st) == 0) {
-            inode = st.st_ino;
-            dev = st.st_dev;
-        }
-    }
-
-    for (int i = 0; i < info->dlpi_phnum; i++) {
-        const ElfW(Phdr) *phdr = &info->dlpi_phdr[i];
-        if (phdr->p_type == PT_LOAD) {
-            uintptr_t start = PAGE_START(info->dlpi_addr + phdr->p_vaddr);
-            uintptr_t end = PAGE_END(info->dlpi_addr + phdr->p_vaddr + phdr->p_memsz);
-            uintptr_t offset = PAGE_START(phdr->p_offset);
-
-            uint8_t perms = 0;
-            if (phdr->p_flags & PF_R) perms |= PROT_READ;
-            if (phdr->p_flags & PF_W) perms |= PROT_WRITE;
-            if (phdr->p_flags & PF_X) perms |= PROT_EXEC;
-
-            MapInfo map_info;
-            map_info.start = start;
-            map_info.end = end;
-            map_info.perms = perms;
-            map_info.is_private = true; // dl_iterate_phdr doesn't expose mapping type, but mostly private
-            map_info.offset = offset;
-            map_info.dev = dev;
-            map_info.inode = inode;
-
-            snprintf(map_info.path, sizeof(map_info.path), "%s", name);
-            info_vec->push_back(map_info);
-        }
-    }
-    return 0;
-}
-
-static bool ParseMapLine(const char* buffer, MapInfo& ref) {
-    const char* p = buffer;
-
-    // Inline hex parsing
-    uintptr_t start = 0;
-    while (true) {
-        char c = *p;
-        if (c >= '0' && c <= '9') start = (start << 4) | (c - '0');
-        else if (c >= 'a' && c <= 'f') start = (start << 4) | (c - 'a' + 10);
-        else if (c >= 'A' && c <= 'F') start = (start << 4) | (c - 'A' + 10);
-        else break;
-        p++;
-    }
-    if (*p++ != '-') return false;
-
-    uintptr_t end = 0;
-    while (true) {
-        char c = *p;
-        if (c >= '0' && c <= '9') end = (end << 4) | (c - '0');
-        else if (c >= 'a' && c <= 'f') end = (end << 4) | (c - 'a' + 10);
-        else if (c >= 'A' && c <= 'F') end = (end << 4) | (c - 'A' + 10);
-        else break;
-        p++;
-    }
-    if (*p++ != ' ') return false;
-
-    char perm[4];
-    perm[0] = *p++;
-    perm[1] = *p++;
-    perm[2] = *p++;
-    bool is_private = (*p++ == 'p');
-    if (*p++ != ' ') return false;
-
-    uintptr_t off = 0;
-    while (true) {
-        char c = *p;
-        if (c >= '0' && c <= '9') off = (off << 4) | (c - '0');
-        else if (c >= 'a' && c <= 'f') off = (off << 4) | (c - 'a' + 10);
-        else if (c >= 'A' && c <= 'F') off = (off << 4) | (c - 'A' + 10);
-        else break;
-        p++;
-    }
-    if (*p++ != ' ') return false;
-
-    unsigned int dev_major = 0;
-    while (true) {
-        char c = *p;
-        if (c >= '0' && c <= '9') dev_major = (dev_major << 4) | (c - '0');
-        else if (c >= 'a' && c <= 'f') dev_major = (dev_major << 4) | (c - 'a' + 10);
-        else if (c >= 'A' && c <= 'F') dev_major = (dev_major << 4) | (c - 'A' + 10);
-        else break;
-        p++;
-    }
-    if (*p++ != ':') return false;
-
-    unsigned int dev_minor = 0;
-    while (true) {
-        char c = *p;
-        if (c >= '0' && c <= '9') dev_minor = (dev_minor << 4) | (c - '0');
-        else if (c >= 'a' && c <= 'f') dev_minor = (dev_minor << 4) | (c - 'a' + 10);
-        else if (c >= 'A' && c <= 'F') dev_minor = (dev_minor << 4) | (c - 'A' + 10);
-        else break;
-        p++;
-    }
-    if (*p++ != ' ') return false;
-
-    ino_t inode = 0;
-    while (true) {
-        char c = *p;
-        if (c >= '0' && c <= '9') inode = inode * 10 + (c - '0');
-        else break;
-        p++;
-    }
-
-    while (*p == ' ') p++;
-
-    uint8_t perms = 0;
-    if (perm[0] == 'r') perms |= PROT_READ;
-    if (perm[1] == 'w') perms |= PROT_WRITE;
-    if (perm[2] == 'x') perms |= PROT_EXEC;
-
-    ref.start = start;
-    ref.end = end;
-    ref.perms = perms;
-    ref.is_private = is_private;
-    ref.offset = off;
-    ref.dev = static_cast<dev_t>(makedev(dev_major, dev_minor));
-    ref.inode = inode;
-
-    size_t i = 0;
-    while (char c = *p++) {
-        if (c == '\n') break;
-        if (i < sizeof(ref.path) - 1) {
-            ref.path[i++] = c;
-        }
-    }
-    ref.path[i] = '\0';
-
-    return true;
-}
-
-/**
- * @brief Scans and parses the /proc/[pid]/maps file for a given process.
- * @param pid The process ID to scan, or -1 for "self".
- * @return A vector of MapInfo structs, each representing a memory mapping.
- */
-std::vector<MapInfo> MapInfo::Scan(int pid) {
-    std::vector<MapInfo> info;
-    info.reserve(2048);
-
-    if (pid == -1) {
-        dl_iterate_phdr(DlIterateCallback, &info);
-        return info;
-    }
-
-    char file_name[64];
-    snprintf(file_name, sizeof(file_name), "/proc/%d/maps", pid);
-    auto maps = std::unique_ptr<FILE, decltype(&fclose)>{fopen(file_name, "r"), &fclose};
-
-    if (!maps) {
-        PLOGE("fopen %s", file_name);
-        return info;
-    }
-
-    char buffer[8196];
-    while (fgets(buffer, sizeof(buffer), maps.get())) {
-        info.emplace_back(); 
-        if (!ParseMapLine(buffer, info.back())) {
-            info.pop_back(); 
-        }
-    }
-    return info;
-}
-
 /**
  * @brief Writes data to another process's memory using process_vm_writev.
  * @return The number of bytes written, or -1 on error.
@@ -328,13 +135,16 @@ bool set_regs(int pid, struct user_regs_struct &regs) {
 /**
  * @brief Finds the base address of a loaded module (the first mapping with zero offset).
  */
-void *find_module_base(const std::vector<MapInfo> &info, std::string_view suffix) {
-    for (const auto &map : info) {
+void *find_module_base(int pid, std::string_view suffix) {
+    void* result = nullptr;
+    MapInfo::Scan(pid, [&](const MapInfo& map) {
         if (map.offset == 0 && std::string_view(map.path).ends_with(suffix)) {
-            return (void *) map.start;
+            result = (void*)map.start;
+            return true; // We find the module, stop scanning
         }
-    }
-    return nullptr;
+        return false; // Continue scanning
+    });
+    return result;
 }
 
 /**
@@ -345,37 +155,34 @@ void *find_module_base(const std::vector<MapInfo> &info, std::string_view suffix
  * remote process. The remote address is then calculated using the offset from the base.
  * remote_sym = remote_base + (local_sym - local_base)
  */
-void *find_func_addr(const std::vector<MapInfo> &local_info,
-                     const std::vector<MapInfo> &remote_info, std::string_view module,
-                     std::string_view func) {
+void *find_func_addr(int local_pid, int remote_pid, std::string_view module, std::string_view func) {
     auto lib = dlopen(module.data(), RTLD_NOW);
     if (lib == nullptr) {
         LOGE("failed to open lib %s: %s", module.data(), dlerror());
         return nullptr;
     }
-    auto local_sym = PAC_STRIP(reinterpret_cast<uintptr_t>(dlsym(lib, func.data())));
+    void *local_sym = dlsym(lib, func.data());
     dlclose(lib);  // Close the library handle immediately to avoid resource leaks.
-    if (local_sym == 0) {
+    if (local_sym == nullptr) {
         LOGE("failed to find sym %s in %s: %s", func.data(), module.data(), dlerror());
         return nullptr;
     }
 
-    auto local_base = (uintptr_t) find_module_base(local_info, module);
-    if (local_base == 0) {
+    void *local_base = find_module_base(local_pid, module);
+    if (local_base == nullptr) {
         LOGE("failed to find local base for module %s", module.data());
         return nullptr;
     }
 
-    auto remote_base = (uintptr_t) find_module_base(remote_info, module);
-    if (remote_base == 0) {
+    void *remote_base = find_module_base(remote_pid, module);
+    if (remote_base == nullptr) {
         LOGE("failed to find remote base for module %s", module.data());
         return nullptr;
     }
 
-    uintptr_t remote_addr = remote_base + (local_sym - local_base);
-    LOGV("found remote %s!%s at 0x%" PRIxPTR " (local base 0x%" PRIxPTR ", remote base 0x%" PRIxPTR
-         ")",
-         module.data(), func.data(), remote_addr, local_base, remote_base);
+    uintptr_t remote_addr = (uintptr_t)remote_base + ((uintptr_t) local_sym - (uintptr_t) local_base);
+    LOGV("found remote %s!%s at 0x%" PRIxPTR " (local base 0x%" PRIxPTR ", remote base 0x%" PRIxPTR ")",
+         module.data(), func.data(), (uintptr_t)remote_addr, (uintptr_t)local_base, (uintptr_t)remote_base);
 
     return (void *) remote_addr;
 }
@@ -749,7 +556,7 @@ bool get_program(int pid, char* buf, size_t buf_size) {
     return true;
 }
 
-uintptr_t find_syscall_gadget([[maybe_unused]] int pid, const std::vector<MapInfo> &local_info, const std::vector<MapInfo> &remote_info) {
+uintptr_t find_syscall_gadget([[maybe_unused]] int local_pid, int remote_pid) {
     void* local_syscall = dlsym(RTLD_DEFAULT, "syscall");
     if (!local_syscall) {
         LOGE("Failed to find local syscall function");
@@ -791,8 +598,8 @@ uintptr_t find_syscall_gadget([[maybe_unused]] int pid, const std::vector<MapInf
         return 0;
     }
 
-    uintptr_t local_base = (uintptr_t)find_module_base(local_info, "libc.so");
-    uintptr_t remote_base = (uintptr_t)find_module_base(remote_info, "libc.so");
+    uintptr_t local_base = (uintptr_t)find_module_base(local_pid, "libc.so");
+    uintptr_t remote_base = (uintptr_t)find_module_base(remote_pid, "libc.so");
 
     if (!local_base || !remote_base) {
         LOGE("Failed to find libc.so base for syscall gadget translation");

@@ -36,9 +36,7 @@
   #endif
 #endif
 
-bool remote_custom_linker_load_and_resolve_entry(int pid, struct user_regs_struct *regs,
-                                             const std::vector<MapInfo>& local_map,
-                                             const std::vector<MapInfo>& remote_map, 
-                                             const char *lib_path, uintptr_t *out_base,
-                                             size_t *out_total_size, uintptr_t *out_entry,
-                                             uintptr_t *out_init_array, size_t *out_init_count);
+bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, struct user_regs_struct *regs,
+                                                 const char *lib_path, uintptr_t *out_base,
+                                                 size_t *out_total_size, uintptr_t *out_entry,
+                                                 uintptr_t *out_init_array, size_t *out_init_count);

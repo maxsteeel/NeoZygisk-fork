@@ -22,6 +22,7 @@ add_library(zygisk SHARED ${INJECTOR_SRC_LIST})
 target_include_directories(zygisk PRIVATE include)
 target_include_directories(zygisk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../zygiskd/src/include)
 target_link_options(zygisk PRIVATE "-Wl,--exclude-libs,ALL")
+target_link_options(zygisk PRIVATE "-nostartfiles")
 target_link_libraries(zygisk log common lsplt_static)
 
 aux_source_directory(ptracer PTRACER_SRC_LIST)

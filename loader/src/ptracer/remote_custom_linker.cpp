@@ -21,6 +21,7 @@
 #include <link.h>
 #include <vector>
 #include <string>
+#include <memory>
 #include <sys/uio.h>
 #include <linux/memfd.h>
 #include <sys/utsname.h>
@@ -30,14 +31,20 @@
 #include "utils.hpp"
 #include "elf_utils.hpp"
 
-static const char *find_remote_module_path(const std::vector<MapInfo>& remote_map, const char *soname) {
-    for (const auto& m : remote_map) {
-        if (m.offset != 0) continue;
+static bool find_remote_module_path(int remote_pid, const char *soname, char* out_path, size_t out_size) {
+    bool found = false;
+    MapInfo::Scan(remote_pid, [&](const MapInfo& m) {
+        if (m.offset != 0) return false;
         const char *filename = strrchr(m.path, '/');
         filename = filename ? filename + 1 : m.path;
-        if (strcmp(filename, soname) == 0) return m.path;
-    }
-    return nullptr;
+        if (strcmp(filename, soname) == 0) {
+            strlcpy(out_path, m.path, out_size);
+            found = true;
+            return true; // Found, stop scanning
+        }
+        return false;
+    });
+    return found;
 }
 
 
@@ -49,7 +56,7 @@ static const char *find_remote_module_path(const std::vector<MapInfo>& remote_ma
 #define ELF_R_SYM ELF32_R_SYM
 #endif
 
-static uintptr_t smart_resolve_symbol(const char* sym_name, const std::vector<MapInfo>& local_map, const std::vector<MapInfo>& remote_map) {
+static uintptr_t smart_resolve_symbol(const char* sym_name, int local_pid, int remote_pid) {
     void* local_addr = dlsym(RTLD_DEFAULT, sym_name);
     if (!local_addr) return 0;
 
@@ -64,55 +71,71 @@ static uintptr_t smart_resolve_symbol(const char* sym_name, const std::vector<Ma
         return cached_remote_start + offset;
     }
 
-    const MapInfo* actual_map = nullptr;
     uintptr_t local_base = 0;
-    uintptr_t last_base = 0;
-    const char* last_path = nullptr;
+    uintptr_t map_start = 0, map_end = 0;
+    char actual_path[256] = {0};
 
-    for (const auto& m : local_map) {
+    uintptr_t last_base = 0;
+    char last_path[256] = {0};
+
+    // Find the local memory section
+    MapInfo::Scan(local_pid, [&](const MapInfo& m) {
         if (m.offset == 0) {
             last_base = m.start;
-            last_path = m.path;
+            strlcpy(last_path, m.path, sizeof(last_path));
         }
         if (l_addr >= m.start && l_addr < m.end) {
-            actual_map = &m;
-            if (last_path && strcmp(last_path, m.path) == 0) {
+            map_start = m.start;
+            map_end = m.end;
+            strlcpy(actual_path, m.path, sizeof(actual_path));
+            if (last_path[0] != '\0' && strcmp(last_path, m.path) == 0) {
                 local_base = last_base;
             }
-            break;
+            return true; // Stop scanning
         }
-    }
+        return false;
+    });
 
-    if (!actual_map || actual_map->path[0] == '\0') return 0;
+    if (actual_path[0] == '\0') return 0;
 
+    // If the base was 0, we look for offset 0 explicitly
     if (local_base == 0) {
-        for (const auto& m : local_map) {
-            if (m.offset == 0 && strcmp(actual_map->path, m.path) == 0) {
+        MapInfo::Scan(local_pid, [&](const MapInfo& m) {
+            if (m.offset == 0 && strcmp(actual_path, m.path) == 0) {
                 local_base = m.start;
-                break;
+                return true; // Stop scanning
             }
-        }
+            return false;
+        });
     }
     if (local_base == 0) return 0;
 
     uintptr_t offset = l_addr - local_base;
+    uintptr_t remote_base = 0;
 
-    for (const auto& m : remote_map) {
-        if (m.offset == 0 && strcmp(actual_map->path, m.path) == 0) {
-            cached_local_start = actual_map->start;
-            cached_local_end = actual_map->end;
-            cached_local_base = local_base;
-            cached_remote_start = m.start;
-            return m.start + offset;
+    // Find the corresponding base in the remote process
+    MapInfo::Scan(remote_pid, [&](const MapInfo& m) {
+        if (m.offset == 0 && strcmp(actual_path, m.path) == 0) {
+            remote_base = m.start;
+            return true; // Stop scanning
         }
+        return false;
+    });
+
+    if (remote_base != 0) {
+        cached_local_start = map_start;
+        cached_local_end = map_end;
+        cached_local_base = local_base;
+        cached_remote_start = remote_base;
+        return remote_base + offset;
     }
+
     return 0;
 }
 
 static bool resolve_symbol_addr(const elf_dyn_info *info,
-                                const std::vector<MapInfo>& local_map,
-                                const std::vector<MapInfo>& remote_map,
-                                const std::vector<const char*>& needed_paths,
+                                int local_pid, int remote_pid,
+                                const char** needed_paths, size_t needed_count,
                                 uintptr_t load_bias, size_t sym_idx, uintptr_t *out_addr) {
     
     if (sym_idx >= info->nsyms) return false;
@@ -134,15 +157,16 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
         *out_addr = 0; return true; 
     }
 
-    uintptr_t smart_addr = smart_resolve_symbol(name, local_map, remote_map);
+    uintptr_t smart_addr = smart_resolve_symbol(name, local_pid, remote_pid);
     if (smart_addr != 0) {
         *out_addr = smart_addr;
         return true;
     }
 
-    for (const auto& mod_path : needed_paths) {
+    for (size_t k = 0; k < needed_count; k++) {
+        const char* mod_path = needed_paths[k];
         if (!mod_path || !*mod_path) continue;
-        void *addr = find_func_addr(local_map, remote_map, mod_path, name);
+        void *addr = find_func_addr(local_pid, remote_pid, mod_path, name);
         if (addr) { *out_addr = (uintptr_t)addr; return true; }
     }
     
@@ -153,13 +177,13 @@ static bool write_remote_addr(int pid, uintptr_t addr, ElfW(Addr) value) { retur
 [[maybe_unused]] static bool read_remote_addr(int pid, uintptr_t addr, ElfW(Addr) *out) { return read_proc(pid, addr, out, sizeof(*out)); }
 
 static bool apply_rela_section(int pid, int fd, [[maybe_unused]] const elf_dyn_info *info,
-                               [[maybe_unused]] const std::vector<MapInfo>& local_map,
-                               [[maybe_unused]] const std::vector<MapInfo>& remote_map,
-                               [[maybe_unused]] const std::vector<const char*>& needed_paths,
+                               [[maybe_unused]] int local_pid, [[maybe_unused]] int remote_pid,
+                               [[maybe_unused]] const char** needed_paths, 
+                               [[maybe_unused]] size_t needed_count,
                                uintptr_t load_bias, off_t rela_off, size_t rela_sz) {
     size_t count = rela_sz / sizeof(ElfW(Rela));
-    std::vector<ElfW(Rela)> rels(count);
-    if (!read_loop_offset(fd, rels.data(), rela_sz, rela_off)) return false;
+    auto rels = std::make_unique<ElfW(Rela)[]>(count);
+    if (!read_loop_offset(fd, rels.get(), rela_sz, rela_off)) return false;
 
     for (size_t i = 0; i < count; i++) {
         const ElfW(Rela)& r = rels[i];
@@ -173,14 +197,14 @@ static bool apply_rela_section(int pid, int fd, [[maybe_unused]] const elf_dyn_i
         if (type == R_AARCH64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))r.r_addend;
         else if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT || type == R_AARCH64_ABS64) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, local_map, remote_map, needed_paths, load_bias, sym, &sym_addr)) return false;
+            if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, sym, &sym_addr)) return false;
             value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))r.r_addend : 0;
         } else return false;
 #elif defined(__x86_64__)
         if (type == R_X86_64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))r.r_addend;
         else if (type == R_X86_64_GLOB_DAT || type == R_X86_64_JUMP_SLOT || type == R_X86_64_64) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, local_map, remote_map, needed_paths, load_bias, sym, &sym_addr)) return false;
+            if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, sym, &sym_addr)) return false;
             value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))r.r_addend : 0;
         } else return false;
 #else
@@ -193,13 +217,13 @@ static bool apply_rela_section(int pid, int fd, [[maybe_unused]] const elf_dyn_i
 }
 
 static bool apply_rel_section(int pid, int fd, [[maybe_unused]] const elf_dyn_info *info,
-                              [[maybe_unused]] const std::vector<MapInfo>& local_map,
-                              [[maybe_unused]] const std::vector<MapInfo>& remote_map,
-                              [[maybe_unused]] const std::vector<const char*>& needed_paths,
+                              [[maybe_unused]] int local_pid, [[maybe_unused]] int remote_pid,
+                              [[maybe_unused]] const char** needed_paths, 
+                              [[maybe_unused]] size_t needed_count,
                               uintptr_t load_bias, off_t rel_off, size_t rel_sz) {
     size_t count = rel_sz / sizeof(ElfW(Rel));
-    std::vector<ElfW(Rel)> rels(count);
-    if (!read_loop_offset(fd, rels.data(), rel_sz, rel_off)) return false;
+    auto rels = std::make_unique<ElfW(Rel)[]>(count);
+    if (!read_loop_offset(fd, rels.get(), rel_sz, rel_off)) return false;
 
     for (size_t i = 0; i < count; i++) {
         const ElfW(Rel)& r = rels[i];
@@ -216,7 +240,7 @@ static bool apply_rel_section(int pid, int fd, [[maybe_unused]] const elf_dyn_in
             value = (ElfW(Addr))load_bias + addend;
         } else if (type == R_ARM_GLOB_DAT || type == R_ARM_JUMP_SLOT || type == R_ARM_ABS32) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, local_map, remote_map, needed_paths, load_bias, sym, &sym_addr)) return false;
+            if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, sym, &sym_addr)) return false;
             if (sym_addr == 0) value = 0;
             else if (type == R_ARM_ABS32) {
                 if (!read_remote_addr(pid, target, &addend)) return false;
@@ -229,7 +253,7 @@ static bool apply_rel_section(int pid, int fd, [[maybe_unused]] const elf_dyn_in
             value = (ElfW(Addr))load_bias + addend;
         } else if (type == R_386_GLOB_DAT || type == R_386_JMP_SLOT || type == R_386_32) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, local_map, remote_map, needed_paths, load_bias, sym, &sym_addr)) return false;
+            if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, sym, &sym_addr)) return false;
             if (sym_addr == 0) value = 0;
             else if (type == R_386_32) {
                 if (!read_remote_addr(pid, target, &addend)) return false;
@@ -286,13 +310,12 @@ static long remote_mmap_offset_arg(off_t file_offset, size_t page_size) {
 }
 
 // ---------------- MAIN ----------------
-bool remote_custom_linker_load_and_resolve_entry(int pid, struct user_regs_struct *regs,
-                                             const std::vector<MapInfo>& local_map,
-                                             const std::vector<MapInfo>& remote_map, 
-                                             const char *lib_path, uintptr_t *out_base,
-                                             size_t *out_total_size, uintptr_t *out_entry,
-                                             uintptr_t *out_init_array, size_t *out_init_count) {
+bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, struct user_regs_struct *regs,
+                                                 const char *lib_path, uintptr_t *out_base,
+                                                 size_t *out_total_size, uintptr_t *out_entry,
+                                                 uintptr_t *out_init_array, size_t *out_init_count) {
     const struct user_regs_struct regs_saved = *regs;
+    int pid = remote_pid;
 
     long page_size_long = sysconf(_SC_PAGESIZE);
     size_t page_size = (size_t)page_size_long;
@@ -301,13 +324,13 @@ bool remote_custom_linker_load_and_resolve_entry(int pid, struct user_regs_struc
     if (fd < 0) return false;
 
     ElfW(Ehdr) eh;
-    std::vector<ElfW(Phdr)> phdr;
+    std::unique_ptr<ElfW(Phdr)[]> phdr;
     ElfW(Addr) min_vaddr = 0;
     size_t map_size = 0;
 
     if (!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size)) { return false; }
 
-    uintptr_t syscall_gadget = find_syscall_gadget(pid, local_map, remote_map);
+    uintptr_t syscall_gadget = find_syscall_gadget(local_pid, remote_pid);
     if (!syscall_gadget) {
         LOGE("Failed to find syscall gadget for Remote-Custom Linker");
         return false;
@@ -320,10 +343,11 @@ bool remote_custom_linker_load_and_resolve_entry(int pid, struct user_regs_struc
     uintptr_t remote_str_block = regs_saved.REG_SP - ALIGN_UP(path_len + fake_name_len, 16);
     uintptr_t remote_fake_name = remote_str_block + path_len;
 
-    std::vector<char> str_buffer(path_len + fake_name_len, 0);
-    memcpy(str_buffer.data(), lib_path, path_len);
-    memcpy(str_buffer.data() + path_len, fake_name, fake_name_len);
-    write_proc(pid, remote_str_block, str_buffer.data(), str_buffer.size());
+    char* str_buffer = (char*)alloca(path_len + fake_name_len);
+    memset(str_buffer, 0, path_len + fake_name_len);
+    memcpy(str_buffer, lib_path, path_len);
+    memcpy(str_buffer + path_len, fake_name, fake_name_len);
+    write_proc(pid, remote_str_block, str_buffer, path_len + fake_name_len);
 
     struct user_regs_struct call_regs = regs_saved;
     call_regs.REG_SP = remote_str_block;
@@ -366,8 +390,10 @@ bool remote_custom_linker_load_and_resolve_entry(int pid, struct user_regs_struc
 
     uintptr_t load_bias = remote_base - (uintptr_t)min_vaddr;
     struct SegInfo { uintptr_t addr; size_t len; int prot; };
-    std::vector<SegInfo> segs;
-    std::vector<char> tail_zeros(page_size, 0);
+    SegInfo segs[32];
+    size_t seg_count = 0;
+    char* tail_zeros = (char*)alloca(page_size);
+    memset(tail_zeros, 0, page_size);
 
     for (int i = 0; i < eh.e_phnum; i++) {
         if (phdr[i].p_type != PT_LOAD) continue;
@@ -390,8 +416,12 @@ bool remote_custom_linker_load_and_resolve_entry(int pid, struct user_regs_struc
 
             if (is_writable && file_page_end > file_end) {
                 size_t tail_len = (size_t)(file_page_end - file_end);
-                if (tail_len > tail_zeros.size()) tail_zeros.resize(tail_len, 0);
-                write_proc(pid, file_end, tail_zeros.data(), tail_len);
+                size_t written = 0;
+                while (written < tail_len) {
+                    size_t to_write = (tail_len - written > page_size) ? page_size : (tail_len - written);
+                    write_proc(pid, file_end + written, tail_zeros, to_write);
+                    written += to_write;
+                }
             }
         }
         if (seg_page_end > file_page_end) {
@@ -403,7 +433,11 @@ bool remote_custom_linker_load_and_resolve_entry(int pid, struct user_regs_struc
         if (phdr[i].p_flags & PF_R) prot |= PROT_READ;
         if (phdr[i].p_flags & PF_W) prot |= PROT_WRITE;
         if (phdr[i].p_flags & PF_X) prot |= PROT_EXEC;
-        segs.push_back({seg_page, seg_page_len, prot});
+        if (seg_count < 32) {
+            segs[seg_count++] = {seg_page, seg_page_len, prot};
+        } else {
+            LOGW("Too many segments in the ELF, some may not have correct permissions set");
+        }
     }
 
     long args_close_fd[] = {remote_fd};
@@ -412,24 +446,32 @@ bool remote_custom_linker_load_and_resolve_entry(int pid, struct user_regs_struc
     elf_dyn_info dinfo;
     if (!elf_load_dyn_info(fd, &eh, phdr, &dinfo)) return false;
 
-    std::vector<const char*> needed_paths(dinfo.needed_str_offsets.size(), nullptr);
-    for (size_t i = 0; i < dinfo.needed_str_offsets.size(); i++) {
+    size_t needed_count = dinfo.needed_count;
+    const char** needed_paths = (const char**)alloca(needed_count * sizeof(const char*));
+    memset(needed_paths, 0, needed_count * sizeof(const char*));
+
+    for (size_t i = 0; i < needed_count; i++) {
         size_t off = dinfo.needed_str_offsets[i];
         if (off < dinfo.strsz) {
             const char *soname = &dinfo.strtab[off];
-            const char *path = find_remote_module_path(remote_map, soname);
-            if (path) needed_paths[i] = path;
+            char remote_path[256]; 
+            if(find_remote_module_path(pid, soname, remote_path, sizeof(remote_path))) { 
+                needed_paths[i] = remote_path;
+            } else {
+                LOGW("Failed to find remote path for needed library: %s", soname);
+            }
         }
     }
 
-    if (dinfo.rela_sz && dinfo.rela_off) apply_rela_section(pid, fd, &dinfo, local_map, remote_map, needed_paths, load_bias, dinfo.rela_off, dinfo.rela_sz);
-    if (dinfo.rel_sz && dinfo.rel_off) apply_rel_section(pid, fd, &dinfo, local_map, remote_map, needed_paths, load_bias, dinfo.rel_off, dinfo.rel_sz);
+    if (dinfo.rela_sz && dinfo.rela_off) apply_rela_section(pid, fd, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.rela_off, dinfo.rela_sz);
+    if (dinfo.rel_sz && dinfo.rel_off) apply_rel_section(pid, fd, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.rel_off, dinfo.rel_sz);
     if (dinfo.jmprel_sz && dinfo.jmprel_off) {
-        if (dinfo.pltrel_type == DT_RELA) apply_rela_section(pid, fd, &dinfo, local_map, remote_map, needed_paths, load_bias, dinfo.jmprel_off, dinfo.jmprel_sz);
-        else apply_rel_section(pid, fd, &dinfo, local_map, remote_map, needed_paths, load_bias, dinfo.jmprel_off, dinfo.jmprel_sz);
+        if (dinfo.pltrel_type == DT_RELA) apply_rela_section(pid, fd, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.jmprel_off, dinfo.jmprel_sz);
+        else apply_rel_section(pid, fd, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.jmprel_off, dinfo.jmprel_sz);
     }
 
-    for (const auto& s : segs) {
+    for (size_t k = 0; k < seg_count; k++) {
+        const auto& s = segs[k];
         if (s.prot == (PROT_READ | PROT_WRITE)) continue;
         long args_mprotect[] = {(long)s.addr, (long)s.len, s.prot};
         remote_syscall(pid, call_regs, syscall_gadget, SYS_mprotect, args_mprotect, 3);

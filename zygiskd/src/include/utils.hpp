@@ -6,6 +6,101 @@
 #include <cstdio>
 #include <vector>
 #include <optional>
+#include <pthread.h>
+#include <malloc.h>
+#include <type_traits>
+#include <utility>
+#include <cstdlib> // malloc, realloc, free
+#include <cstring> // strdup, strcmp
+#include <algorithm> // std::binary_search
+#include <string> // std::string, std::string_view
+
+struct IntList {
+    int32_t* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+
+    ~IntList() { free(data); }
+
+    void clear() {
+        free(data);
+        data = nullptr;
+        size = 0;
+        capacity = 0;
+    }
+
+    void push_back(int32_t val) {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 32 : capacity * 2;
+            data = (int32_t*)realloc(data, capacity * sizeof(int32_t));
+        }
+        data[size++] = val;
+    }
+};
+
+struct StringList {
+    char** data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+
+    StringList() = default;
+
+    // Move constructor
+    StringList(StringList&& other) noexcept : data(other.data), size(other.size), capacity(other.capacity) {
+        other.data = nullptr;
+        other.size = 0;
+        other.capacity = 0;
+    }
+
+    // Move assignment
+    StringList& operator=(StringList&& other) noexcept {
+        if (this != &other) {
+            clear();
+            data = other.data;
+            size = other.size;
+            capacity = other.capacity;
+            other.data = nullptr;
+            other.size = 0;
+            other.capacity = 0;
+        }
+        return *this;
+    }
+
+    StringList(const StringList&) = delete;
+    StringList& operator=(const StringList&) = delete;
+
+    ~StringList() { clear(); }
+
+    void clear() {
+        if (data) {
+            for (size_t i = 0; i < size; ++i) {
+                free(data[i]);
+            }
+            free(data);
+            data = nullptr;
+        }
+        size = 0;
+        capacity = 0;
+    }
+
+    void push_back(const char* str) {
+        if (!str) return;
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 16 : capacity * 2;
+            data = (char**)realloc(data, capacity * sizeof(char*));
+        }
+        data[size++] = strdup(str);
+    }
+
+    void push_back(std::string_view str) {
+        if (str.empty()) return;
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 16 : capacity * 2;
+            data = (char**)realloc(data, capacity * sizeof(char*));
+        }
+        data[size++] = str.empty() ? nullptr : strndup(str.data(), str.size());
+    }
+};
 
 // Wrapper to automatically close FILE pointers when they go out of scope.
 // Prevents memory and file descriptor leaks in case of early returns.
@@ -126,6 +221,59 @@ inline std::string to_str(T value) {
     else
         snprintf(buf, sizeof(buf), "%lld", (long long)value);
     return std::string(buf);
+}
+
+// Creates a detached background thread with a minimal 64KB stack 
+// instead of Android's default 1MB, drastically reducing RAM footprint.
+static inline void spawn_thread(void* (*thread_func)(void*), void* arg) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    
+    // Set stack size to 64KB (minimum recommended for basic C/C++ logic)
+    size_t stack_size = 64 * 1024; 
+    pthread_attr_setstacksize(&attr, stack_size);
+    
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, thread_func, arg) == 0) {
+        // Detach immediately to free thread resources upon exit
+        pthread_detach(thread);
+    }
+    
+    pthread_attr_destroy(&attr);
+}
+
+// Template wrapper to spawn a detached pthread with a minimal 64KB stack.
+// This allows passing C++ lambdas with captured variables while avoiding 
+// the massive 1MB default memory footprint of std::thread.
+template <typename F>
+static inline void spawn_thread(F&& lambda) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    
+    // Set stack size to 64KB (minimum recommended for basic C/C++ logic)
+    size_t stack_size = 64 * 1024; 
+    pthread_attr_setstacksize(&attr, stack_size);
+
+    // Heap-allocate the lambda so it survives the scope transition
+    using LambdaType = std::decay_t<F>;
+    auto* arg = new LambdaType(std::forward<F>(lambda));
+
+    pthread_t thread;
+    int ret = pthread_create(&thread, &attr, [](void* data) -> void* {
+        auto* func = static_cast<LambdaType*>(data);
+        (*func)();       // Execute the lambda
+        delete func;     // Free the lambda memory
+        return nullptr;
+    }, arg);
+
+    if (ret == 0) {
+        pthread_detach(thread);
+    } else {
+        // Prevent memory leak if thread creation fails
+        delete arg; 
+    }
+    
+    pthread_attr_destroy(&attr);
 }
 
 namespace utils {

@@ -442,8 +442,12 @@ void ZygiskContext::fork_post() {
 
 /* Zygisksu changed: Load module fds */
 void ZygiskContext::run_modules_pre() {
-    auto ms = zygiskd::ReadModules();
-    auto size = ms.size();
+    // Allocate raw array on the stack
+    constexpr size_t MAX_MODULES = 256;
+    zygiskd::Module ms[MAX_MODULES];
+
+    // Pass the array to be filled and get the total count
+    size_t size = zygiskd::ReadModules(ms, MAX_MODULES);
 
     void* altstack_mem = malloc(SIGSTKSZ);
     stack_t ss = {};
@@ -529,8 +533,8 @@ void ZygiskContext::run_modules_pre() {
     sigaltstack(&ss, nullptr);
     free(altstack_mem);
 
-    for (auto &m : ms) {
-        memzero(m.name, sizeof(m.name));
+    for (size_t i = 0; i < size; i++) {
+        memzero(ms[i].name, sizeof(ms[i].name));
     }
 }
 

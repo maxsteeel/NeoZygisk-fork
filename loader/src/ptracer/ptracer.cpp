@@ -9,6 +9,7 @@
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <malloc.h>
 
 #include <cinttypes>
 #include <cstdio>
@@ -188,18 +189,17 @@ static bool execute_remote_injection(int pid, const char *lib_path, uintptr_t en
 
     // Backup the current registers before we start making remote calls.
     memcpy(&backup, &regs, sizeof(regs));
-    auto map = MapInfo::Scan(pid);  // Re-scan maps as they may have changed.
-    auto local_map = MapInfo::Scan();
+
     uintptr_t remote_base = 0;
     size_t remote_size = 0;
     uintptr_t injector_entry = 0;
     uintptr_t init_array = 0;
     size_t init_count = 0;
 
-    if (!remote_custom_linker_load_and_resolve_entry(pid, &regs, 
-                                                 local_map, map, 
-                                                 lib_path, &remote_base, &remote_size, &injector_entry,
-                                                 &init_array, &init_count)) {
+    // Pass local_pid = -1, remote_pid = pid
+    if (!remote_custom_linker_load_and_resolve_entry(-1, pid, &regs, 
+                                                     lib_path, &remote_base, &remote_size, &injector_entry,
+                                                     &init_array, &init_count)) {
         LOGE("Remote-Custom Linker failed to map the library remotely");
         backup.REG_IP = (long) entry_addr;
         set_regs(pid, backup);
@@ -461,22 +461,22 @@ static bool trace_with_attach(int pid) {
  */
 bool trace_zygote(int pid) {
     LOGI("attaching to zygote (PID: %d) to begin injection", pid);
+    bool success = false;
 
     // 1. Try SEIZE (Modern, robust handling of group stops)
     if (trace_with_seize(pid)) {
         LOGI("successfully detached from zygote (via SEIZE), NeoZygisk active");
-        return true;
-    }
-
+        success = true;
+    } 
     // 2. Check for fallback condition
     // PTRACE_SEIZE returns EIO if the process state prohibits seizing,
     // or sometimes if security modules interfere.
-    if (errno == EIO) {
+    else if (errno == EIO) {
         LOGW("PTRACE_SEIZE failed with EIO, attempting fallback to PTRACE_ATTACH");
 
         if (trace_with_attach(pid)) {
             LOGI("successfully detached from zygote (via ATTACH), NeoZygisk active");
-            return true;
+            success = true;
         }
     } else {
         // If it wasn't EIO (e.g., EPERM, ESRCH), Attach will likely fail too,
@@ -484,5 +484,13 @@ bool trace_zygote(int pid) {
         PLOGE("PTRACE_SEIZE failed (errno: %d)", errno);
     }
 
-    return false;
+#ifdef M_PURGE
+    // The injection process is extremely memory-intensive (parsing ELFs, 
+    // string manipulations, maps scanning). Now that we are done and detached,
+    // we force the allocator to return all cached pages back to the kernel,
+    // dropping the daemon's RAM footprint to the absolute minimum.
+    mallopt(M_PURGE, 0);
+#endif
+
+    return success;
 }

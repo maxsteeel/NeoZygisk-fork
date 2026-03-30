@@ -174,12 +174,13 @@ std::optional<std::string> exec_command(std::initializer_list<const char*> args)
             }
         }
 
-        std::vector<char*> c_args;
-        c_args.reserve(args.size() + 1);
+        char** c_args = (char**) alloca((args.size() + 1) * sizeof(char*));
+        size_t i = 0;
         for (const auto& arg : args) {
-            c_args.push_back(const_cast<char*>(arg));
+            c_args[i] = const_cast<char*>(arg); 
+            i++;
         }
-        c_args.push_back(nullptr);
+        c_args[i] = nullptr;
 
         if (syscall(__NR_close_range, 3, ~0U, 0) != 0) {
             UniqueFd fd_dir(open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
@@ -208,7 +209,7 @@ std::optional<std::string> exec_command(std::initializer_list<const char*> args)
             }
         }
 
-        execvp(c_args[0], c_args.data());
+        execvp(c_args[0], c_args);
         _exit(127);
     }
 

@@ -114,9 +114,15 @@ static void run_companion(int fd) {
 
         // Spawn a new thread to handle this client.
         int raw_client = client_fd.release();
-        std::thread([raw_client, entry_fn]() {
+        spawn_thread([raw_client, entry_fn]() {
             handle_client(UniqueFd(raw_client), entry_fn);
-        }).detach();
+            
+    #ifdef M_PURGE
+            // Force the allocator to release cached free memory back to the OS
+            // after the companion client disconnects and the thread finishes.
+            mallopt(M_PURGE, 0);
+    #endif
+        });
     }
 }
 
