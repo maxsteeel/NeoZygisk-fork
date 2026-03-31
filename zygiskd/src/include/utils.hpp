@@ -13,7 +13,9 @@
 #include <cstdlib> // malloc, realloc, free
 #include <cstring> // strdup, strcmp
 #include <algorithm> // std::binary_search
-#include <string> // std::string, std::string_view
+#include <string> // std::string_view
+
+#define PROP_VALUE_MAX 92
 
 struct IntList {
     int32_t* data = nullptr;
@@ -213,16 +215,6 @@ inline int fast_atoi(const char *str) {
     return val;
 }
 
-template<typename T>
-inline std::string to_str(T value) {
-    char buf[24];
-    if constexpr (std::is_unsigned_v<T>)
-        snprintf(buf, sizeof(buf), "%zu", (size_t)value);
-    else
-        snprintf(buf, sizeof(buf), "%lld", (long long)value);
-    return std::string(buf);
-}
-
 // Creates a detached background thread with a minimal 64KB stack 
 // instead of Android's default 1MB, drastically reducing RAM footprint.
 static inline void spawn_thread(void* (*thread_func)(void*), void* arg) {
@@ -284,10 +276,10 @@ namespace utils {
 bool set_socket_create_context(const char* context);
 
 // Gets the current SELinux context of the process.
-std::string get_current_attr();
+const char* get_current_attr();
 
 // Retrieves an Android system property value.
-std::string get_property(const char* name);
+const char* get_property(const char* name);
 
 // --- Unix Socket and IPC Extensions ---
 
@@ -298,6 +290,6 @@ bool unix_datagram_sendto(const char* path, const void* buf, size_t len);
 bool is_socket_alive(int fd);
 
 // Executes a shell command securely avoiding shell injection by directly using execvp.
-std::optional<std::string> exec_command(std::initializer_list<const char*> args);
+bool exec_command(std::initializer_list<const char*> args, char* out_buf, size_t out_size);
 
 } // namespace utils

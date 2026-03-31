@@ -32,76 +32,70 @@ ZygoteAbiManager &AppMonitor::get_abi_manager() { return zygote_; }
 
 TracingState AppMonitor::get_tracing_state() const { return tracing_state_; }
 
-void AppMonitor::write_abi_status_section(std::string &status_text, const Status &daemon_status) {
-    auto abi_name = this->zygote_.abi_name_;
-    if (daemon_status.supported) {
-        status_text += "\tzygote";
-        status_text += abi_name;
-        status_text += ":";
-        if (tracing_state_ != TRACING)
-            status_text += "\t❓ unknown";
-        else if (daemon_status.zygote_injected)
-            status_text += "\t😋 injected";
-        else
-            status_text += "\t❌ not injected";
-        status_text += "\n\tdaemon";
-        status_text += abi_name;
-        status_text += ":";
-        if (daemon_status.daemon_running) {
-            status_text += "\t😋 running";
-            if (!daemon_status.daemon_info.empty()) {
-                status_text += "\n";
-                status_text += daemon_status.daemon_info;
-            }
-        } else {
-            status_text += "\t❌ crashed";
-            if (!daemon_status.daemon_error_info.empty()) {
-                status_text += "(";
-                status_text += daemon_status.daemon_error_info;
-                status_text += ")";
-            }
-        }
+void AppMonitor::write_abi_status_section(char *status_text, const Status &daemon_status) {
+    if (!daemon_status.supported) return;
+
+    size_t len = strlen(status_text);
+    char* p = status_text + len;
+    size_t remaining = sizeof(final_output_) - len;
+
+    p += snprintf(p, remaining, "\tzygote%s:\t%s\n\tdaemon%s:\t%s",
+                  zygote_.abi_name_,
+                  (tracing_state_ != TRACING) ? "❓ unknown" : 
+                  (daemon_status.zygote_injected ? "😋 injected" : "❌ not injected"),
+                  zygote_.abi_name_,
+                  daemon_status.daemon_running ? "😋 running" : "❌ crashed");
+
+    if (daemon_status.daemon_running && daemon_status.daemon_info[0]) {
+        snprintf(p, remaining - (p - (status_text + len)), "\n%s", daemon_status.daemon_info);
     }
 }
 
 void AppMonitor::update_status() {
     if (prop_fd_ < 0) return;
 
-    final_output_.clear();
-    final_output_ += pre_section_;
-    final_output_ += "\n\tmonitor: \t";
+    memset(final_output_, 0, sizeof(final_output_));
+    strcat(final_output_, pre_section_);
+    strcat(final_output_, "\n\tmonitor: \t");
 
     switch (tracing_state_) {
     case TRACING:
-        final_output_ += "😋 tracing";
+        strcat(final_output_, "😋 tracing");
         break;
     case STOPPING:
         [[fallthrough]];
     case STOPPED:
-        final_output_ += "❌ stopped";
+        strcat(final_output_, "❌ stopped");
         break;
     case EXITING:
-        final_output_ += "❌ exited";
+        strcat(final_output_, "❌ exited");
         break;
     }
-    if (tracing_state_ != TRACING && !monitor_stop_reason_.empty()) {
-        final_output_ += "(";
-        final_output_ += monitor_stop_reason_;
-        final_output_ += ")";
+    if (tracing_state_ != TRACING && monitor_stop_reason_[0] != '\0') {
+        strcat(final_output_, "(");
+        strcat(final_output_, monitor_stop_reason_);
+        strcat(final_output_, ")");
     }
 
-    final_output_ += "\n\n";
+    strcat(final_output_, "\n\n");
     write_abi_status_section(final_output_, zygote_.get_status());
-    final_output_ += "\n\n";
-    final_output_ += post_section_;
+    strcat(final_output_, "\n\n");
+    strcat(final_output_, post_section_);
 
     ftruncate(prop_fd_, 0);
-    pwrite(prop_fd_, final_output_.data(), final_output_.size(), 0);
+    pwrite(prop_fd_, final_output_, strlen(final_output_), 0);
 }
 
 bool AppMonitor::prepare_environment() {
-    prop_path_ = zygiskd::GetTmpPath() + "/module.prop";
-    UniqueFd(open(prop_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
+    memset(pre_section_, 0, sizeof(pre_section_));
+    memset(post_section_, 0, sizeof(post_section_));
+    memset(this->prop_path_, 0, sizeof(this->prop_path_));
+    snprintf(this->prop_path_, sizeof(this->prop_path_), "%s/module.prop", zygiskd::GetTmpPath());
+    this->prop_fd_ = UniqueFd(open(this->prop_path_, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
+    if (this->prop_fd_ < 0) {
+        PLOGE("failed to create/open prop_file at %s", this->prop_path_);
+        return false;
+    }
     auto orig_prop = xopen_file("./module.prop", "r");
     if (orig_prop == nullptr) {
         PLOGE("open original prop");
@@ -112,20 +106,16 @@ bool AppMonitor::prepare_environment() {
         if (line.starts_with("updateJson=")) return true;
         if (line.starts_with("description=")) {
             post = true;
-            post_section_ += line.substr(sizeof("description"));
+            strncat(post_section_, line.data() + 12, sizeof(post_section_) - strlen(post_section_) - 1);
         } else {
-            (post ? post_section_ : pre_section_) += "\t";
-            (post ? post_section_ : pre_section_) += line;
+            char* target = post ? post_section_ : pre_section_;
+            strncat(target, "\t", sizeof(pre_section_) - strlen(target) - 1);
+            strncat(target, line.data(), sizeof(pre_section_) - strlen(target) - 1);
+            strncat(target, "\n", sizeof(pre_section_) - strlen(target) - 1);
         }
         return true;
     });
 
-    prop_fd_ = UniqueFd(open(prop_path_.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0644));
-    if (prop_fd_ < 0) {
-        PLOGE("failed to open persistent prop_file");
-    }
-
-    final_output_.reserve(1024);
     update_status();
     return true;
 }
@@ -162,11 +152,12 @@ void AppMonitor::request_start() {
     update_status();
 }
 
-void AppMonitor::request_stop(std::string reason) {
+void AppMonitor::request_stop(const char* reason) {
     if (tracing_state_ == TRACING) {
         LOGI("stop tracing requested");
         tracing_state_ = STOPPING;
-        monitor_stop_reason_ = std::move(reason);
+        strncpy(monitor_stop_reason_, reason, sizeof(monitor_stop_reason_) - 1);
+        monitor_stop_reason_[sizeof(monitor_stop_reason_) - 1] = '\0';
         ptrace(PTRACE_INTERRUPT, 1, 0, 0);
         update_status();
     }
@@ -175,7 +166,8 @@ void AppMonitor::request_stop(std::string reason) {
 void AppMonitor::request_exit() {
     LOGI("prepare for exit ...");
     tracing_state_ = EXITING;
-    monitor_stop_reason_ = "user requested";
+    strncpy(monitor_stop_reason_, "user requested", sizeof(monitor_stop_reason_) - 1);
+    monitor_stop_reason_[sizeof(monitor_stop_reason_) - 1] = '\0';
     update_status();
     event_loop_.Stop();
 }
@@ -198,7 +190,7 @@ bool AppMonitor::SocketHandler::Init() {
     struct sockaddr_un addr {
         .sun_family = AF_UNIX, .sun_path = {0},
     };
-    if (snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/%s", zygiskd::GetTmpPath().c_str(),
+    if (snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/%s", zygiskd::GetTmpPath(),
                  AppMonitor::SOCKET_NAME) >= static_cast<int>(sizeof(addr.sun_path))) {
         PLOGE("UNIX domain socket path too long");
         return false;
@@ -487,8 +479,9 @@ void AppMonitor::SigChldHandler::handleTracedProcess(int pid, int &status) {
     }
     // Unexpected state during the pre-exec phase.
     else {
-        LOGW("traced process %d stopped with unexpected status: %s", pid,
-             parse_status(status).c_str());
+        char status_buf[256];
+        parse_status(status, status_buf, sizeof(status_buf));
+        LOGW("traced process %d stopped with unexpected status: %s", pid, status_buf);
     }
 
     // Determine lifecycle routing based on the handlers above.
@@ -589,8 +582,9 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
 
             handled = true;
         } else {
-            LOGE("target %d failed to enter SIGSTOP, status: %s", pid,
-                 parse_status(status).c_str());
+            char status_str[256];
+            parse_status(status, status_str, sizeof(status_str));
+            LOGE("target %d failed to enter SIGSTOP, status: %s", pid, status_str);
         }
 
     } while (false);

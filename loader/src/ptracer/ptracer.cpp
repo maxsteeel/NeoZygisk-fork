@@ -138,7 +138,9 @@ static bool hijack_and_wait(int pid, uintptr_t entry_addr, uintptr_t addr_of_ent
 
         // 1. Handle Process Death
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            LOGE("process died unexpectedly: %s", parse_status(status).c_str());
+            char status_str[256];
+            parse_status(status, status_str, sizeof(status_str));
+            LOGE("process died unexpectedly: %s", status_str);
             return false;
         }
 
@@ -208,7 +210,7 @@ static bool execute_remote_injection(int pid, const char *lib_path, uintptr_t en
 
     LOGI("Remote-Custom Linker success. entry: 0x%" PRIxPTR, injector_entry);
 
-    auto remote_tmp_path = push_string(pid, regs, zygiskd::GetTmpPath().c_str());
+    auto remote_tmp_path = push_string(pid, regs, zygiskd::GetTmpPath());
     long args[] = {
         (long)remote_base,
         (long)remote_size,
@@ -292,10 +294,11 @@ static bool wait_for_process(int pid, int *status) {
  * Shared logic between Seize and Attach methods.
  */
 static bool perform_injection(int pid) {
-    std::string lib_path = zygiskd::GetModDir();
-    lib_path += "/lib" LP_SELECT("", "64") "/libzygisk.so";
+    char lib_path[512];
+    snprintf(lib_path, sizeof(lib_path), "%s/lib%s/libzygisk.so", 
+             zygiskd::GetModDir(), LP_SELECT("", "64"));
 
-    if (!inject_on_main(pid, lib_path.c_str())) {
+    if (!inject_on_main(pid, lib_path)) {
         LOGE("failed to inject library into zygote (PID: %d)", pid);
         return false;
     }
@@ -389,15 +392,21 @@ static bool trace_with_seize(int pid) {
                 // 6. Workaround + Detach
                 return detach_with_gki_workaround(pid, SIGCONT);
             } else {
-                LOGE("unexpected state after SIGTRAP: %s", parse_status(status).c_str());
+                char status_str[256];
+                parse_status(status, status_str, sizeof(status_str));
+                LOGE("unexpected state after SIGTRAP: %s", status_str);
                 BAIL_AND_DETACH
             }
         } else {
-            LOGE("expected SIGTRAP after CONT, got: %s", parse_status(status).c_str());
+            char status_str[256];
+            parse_status(status, status_str, sizeof(status_str));
+            LOGE("expected SIGTRAP after CONT, got: %s", status_str);
             BAIL_AND_DETACH
         }
     } else {
-        LOGE("seize attached, but unexpected initial state: %s", parse_status(status).c_str());
+        char status_str[256];
+        parse_status(status, status_str, sizeof(status_str));
+        LOGE("seize attached, but unexpected initial state: %s", status_str);
         BAIL_AND_DETACH
     }
 
@@ -444,7 +453,9 @@ static bool trace_with_attach(int pid) {
         return detach_with_gki_workaround(pid, SIGCONT);
 
     } else {
-        LOGE("attach succeeded but process state unexpected: %s", parse_status(status).c_str());
+        char status_str[256];
+        parse_status(status, status_str, sizeof(status_str));
+        LOGE("attach succeeded but process state unexpected: %s", status_str);
         ptrace(PTRACE_DETACH, pid, 0, 0);
         return false;
     }

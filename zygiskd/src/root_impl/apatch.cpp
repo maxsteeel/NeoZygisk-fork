@@ -35,10 +35,11 @@ std::optional<Version> detect_version() {
     static std::once_flag flag;
 
     std::call_once(flag, []() {
-        auto output = utils::exec_command({"apd", "-V"});
+        char buf[256];
+        auto output = utils::exec_command({"apd", "-V"}, buf, sizeof(buf));
         if (!output) return;
 
-        const char* p = output.value().c_str();
+        const char* p = buf;
         while (*p && !isdigit(static_cast<unsigned char>(*p))) p++;
 
         if (*p) {

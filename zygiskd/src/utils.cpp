@@ -54,8 +54,9 @@ bool set_socket_create_context(const char* context) {
     return false;
 }
 
-std::string get_current_attr() {
-    char buf[256] = {0};
+const char* get_current_attr() {
+    static char buf[256] = {0};
+    memset(buf, 0, sizeof(buf));
     UniqueFd fd(open("/proc/self/attr/current", O_RDONLY | O_CLOEXEC));
     if (fd >= 0) {
         // Use normal 'read', since the file has variable size
@@ -66,16 +67,17 @@ std::string get_current_attr() {
                 buf[r-1] = '\0';
                 r--;
             }
-            return std::string(buf, r);
+            return buf;
         }
     }
     return "";
 }
 
-std::string get_property(const char* name) {
-    char value[PROP_VALUE_MAX] = {0};
+const char* get_property(const char* name) {
+    static char value[PROP_VALUE_MAX] = {0};
+    memset(value, 0, sizeof(value));
     if (__system_property_get(name, value) > 0) {
-        return std::string(value);
+        return value;
     }
     return "";
 }
@@ -83,8 +85,8 @@ std::string get_property(const char* name) {
 // --- Unix Socket and IPC Extensions ---
 
 bool unix_datagram_sendto(const char* path, const void* buf, size_t len) {
-    std::string attr = get_current_attr();
-    if (!set_socket_create_context(attr.c_str())) {
+    const char* attr = get_current_attr();
+    if (!set_socket_create_context(attr)) {
         PLOGE("unix_datagram_sendto: set_socket_create_context(attr)");
         return false;
     }
@@ -142,12 +144,12 @@ bool is_socket_alive(int fd) {
     return (pfd.revents & ~POLLIN) == 0;
 }
 
-std::optional<std::string> exec_command(std::initializer_list<const char*> args) {
-    if (args.size() == 0) return std::nullopt;
+bool exec_command(std::initializer_list<const char*> args, char* out_buf, size_t out_size) {
+    if (args.size() == 0 || out_buf == nullptr) return false;
 
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) == -1) {
-        return std::nullopt;
+        return false;
     }
 
     UniqueFd read_pipe(pipefd[0]);
@@ -155,7 +157,7 @@ std::optional<std::string> exec_command(std::initializer_list<const char*> args)
 
     pid_t pid = fork();
     if (pid == -1) {
-        return std::nullopt;
+        return false;
     }
 
     if (pid == 0) {
@@ -214,24 +216,20 @@ std::optional<std::string> exec_command(std::initializer_list<const char*> args)
     }
 
     write_pipe = UniqueFd();
-    std::string result;
-    char buf[256];
+    size_t total_read = 0;
     ssize_t n;
-
-    while ((n = read(read_pipe, buf, sizeof(buf))) > 0) {
-        result.append(buf, n);
+    
+    // Trim trailing whitespace and newlines
+    while (total_read < out_size - 1 && (n = read(read_pipe, out_buf + total_read, out_size - 1 - total_read)) > 0) {
+        total_read += n;
     }
-
+    out_buf[total_read] = '\0'; // null terminator
+    
+    // Wait for the child process to avoid leaving zombies
     int status;
     waitpid(pid, &status, 0);
-
-    // Trim trailing whitespace and newlines
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r' || result.back() == ' ')) {
-        result.pop_back();
-    }
-
-    if (result.empty()) return std::nullopt;
-    return result;
+    
+    return total_read > 0;
 }
 
 } // namespace utils

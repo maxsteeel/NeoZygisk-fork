@@ -12,7 +12,7 @@
 #define LP_SELECT(lp32, lp64) lp32
 #endif
 
-extern std::string kCPSocketName;
+extern const char* kCPSocketName;
 
 class UniqueFd {
     using Fd = int;
@@ -87,8 +87,8 @@ enum class MountNamespace { Clean, Root };
 
 void Init(const char *path, const char *mod_dir);
 
-std::string GetTmpPath();
-std::string GetModDir();
+const char* GetTmpPath();
+const char* GetModDir();
 
 bool PingHeartbeat();
 

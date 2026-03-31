@@ -115,7 +115,7 @@ public:
     // Public Interface for state changes and notifications
     void update_status();
     void request_start();
-    void request_stop(std::string reason);
+    void request_stop(const char* reason);
     void request_exit();
     void notify_init_detached();
 
@@ -164,7 +164,7 @@ private:
         std::vector<int> stub_processes_;
     };
 
-    void write_abi_status_section(std::string &status_text, const Status &daemon_status);
+    void write_abi_status_section(char *status_text, const Status &daemon_status);
 
     // Owned Components (Declaration order must match initializer list)
     EventLoop event_loop_;
@@ -174,11 +174,11 @@ private:
 
     // Private State
     TracingState tracing_state_;
-    std::string monitor_stop_reason_;
-    std::string prop_path_;
-    std::string pre_section_;
-    std::string post_section_;
+    char monitor_stop_reason_[128];
+    char prop_path_[256];
+    char pre_section_[1024];
+    char post_section_[1024];
+    char final_output_[4096];
 
     UniqueFd prop_fd_;
-    std::string final_output_;
 };

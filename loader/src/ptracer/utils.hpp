@@ -127,7 +127,7 @@ int fork_dont_care();
 
 void wait_for_trace(int pid, int *status, int flags);
 
-std::string parse_status(int status);
+void parse_status(int status, char* out_buf, size_t out_size);
 
 #define WPTEVENT(x) (x >> 16)
 

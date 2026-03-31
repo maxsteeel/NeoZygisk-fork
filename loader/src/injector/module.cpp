@@ -670,11 +670,11 @@ bool abort_zygote_unmount(const std::vector<mount_info> &traces, uint32_t info_f
     }
     bool is_magisk = info_flags & PROCESS_ROOT_IS_MAGISK;
     for (const auto &trace : traces) {
-        if (trace.target.starts_with("/product")) {
-            if (trace.target.starts_with("/product/bin")) continue;
-            if (!is_magisk && trace.target != "/product") continue;
+        if (strncmp(trace.target, "/product", 8) == 0) {
+            if (strncmp(trace.target, "/product/bin", 12) == 0) continue;
+            if (!is_magisk && strcmp(trace.target, "/product") != 0) continue;
             // workaround for zygote resource overlay (JingMatrix/NeoZygisk#26)
-            LOGV("abort unmounting zygote due to prohibited target: [%s]", trace.raw_info.c_str());
+            LOGV("abort unmounting zygote due to prohibited target: [%s]", trace.target);
             return true;
         }
     }
@@ -698,10 +698,10 @@ void ZygiskContext::nativeSpecializeAppProcess_pre() {
         if (!abort_zygote_unmount(traces, info_flags)) {
             for (const auto &trace : traces) {
                 // Fix Magisk root loss: we omitted elements of "magisk"
-                if (trace.source == "magisk") continue;
+                if (strcmp(trace.source, "magisk") == 0) continue;
 
-                LOGV("AppZygote unmounting %s", trace.target.c_str());
-                umount2(trace.target.c_str(), MNT_DETACH);
+                LOGV("AppZygote unmounting %s", trace.target);
+                umount2(trace.target, MNT_DETACH);
             }
             // After unmounting, we can clear the traces to prevent the SystemServer
             // from inheriting them, which may cause issues with the SystemServer's
@@ -731,16 +731,15 @@ void ZygiskContext::nativeForkAndSpecialize_pre() {
         if (!abort_zygote_unmount(g_hook->zygote_traces, info_flags)) {
             auto removal_predicate = [](const mount_info &trace) {
                 // Fix Magisk root loss: skip unmounting items tagged as "magisk"
-                if (trace.source == "magisk") {
-                    LOGV("skip magisk specific mounts for compatibility: %s",
-                         trace.raw_info.c_str());
+                if (strcmp(trace.source, "magisk") == 0) {
+                    LOGV("skip magisk specific mounts for compatibility: %s", trace.source);
                     return false;  // Return false to keep this trace in the vector/mount list
                 }
-                LOGV("unmounting %s (mnt_id: %u)", trace.target.c_str(), trace.id);
-                if (umount2(trace.target.c_str(), MNT_DETACH) == 0) {
+                LOGV("unmounting %s (mnt_id: %u)", trace.target, trace.id);
+                if (umount2(trace.target, MNT_DETACH) == 0) {
                     return true;  // Success: Mark for removal.
                 } else {
-                    LOGE("failed to unmount %s: %s", trace.target.c_str(), strerror(errno));
+                    LOGE("failed to unmount %s: %s", trace.target, strerror(errno));
                     return false;  // Failure: Keep this trace in the vector.
                 }
             };

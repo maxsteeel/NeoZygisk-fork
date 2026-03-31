@@ -1,14 +1,11 @@
 #include <fcntl.h>
 #include <algorithm>
 #include <string_view>
+#include <cstring>
 
 #include "daemon.hpp"
 #include "logging.hpp"
 #include "module.hpp"
-
-static bool starts_with(std::string_view str, std::string_view prefix) {
-    return str.starts_with(prefix);
-}
 
 std::vector<mount_info> check_zygote_traces(uint32_t info_flags) {
     std::vector<mount_info> traces;
@@ -42,7 +39,7 @@ std::vector<mount_info> check_zygote_traces(uint32_t info_flags) {
         return traces;
     }
 
-    std::string kernel_su_module_source;
+    char kernel_su_module_source[256] = {0};
     char* saveptr = nullptr;
     char* line = strtok_r(buf, "\n", &saveptr);
 
@@ -54,34 +51,22 @@ std::vector<mount_info> check_zygote_traces(uint32_t info_flags) {
         }
 
         mount_info info = {};
-        char root_buf[512] = {0};
-        char target_buf[512] = {0};
-        char type_buf[128] = {0};
-        char source_buf[512] = {0};
 
-        if (sscanf(line, "%d %d %*s %511s %511s", &info.id, &info.parent, root_buf, target_buf) == 4) {
-            info.root = root_buf;
-            info.target = target_buf;
-        }
+        if (sscanf(line, "%u %u %*s %127s %255s", &info.id, &info.parent, info.root, info.target) >= 4) {
+            if (sscanf(separator + 3, "%63s %255s", info.type, info.source) >= 2) {
+                if (is_kernelsu && strcmp(info.target, "/data/adb/modules") == 0 && 
+                    strncmp(info.source, "/dev/block/loop", 15) == 0) {
+                    strlcpy(kernel_su_module_source, info.source, sizeof(kernel_su_module_source));
+                }
+                bool should_unmount = (strstr(line, "/adb/") != nullptr) || 
+                                     (strcmp(info.source, mount_source_name) == 0) ||
+                                     (kernel_su_module_source[0] != '\0' && 
+                                      strcmp(info.source, kernel_su_module_source) == 0);
 
-        if (sscanf(separator + 3, "%127s %511s", type_buf, source_buf) == 2) {
-            info.type = type_buf;
-            info.source = source_buf;
-        }
-
-        info.raw_info = line;
-
-        if (is_kernelsu && info.target == "/data/adb/modules" && starts_with(info.source, "/dev/block/loop")) {
-            kernel_su_module_source = info.source;
-        }
-
-        const bool should_unmount =
-            (strstr(line, "/adb/") != nullptr) || 
-            (info.source == std::string(mount_source_name)) ||
-            (!kernel_su_module_source.empty() && info.source == kernel_su_module_source);
-
-        if (should_unmount) {
-            traces.push_back(std::move(info));
+                if (should_unmount) {
+                    traces.push_back(info);
+                }
+            }
         }
 
         line = strtok_r(nullptr, "\n", &saveptr);

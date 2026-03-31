@@ -122,7 +122,7 @@ void custom_linker_unload(void* handle) {
 }
 
 struct LoadedModule {
-    std::string path;
+    char path[256];
     uintptr_t load_bias;
     uintptr_t base;
     size_t size;
@@ -732,14 +732,14 @@ static bool apply_relr_section(int fd, uintptr_t load_bias, off_t relr_off, size
 static bool apply_module_relocations(int memfd, LoadedModule& mod, const std::vector<LoadedModule>& loaded_modules) {
     UniqueFd fd;
 
-    if (mod.path == "main_module" && memfd >= 0) {
+    if (strcmp(mod.path, "main_module") == 0 && memfd >= 0) {
         fd = UniqueFd(dup(memfd));
     } else {
-        fd = UniqueFd(open(mod.path.c_str(), O_RDONLY | O_CLOEXEC));
+        fd = UniqueFd(open(mod.path, O_RDONLY | O_CLOEXEC));
     }
 
     if (fd < 0) {
-        LOGE("Failed to open module file for relocations: %s", mod.path.c_str());
+        LOGE("Failed to open module file for relocations: %s", mod.path);
         return false;
     }
 
@@ -752,10 +752,10 @@ static bool apply_module_relocations(int memfd, LoadedModule& mod, const std::ve
         if (off < mod.dinfo.strsz) {
             const char *soname = &mod.dinfo.strtab[off];
             for (const auto& m : loaded_modules) {
-                const char *m_name = strrchr(m.path.c_str(), '/');
-                m_name = m_name ? m_name + 1 : m.path.c_str();
+                const char *m_name = strrchr(m.path, '/');
+                m_name = m_name ? m_name + 1 : m.path;
                 if (strcmp(m_name, soname) == 0) {
-                    needed_paths[i] = m.path.c_str();
+                    needed_paths[i] = m.path;
                     break;
                 }
             }
@@ -865,7 +865,7 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
         dinfo.tls_mod_id = tls_info->module_id;
     }
 
-    out_module->path = lib_path;
+    strlcpy(out_module->path, lib_path, sizeof(out_module->path));
     out_module->load_bias = load_bias;
     out_module->base = remote_base;
     out_module->size = map_size;
@@ -930,8 +930,8 @@ static bool load_dependencies_recursive(const char *lib_path, int memfd, std::ve
     soname = soname ? soname + 1 : lib_path;
 
     for (const auto& m : loaded_modules) {
-        const char *m_name = strrchr(m.path.c_str(), '/');
-        m_name = m_name ? m_name + 1 : m.path.c_str();
+        const char *m_name = strrchr(m.path, '/');
+        m_name = m_name ? m_name + 1 : m.path;
         if (strcmp(m_name, soname) == 0) {
             return true; // Already loaded
         }
@@ -1046,7 +1046,7 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
         auto& mod = *it;
 
         if (!apply_module_relocations(memfd, mod, loaded_modules)) {
-            LOGE("Failed to apply relocations for module %s", mod.path.c_str());
+            LOGE("Failed to apply relocations for module %s", mod.path);
             cleanup_failed_load(loaded_modules);
             return false;
         }
@@ -1121,7 +1121,7 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
 
         // If it has NEITHER of the two, then it is an invalid module
         if (!has_companion_entry) {
-            LOGE("Module %s exports neither 'zygisk_module_entry' nor 'zygisk_companion_entry'. Invalid module.", main_mod.path.c_str());
+            LOGE("Module %s exports neither 'zygisk_module_entry' nor 'zygisk_companion_entry'. Invalid module.", main_mod.path);
             cleanup_failed_load(loaded_modules);
             return false;
         }

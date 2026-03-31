@@ -13,8 +13,8 @@ struct Status {
     bool zygote_injected = false;
     bool daemon_running = false;
     pid_t daemon_pid = -1;
-    std::string daemon_info;
-    std::string daemon_error_info;
+    char daemon_info[256];
+    char daemon_error_info[256];
 };
 
 struct StartCounter {

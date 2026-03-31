@@ -17,11 +17,13 @@ const Status& ZygoteAbiManager::get_status() const { return status_; }
 
 void ZygoteAbiManager::notify_injected() { status_.zygote_injected = true; }
 
-void ZygoteAbiManager::set_daemon_info(std::string_view info) { status_.daemon_info = info; }
+void ZygoteAbiManager::set_daemon_info(std::string_view info) { 
+    strlcpy(status_.daemon_info, info.data(), sizeof(status_.daemon_info)); 
+}
 
 void ZygoteAbiManager::set_daemon_crashed(std::string_view error) {
     status_.daemon_running = false;
-    status_.daemon_error_info = error;
+    strlcpy(status_.daemon_error_info, error.data(), sizeof(status_.daemon_error_info));
 }
 
 bool ZygoteAbiManager::is_in_crash_loop() {
@@ -45,10 +47,10 @@ bool ZygoteAbiManager::ensure_daemon_created() {
             return false;
         }
         if (pid == 0) {
-            std::string daemon_name = "./bin/zygiskd";
-            daemon_name += abi_name_;
-            execl(daemon_name.c_str(), daemon_name.c_str(), nullptr);
-            PLOGE("exec daemon %s", daemon_name.c_str());
+            char daemon_name[32];
+            snprintf(daemon_name, sizeof(daemon_name), "./bin/zygiskd%s", abi_name_);
+            execl(daemon_name, daemon_name, nullptr);
+            PLOGE("exec daemon %s", daemon_name);
             exit(1);
         }
         status_.supported = true;
@@ -72,11 +74,12 @@ const char* ZygoteAbiManager::check_and_prepare_injection() {
 
 bool ZygoteAbiManager::handle_daemon_exit_if_match(int pid, int process_status) {
     if (status_.supported && pid == status_.daemon_pid) {
-        auto status_str = parse_status(process_status);
-        LOGW("ZygoteAbiManager: daemon%s (pid %d) exited: %s", abi_name_, pid, status_str.c_str());
+        char status_str[256];
+        parse_status(process_status, status_str, sizeof(status_str));
+        LOGW("ZygoteAbiManager: daemon%s (pid %d) exited: %s", abi_name_, pid, status_str);
         status_.daemon_running = false;
-        if (status_.daemon_error_info.empty()) {
-            status_.daemon_error_info = status_str;
+        if (status_.daemon_error_info[0] == '\0') {
+            strlcpy(status_.daemon_error_info, status_str, sizeof(status_.daemon_error_info));
         }
         monitor_.update_status();
         return true;

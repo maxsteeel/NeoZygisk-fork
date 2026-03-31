@@ -352,7 +352,9 @@ uintptr_t remote_call(int pid, struct user_regs_struct &regs, uintptr_t func_add
         }
 
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            LOGE("process died unexpectedly after remote call: %s", parse_status(status).c_str());
+            char status_str[256];
+            parse_status(status, status_str, sizeof(status_str));
+            LOGE("process died unexpectedly after remote call: %s", status_str);
             return 0;
         }
 
@@ -503,7 +505,9 @@ void wait_for_trace(int pid, int *status, int flags) {
 
         // If the process terminated or signaled instead of stopping, it's an error.
         if (!WIFSTOPPED(*status)) {
-            LOGE("process %d did not stop as expected: %s", pid, parse_status(*status).c_str());
+            char status_str[256];
+            parse_status(*status, status_str, sizeof(status_str));
+            LOGE("process %d did not stop as expected: %s", pid, status_str);
             exit(1);
         }
 
@@ -512,32 +516,16 @@ void wait_for_trace(int pid, int *status, int flags) {
     }
 }
 
-std::string parse_status(int status) {
-    char buf[256];
-
-    int len = snprintf(buf, sizeof(buf), "0x%x ", status);
-    std::string result(buf, len);
-
+void parse_status(int status, char* out_buf, size_t out_size) {
     if (WIFEXITED(status)) {
-        snprintf(buf, sizeof(buf), "exited with %d", WEXITSTATUS(status));
-        result += buf;
+        snprintf(out_buf, out_size, "exited with %d", WEXITSTATUS(status));
     } else if (WIFSIGNALED(status)) {
-        int term_sig = WTERMSIG(status);
-        const char *sig_name = sigabbrev_np(term_sig);
-        snprintf(buf, sizeof(buf), "signaled with %s(%d)", sig_name ? sig_name : "UNKNOWN",
-                 term_sig);
-        result += buf;
+        snprintf(out_buf, out_size, "killed by signal %d (%s)", WTERMSIG(status), sigabbrev_np(WTERMSIG(status)));
     } else if (WIFSTOPPED(status)) {
-        int stop_sig = WSTOPSIG(status);
-        const char *sig_name = sigabbrev_np(stop_sig);
-        snprintf(buf, sizeof(buf), "stopped by signal=%s(%d),event=%s",
-                 sig_name ? sig_name : "UNKNOWN", stop_sig, parse_ptrace_event(status));
-        result += buf;
+        snprintf(out_buf, out_size, "stopped by signal %d (%s)", WSTOPSIG(status), sigabbrev_np(WSTOPSIG(status)));
     } else {
-        result += "unknown";
+        snprintf(out_buf, out_size, "unknown status 0x%x", status);
     }
-
-    return result;
 }
 
 /**
@@ -671,7 +659,9 @@ long remote_syscall(int pid, struct user_regs_struct &regs, uintptr_t syscall_ga
     wait_for_trace(pid, &status, __WALL);
 
     if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-        LOGE("remote syscall unexpected stop: %s", parse_status(status).c_str());
+        char status_str[256];
+        parse_status(status, status_str, sizeof(status_str));
+        LOGE("remote syscall unexpected stop: %s", status_str);
         set_regs(pid, saved_regs);
         return -1;
     }

@@ -7,13 +7,12 @@ struct mount_info {
     unsigned int id;
     unsigned int parent;
     dev_t device;
-    std::string root;
-    std::string target;
-    std::string vfs_options;
-    std::string type;
-    std::string source;
-    std::string fs_options;
-    std::string raw_info;
+    char root[128];       
+    char target[256];     
+    char vfs_options[128];
+    char type[64];        
+    char source[256];     
+    char fs_options[128];
 };
 
 void hook_entry(void *start_addr, size_t block_size);

@@ -14,9 +14,9 @@
 constants::ZygiskSharedData* g_shared_data = nullptr;
 
 namespace zygiskd {
-static std::string TMP_PATH;
-static std::string MODULE_DIR;
-std::string kCPSocketName = (sizeof(void*) == 8) ? "cp64.sock" : "cp32.sock";
+static char TMP_PATH[256] = {0};
+static char MODULE_DIR[256] = {0};
+const char* kCPSocketName = (sizeof(void*) == 8) ? "cp64.sock" : "cp32.sock";
 
 void UnmapSharedMemory() {
     if (g_shared_data) {
@@ -26,22 +26,22 @@ void UnmapSharedMemory() {
 }
 
 void Init(const char *path, const char *mod_dir) {
-    TMP_PATH = path;
-    MODULE_DIR = mod_dir ? mod_dir : "";
-    setenv("TMP_PATH", TMP_PATH.data(), 0);
-    setenv("ZYGISK_MODDIR", MODULE_DIR.data(), 0);
+    if (path) strlcpy(TMP_PATH, path, sizeof(TMP_PATH));
+    if (mod_dir) strlcpy(MODULE_DIR, mod_dir, sizeof(MODULE_DIR));
+    setenv("TMP_PATH", TMP_PATH, 0);
+    setenv("ZYGISK_MODDIR", MODULE_DIR, 0);
 }
 
-std::string GetTmpPath() { return TMP_PATH; }
-std::string GetModDir() { return MODULE_DIR; }
+const char* GetTmpPath() { return TMP_PATH; }
+const char* GetModDir() { return MODULE_DIR; }
 
 int Connect(uint8_t retry) {
     UniqueFd fd(socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
 
-    memcpy(addr.sun_path + 1, kCPSocketName.c_str(), kCPSocketName.size());
-    socklen_t socklen = sizeof(addr.sun_family) + kCPSocketName.size() + 1;
+    memcpy(addr.sun_path + 1, kCPSocketName, strlen(kCPSocketName));
+    socklen_t socklen = sizeof(addr.sun_family) + strlen(kCPSocketName) + 1;
 
     while (retry--) {
         int r = connect(fd, reinterpret_cast<struct sockaddr *>(&addr), socklen);

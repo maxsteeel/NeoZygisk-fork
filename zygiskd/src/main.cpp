@@ -9,6 +9,7 @@
 #include "companion.hpp"
 #include "root_impl.hpp"
 #include "mount.hpp"
+#include "utils.hpp"
 
 // We are providing our own Android logger equivalent if building daemon directly or linking common logging.
 // common logging uses Android __android_log_print and PLOGE/LOGE macros.
@@ -17,7 +18,7 @@ int main(int argc, char** argv) {
 #ifndef NDEBUG
     const char* env_fd = getenv("ZYGISK_COMPANION_FD");
     if (env_fd != nullptr) {
-        int fd = atoi(env_fd);
+        int fd = fast_atoi(env_fd);
         unsetenv("ZYGISK_COMPANION_FD");
         companion::entry(fd);
         return 0;
@@ -27,7 +28,7 @@ int main(int argc, char** argv) {
     if (argc >= 2) {
         if (strcmp(argv[1], "companion") == 0) {
             if (argc >= 3) {
-                int fd = atoi(argv[2]);
+                int fd = fast_atoi(argv[2]);
                 companion::entry(fd);
             } else {
                 LOGE("Companion: Missing file descriptor argument.");

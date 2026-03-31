@@ -58,7 +58,7 @@ using zygisk_mount::MountNamespaceManager;
 using zygisk_mount::switch_mount_namespace;
 
 struct Module {
-    std::string name;
+    char name[256];
     UniqueFd lib_fd;
     std::mutex companion_mutex;
     UniqueFd companion_fd;
@@ -73,24 +73,22 @@ struct AppContext {
     MountNamespaceManager* mount_manager;
 };
 
-static std::string TMP_PATH;
-static std::string CONTROLLER_SOCKET;
-static std::string DAEMON_SOCKET_PATH;
+static char TMP_PATH[256] = {0};
+static char CONTROLLER_SOCKET[256] = {0};
+static const char* const DAEMON_SOCKET_PATH = LP_SELECT("cp32.sock", "cp64.sock");
 
 static UniqueFd g_shm_fd;
 static constants::ZygiskSharedData* g_shm_base = nullptr;
 static std::mutex g_shm_write_mutex;
 
 static bool initialize_globals() {
-    const char* tmp = getenv("TMP_PATH");
-    if (!tmp) {
+    const char* env_tmp = getenv("TMP_PATH");
+    if (!env_tmp) {
         LOGE("TMP_PATH environment variable not set");
         return false;
     }
-    TMP_PATH = tmp;
-
-    CONTROLLER_SOCKET = TMP_PATH + "/init_monitor";
-    DAEMON_SOCKET_PATH = LP_SELECT("cp32.sock", "cp64.sock");
+    strlcpy(TMP_PATH, env_tmp, sizeof(TMP_PATH));
+    snprintf(CONTROLLER_SOCKET, sizeof(CONTROLLER_SOCKET), "%s/init_monitor", TMP_PATH);
 
     // Initialize Shared Memory
     g_shm_fd = UniqueFd(memfd_create("zygisk-shm", MFD_ALLOW_SEALING | MFD_CLOEXEC));
@@ -182,55 +180,50 @@ static void shm_refresh_thread() {
 
 static bool send_startup_info(Module** modules, size_t module_count) {
     uint8_t msg[4096];
-    size_t msg_len = 0;
+    memset(msg, 0, sizeof(msg));
 
-    auto append = [&](const void* data, size_t size) {
-        if (msg_len + size <= sizeof(msg)) {
-            memcpy(msg + msg_len, data, size);
-            msg_len += size;
-        }
-    };
-    
+    uint32_t* magic_ptr = reinterpret_cast<uint32_t*>(msg);
+    char* info_ptr = reinterpret_cast<char*>(msg + 8);
+    size_t max_info_sz = sizeof(msg) - 8 - 1;
+
     auto root = root_impl::get();
-    std::string info;
-    std::string root_name;
+    const char* root_name = "Unknown";
+    if (root == root_impl::RootImpl::APatch) root_name = "APatch";
+    else if (root == root_impl::RootImpl::KernelSU) root_name = "KernelSU";
+    else if (root == root_impl::RootImpl::Magisk) root_name = "Magisk";
 
-    if (root == root_impl::RootImpl::APatch || root == root_impl::RootImpl::KernelSU || root == root_impl::RootImpl::Magisk) {
-        uint32_t magic = constants::DAEMON_SET_INFO;
-        append(&magic, 4);
-
-        if (root == root_impl::RootImpl::APatch) root_name = "APatch";
-        else if (root == root_impl::RootImpl::KernelSU) root_name = "KernelSU";
-        else if (root == root_impl::RootImpl::Magisk) root_name = "Magisk";
-
-        if (module_count > 0) {
-            info = "\t\tRoot: " + root_name + "\n\t\tModules (" + to_str(module_count) + "):\n\t\t\t";
-            for (size_t i = 0; i < module_count; ++i) {
-                info += modules[i]->name;
-                if (i != module_count - 1) info += "\n\t\t\t";
-            }
-        } else {
-            info = "\t\tRoot: " + root_name;
-        }
+    if (strcmp(root_name, "Unknown") == 0) {
+        *magic_ptr = constants::DAEMON_SET_ERROR_INFO;
+        strlcpy(info_ptr, "\t\tInvalid root implementation.", max_info_sz);
     } else {
-        uint32_t magic = constants::DAEMON_SET_ERROR_INFO;
-        append(&magic, 4);
-        info = "\t\tInvalid root implementation.";
+        *magic_ptr = constants::DAEMON_SET_INFO;
+        int written = snprintf(info_ptr, max_info_sz, "\t\tRoot: %s", root_name);
+        if (module_count > 0) {
+            written += snprintf(info_ptr + written, max_info_sz - written, 
+                                "\n\t\tModules (%zu):\n\t\t\t", module_count);
+
+            for (size_t i = 0; i < module_count; ++i) {
+                written += snprintf(info_ptr + written, max_info_sz - written, "%s", modules[i]->name);
+                if (i != module_count - 1) {
+                    written += snprintf(info_ptr + written, max_info_sz - written, "\n\t\t\t");
+                }
+                if (written >= (int)max_info_sz - 10) break; 
+            }
+        }
     }
 
-    uint32_t len = info.size() + 1;
-    append(&len, 4);
-    append(info.c_str(), len);
+    uint32_t text_len = strlen(info_ptr) + 1;
+    memcpy(msg + 4, &text_len, 4);
 
-    return utils::unix_datagram_sendto(CONTROLLER_SOCKET.c_str(), msg, msg_len);
+    size_t total_msg_len = 8 + text_len;
+    return utils::unix_datagram_sendto(CONTROLLER_SOCKET, msg, total_msg_len);
 }
 
-static std::string get_arch() {
-    std::string system_arch = utils::get_property("ro.product.cpu.abi");
-    if (system_arch.find("arm") != std::string::npos) {
-        return LP_SELECT("armeabi-v7a", "arm64-v8a");
-    } else if (system_arch.find("x86") != std::string::npos) {
-        return LP_SELECT("x86", "x86_64");
+static const char* get_arch() {
+    char abi[PROP_VALUE_MAX];
+    if (__system_property_get("ro.product.cpu.abi", abi) > 0) {
+        if (strstr(abi, "arm")) return LP_SELECT("armeabi-v7a", "arm64-v8a");
+        if (strstr(abi, "x86")) return LP_SELECT("x86", "x86_64");
     }
     return "";
 }
@@ -271,14 +264,14 @@ static int create_library_fd(const char* so_path) {
 
 static void load_modules(AppContext* context) {
     context->module_count = 0;
-    std::string arch = get_arch();
+    const char* arch = get_arch();
 
-    if (arch.empty()) {
+    if (arch[0] == '\0') {
         LOGE("Unsupported system architecture");
         return;
     }
 
-    LOGD("Daemon architecture: %s", arch.c_str());
+    LOGD("Daemon architecture: %s", arch);
 
     UniqueDir dir(opendir(constants::PATH_MODULES_DIR));
     if (!dir) {
@@ -301,14 +294,14 @@ static void load_modules(AppContext* context) {
         if (stat(disable_path, &st) == 0) continue; // Disabled
 
         char so_path[256];
-        snprintf(so_path, sizeof(so_path), "%s/%s/zygisk/%s.so", constants::PATH_MODULES_DIR, entry->d_name, arch.c_str());
+        snprintf(so_path, sizeof(so_path), "%s/%s/zygisk/%s.so", constants::PATH_MODULES_DIR, entry->d_name, arch);
         if (stat(so_path, &st) != 0) continue; // No so file
 
         LOGI("Loading module `%s`...", entry->d_name);
         int lib_fd = create_library_fd(so_path);
         if (lib_fd >= 0) {
             Module* mod = new Module(); 
-            mod->name = entry->d_name;
+            strlcpy(mod->name, entry->d_name, sizeof(mod->name));
             mod->lib_fd = lib_fd;
             context->modules[context->module_count] = mod;
             context->module_count++;
@@ -325,9 +318,9 @@ static int create_daemon_socket() {
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     addr.sun_path[0] = '\0';
-    strncpy(addr.sun_path + 1, DAEMON_SOCKET_PATH.c_str(), sizeof(addr.sun_path) - 2);
+    strncpy(addr.sun_path + 1, DAEMON_SOCKET_PATH, sizeof(addr.sun_path) - 2);
 
-    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + DAEMON_SOCKET_PATH.size() + 1;
+    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + strlen(DAEMON_SOCKET_PATH) + 1;
 
     if (bind(fd, reinterpret_cast<struct sockaddr*>(&addr), addr_len) < 0) {
         PLOGE("bind");
@@ -513,24 +506,24 @@ static void handle_request_companion_socket(int stream, AppContext* context) {
 
     if (module->companion_fd >= 0) {
         if (!utils::is_socket_alive(module->companion_fd)) {
-            LOGE("Companion for module `%s` appears to have crashed.", module->name.c_str());
+            LOGE("Companion for module `%s` appears to have crashed.", module->name);
             module->companion_fd = UniqueFd();
         }
     }
 
     if (module->companion_fd < 0) {
-        int sock = spawn_companion_complete(module->name.c_str(), module->lib_fd);
+        int sock = spawn_companion_complete(module->name, module->lib_fd);
         if (sock >= 0) {
-            LOGV("Spawned new companion for `%s`.", module->name.c_str());
+            LOGV("Spawned new companion for `%s`.", module->name);
             module->companion_fd = UniqueFd(sock);
         } else {
-            LOGW("Module `%s` does not have a companion entry point or failed.", module->name.c_str());
+            LOGW("Module `%s` does not have a companion entry point or failed.", module->name);
         }
     }
 
     if (module->companion_fd >= 0) {
         if (!socket_utils::send_fd(module->companion_fd, stream)) {
-            LOGE("Failed to send companion socket FD for module `%s`", module->name.c_str());
+            LOGE("Failed to send companion socket FD for module `%s`", module->name);
             socket_utils::write_u8(stream, 0);
         }
     } else {
@@ -543,7 +536,7 @@ static void handle_get_module_dir(int stream, AppContext* context) {
     if (index >= context->module_count) return;
     auto module = context->modules[index];
     char dir_path[256];
-    snprintf(dir_path, sizeof(dir_path), "%s/%s", constants::PATH_MODULES_DIR, module->name.c_str());
+    snprintf(dir_path, sizeof(dir_path), "%s/%s", constants::PATH_MODULES_DIR, module->name);
     UniqueFd dir_fd(open(dir_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     if (dir_fd >= 0) socket_utils::send_fd(stream, dir_fd);
 }
@@ -573,7 +566,7 @@ static void handle_connection(UniqueFd stream, AppContext* context) {
         }
         case DaemonSocketAction::PingHeartbeat: {
             uint32_t val = constants::ZYGOTE_INJECTED;
-            utils::unix_datagram_sendto(CONTROLLER_SOCKET.c_str(), &val, sizeof(val));
+            utils::unix_datagram_sendto(CONTROLLER_SOCKET, &val, sizeof(val));
             break;
         }
         case DaemonSocketAction::ZygoteRestart: {
@@ -589,7 +582,7 @@ static void handle_connection(UniqueFd stream, AppContext* context) {
         }
         case DaemonSocketAction::SystemServerStarted: {
             uint32_t val = constants::SYSTEM_SERVER_STARTED;
-            utils::unix_datagram_sendto(CONTROLLER_SOCKET.c_str(), &val, sizeof(val));
+            utils::unix_datagram_sendto(CONTROLLER_SOCKET, &val, sizeof(val));
             break;
         }
         case DaemonSocketAction::GetSharedMemoryFd:
@@ -671,7 +664,7 @@ int main() {
         return 1;
     }
 
-    LOGI("Daemon listening on %s", DAEMON_SOCKET_PATH.c_str());
+    LOGI("Daemon listening on %s", DAEMON_SOCKET_PATH);
 
     while (true) {
         UniqueFd stream = accept(listener, nullptr, nullptr);

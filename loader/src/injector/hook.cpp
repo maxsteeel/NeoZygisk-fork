@@ -89,8 +89,9 @@ static string generate_random_hex(int len) {
 }
 
 void InitRandomVbmeta() {
-    // 生成 64 hex characters 的隨機值
-    std::string fake_digest = generate_random_hex(64);
+    // Generate a random value of 64 hex characters
+    char fake_digest[65] = {0};
+    strcpy(fake_digest, generate_random_hex(64).c_str());
     g_spoof_props.push_back({"ro.boot.vbmeta.digest", fake_digest});
 }
 
