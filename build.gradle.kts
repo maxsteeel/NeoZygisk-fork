@@ -39,6 +39,7 @@ val androidTargetCompatibility by extra(JavaVersion.VERSION_21)
 
 tasks.register("Delete", Delete::class) {
     delete(rootProject.layout.buildDirectory)
+    delete(rootProject.layout.projectDirectory.dir(".cxx"))
 }
 
 fun Project.configureBaseExtension() {
@@ -61,5 +62,8 @@ fun Project.configureBaseExtension() {
 subprojects {
     plugins.withId("com.android.library") {
         configureBaseExtension()
+    }
+    tasks.withType<Delete>().configureEach {
+        delete(layout.projectDirectory.dir(".cxx"))
     }
 }

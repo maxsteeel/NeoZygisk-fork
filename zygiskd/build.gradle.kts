@@ -13,13 +13,20 @@ val defaultCFlags = arrayOf(
 )
 
 val releaseFlags = arrayOf(
-    "-Oz", "-flto", "-g0",
+    "-Oz", "-flto", "-g0", "-fno-math-errno",
+    "-fno-use-cxa-atexit", "-fno-threadsafe-statics", "-fno-unroll-loops", 
+    "-falign-functions=1", "-fno-jump-tables", "-fno-c++-static-destructors",
+    "-fno-keep-static-consts", "-fno-keep-persistent-storage-variables",
+    "-fno-register-global-dtors-with-atexit", "-fwhole-program-vtables",
+    "-fno-common", "-fno-verbose-asm", "-fvirtual-function-elimination",
     "-Wno-unused", "-Wno-unused-parameter",
     "-fvisibility=hidden", "-fvisibility-inlines-hidden",
     "-fno-unwind-tables", "-fno-asynchronous-unwind-tables"
 )
 
 val linkerFlags = arrayOf(
+    "-unwindlib=none", "-Wl,--no-rosegment",
+    "-Wl,--discard-all", "-Wl,--no-eh-frame-hdr",
     "-Wl,--exclude-libs,ALL", "-Wl,--gc-sections", 
     "-Wl,--strip-all", "-Wl,-z,norelro",
     "-Wl,--build-id=none", "-Wl,-s",
@@ -34,9 +41,8 @@ android {
         externalNativeBuild {
             cmake {
                 cFlags("-std=c18", *defaultCFlags)
-		cppFlags("-std=c++23", *defaultCFlags)
+		        cppFlags("-std=c++23", *defaultCFlags)
                 arguments(
-                    "-DANDROID_STL=c++_static",
                     "-DZKSU_VERSION=\"${rootProject.extra["verName"]}\"",
                     "-DMIN_APATCH_VERSION=${rootProject.extra["minAPatchVersion"]}",
                     "-DMIN_KSU_VERSION=${rootProject.extra["minKsuVersion"]}",

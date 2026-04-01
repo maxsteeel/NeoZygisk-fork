@@ -89,5 +89,9 @@ extern "C" {
     KEEP void _ZNSt6__ndk117__assoc_sub_state16__on_zero_sharedEv() {}
     KEEP void _ZNSt6__ndk117__assoc_sub_state9__executeEv() {}
     KEEP void _ZNSt6__ndk117__assoc_sub_state12__make_readyEv() {}
+    KEEP void _Unwind_Resume(void*) {}
+    KEEP int _Unwind_RaiseException(void*) { return 0; }
+    KEEP void __stub_atexit(void (*func)()) {}
+    __attribute__((weak, alias("__stub_atexit"))) void atexit(void (*func)());
 }
 #endif // NDEBUG

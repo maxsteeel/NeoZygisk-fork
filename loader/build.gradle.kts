@@ -34,17 +34,25 @@ val defaultCFlags = arrayOf(
     "-fno-ident", "-fmerge-all-constants",
     "-fno-semantic-interposition",
     "-Wno-builtin-macro-redefined", "-D__FILE__=__FILE_NAME__",
+    "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0",
     "-DWORK_DIRECTORY='\"${workDirectory}\"'"
 )
 
 val releaseFlags = arrayOf(
-    "-Oz", "-flto",
+    "-Oz", "-flto", "-fno-math-errno",
+    "-fno-use-cxa-atexit", "-fno-threadsafe-statics", "-fno-unroll-loops", 
+    "-falign-functions=1", "-fno-jump-tables", "-fno-c++-static-destructors",
+    "-fno-keep-static-consts", "-fno-keep-persistent-storage-variables",
+    "-fno-register-global-dtors-with-atexit", "-fwhole-program-vtables",
+    "-fno-common", "-fno-verbose-asm", "-fvirtual-function-elimination",
     "-Wno-unused", "-Wno-unused-parameter",
     "-fvisibility=hidden", "-fvisibility-inlines-hidden",
     "-fno-unwind-tables", "-fno-asynchronous-unwind-tables"
 )
 
 val linkerFlags = arrayOf(
+    "-unwindlib=none", "-Wl,--no-rosegment",
+    "-Wl,--discard-all", "-Wl,--no-eh-frame-hdr",
     "-Wl,--exclude-libs,ALL", "-Wl,--gc-sections", 
     "-Wl,--strip-all", "-Wl,-z,norelro",
     "-Wl,--build-id=none", "-Wl,-s", "-fno-plt",
