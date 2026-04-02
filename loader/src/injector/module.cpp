@@ -23,6 +23,7 @@
 #include "misc.hpp"
 #include "zygisk.hpp"
 #include "custom_linker.hpp"
+#include "utils.hpp"
 
 // Structure for the getdents64 syscall
 struct linux_dirent64 {
@@ -57,15 +58,6 @@ static void module_segv_handler(int sig, siginfo_t *info, void *context) {
             old_sa->sa_handler(sig);
         }
     }
-}
-
-// Extremely fast inline string-to-int parser (avoids atoi overhead)
-static inline int fast_atoi(const char *str) {
-    int val = 0;
-    while (*str >= '0' && *str <= '9') {
-        val = val * 10 + (*str++ - '0');
-    }
-    return val;
 }
 
 using namespace std;
@@ -426,6 +418,10 @@ void ZygiskContext::fork_pre() {
             }
         }
         allowed_fds[fd_dir] = false;
+    } else {
+        // If we fail to open the fd directory, assume all fds are allowed to avoid accidentally closing something important
+        LOGW("Failed to open /proc/self/fd to track open file descriptors. All fds will be allowed, which may cause issues if there are many open fds.");
+        memset(allowed_fds.data(), 1, allowed_fds.size());
     }
 }
 
@@ -475,8 +471,10 @@ void ZygiskContext::run_modules_pre() {
                 void* handle = reinterpret_cast<void*>(base); // Fake handle
                 void* entry = reinterpret_cast<void*>(entry_addr);
                 modules.emplace_back(i, handle, entry);
+                LOGV("Module `%s` loaded with custom linker at %p (size: 0x%zx)", m.name, handle, size_mod);
             } else {
                 // Fallback to DlopenMem if custom linker fails
+                LOGW("Custom linker failed for module `%s`. Falling back to dlopen.", m.name);
                 void *handle = DlopenMem(m.memfd, RTLD_NOW);
                 void *entry = handle ? dlsym(handle, "zygisk_module_entry") : nullptr;
                 if (handle && entry) {
@@ -487,9 +485,9 @@ void ZygiskContext::run_modules_pre() {
             LOGE("Module `%s` crashed during dlopen/dlsym. Disabling.", m.name);
             LOGW("WARNING: A crash during dlopen may leave the bionic linker mutex locked, "
                  "potentially causing a deadlock in future library loading.");
-            UniqueFd dir_fd(zygiskd::GetModuleDir(i));
-            if (dir_fd >= 0) {
-                UniqueFd fd(openat(dir_fd, "disable", O_CREAT | O_RDWR | O_CLOEXEC, 0644));
+
+            if (zygiskd::ReportModuleCrash(i) != 0) {
+                PLOGE("Failed to report module crash for module `%s`", m.name);
             }
         }
         g_in_module_load = 0;
@@ -511,11 +509,7 @@ void ZygiskContext::run_modules_pre() {
             }
         } else {
             crashed = true;
-            LOGE("Module crashed during onLoad/preSpecialize. Disabling.");
-            UniqueFd dir_fd(zygiskd::GetModuleDir(m.getId()));
-            if (dir_fd >= 0) {
-                UniqueFd fd(openat(dir_fd, "disable", O_CREAT | O_RDWR | O_CLOEXEC, 0644));
-            }
+            LOGE("Module `%s` crashed during onLoad/preSpecialize.", m.name);
         }
         g_in_module_load = 0;
 

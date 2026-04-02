@@ -541,6 +541,22 @@ static void handle_get_module_dir(int stream, AppContext* context) {
     if (dir_fd >= 0) socket_utils::send_fd(stream, dir_fd);
 }
 
+static void handle_report_module_crash(int stream, AppContext* context) {
+    size_t index = socket_utils::read_usize(stream);
+    if (index >= context->module_count) return;
+
+    auto module = context->modules[index];
+    char disable_path[256];
+    snprintf(disable_path, sizeof(disable_path), "%s/%s/disable", constants::PATH_MODULES_DIR, module->name);
+
+    int fd = open(disable_path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+    if (fd >= 0) {
+        close(fd);
+        LOGI("Module `%s` has been disabled by daemon after crash report.", module->name);
+    } else {
+        PLOGE("Failed to create disable file for `%s`", module->name);
+    }
+}
 
 static void handle_threaded_action(DaemonSocketAction action, int stream, AppContext* context) {
     switch (action) {
@@ -549,6 +565,7 @@ static void handle_threaded_action(DaemonSocketAction action, int stream, AppCon
         case DaemonSocketAction::ReadModules: handle_read_modules(stream, context); break;
         case DaemonSocketAction::RequestCompanionSocket: handle_request_companion_socket(stream, context); break;
         case DaemonSocketAction::GetModuleDir: handle_get_module_dir(stream, context); break;
+        case DaemonSocketAction::ReportModuleCrash: handle_report_module_crash(stream, context); break;
         default: break;
     }
 }

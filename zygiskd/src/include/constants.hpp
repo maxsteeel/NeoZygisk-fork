@@ -58,6 +58,7 @@ enum class DaemonSocketAction : uint8_t {
     SystemServerStarted,
     GetSharedMemoryFd,
     GetZygiskSharedData,
+    ReportModuleCrash,
 };
 
 // ProcessFlags bitmask

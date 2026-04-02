@@ -104,6 +104,8 @@ int ConnectCompanion(size_t index);
 
 int GetModuleDir(size_t index);
 
+int ReportModuleCrash(size_t index);
+
 void ZygoteRestart();
 
 void SystemServerStarted();

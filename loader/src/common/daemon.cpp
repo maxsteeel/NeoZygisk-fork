@@ -249,6 +249,28 @@ int GetModuleDir(size_t index) {
     return socket_utils::recv_fd(fd);
 }
 
+int ReportModuleCrash(size_t index) {
+    UniqueFd fd = Connect(1);
+    if (fd == -1) {
+        PLOGE("ReportModuleCrash: failed to connect to zygiskd");
+        return -1;
+    }
+
+    uint8_t action = static_cast<uint8_t>(constants::DaemonSocketAction::ReportModuleCrash);
+    if (!socket_utils::write_u8(fd, action)) {
+        PLOGE("ReportModuleCrash: failed to write action");
+        return -1;
+    }
+
+    if (!socket_utils::write_usize(fd, index)) {
+        PLOGE("ReportModuleCrash: failed to write module index");
+        return -1;
+    }
+
+    LOGI("Crash for module index %zu reported to daemon.", index);
+    return 0;
+}
+
 void ZygoteRestart() {
     UniqueFd fd = Connect(1);
     if (fd == -1) {
