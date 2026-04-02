@@ -89,6 +89,7 @@ bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, const std:
     if (!read_loop_offset(fd, dyn.get(), dyn_count * sizeof(ElfW(Dyn)), out->dyn_off)) return false;
 
     ElfW(Addr) symtab_vaddr = 0, strtab_vaddr = 0, gnu_hash_vaddr = 0, rel_vaddr = 0, rela_vaddr = 0, jmprel_vaddr = 0;
+    ElfW(Addr) sysv_hash_vaddr = 0, versym_vaddr = 0;
     size_t rel_sz = 0, rela_sz = 0, jmprel_sz = 0, strsz = 0, syment = 0;
 
     ElfW(Addr) android_rel_vaddr = 0; size_t android_rel_sz = 0; bool android_is_rela = false;
@@ -109,7 +110,9 @@ bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, const std:
             case DT_JMPREL: jmprel_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
             case DT_PLTRELSZ: jmprel_sz = (size_t)d.d_un.d_val; break;
             case DT_PLTREL: out->pltrel_type = (int)d.d_un.d_val; break;
+            case DT_VERSYM: versym_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
             case DT_GNU_HASH: gnu_hash_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
+            case DT_HASH: sysv_hash_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
             case DT_NEEDED: if (out->needed_count < 128) out->needed_str_offsets[out->needed_count++] = d.d_un.d_val; break;
             case DT_INIT_ARRAY: out->init_array_vaddr = (ElfW(Addr))d.d_un.d_ptr; break;
             case DT_INIT_ARRAYSZ: out->init_arraysz = (size_t)d.d_un.d_val; break;
@@ -222,10 +225,46 @@ bool elf_load_dyn_info(int fd, [[maybe_unused]] const ElfW(Ehdr) *eh, const std:
         }
     }
 
+    if (sysv_hash_vaddr) {
+        off_t sysv_hash_off = 0;
+        if (vaddr_to_offset(phdr, eh->e_phnum, sysv_hash_vaddr, &sysv_hash_off)) {
+            uint32_t header[2];
+            if (read_loop_offset(fd, header, sizeof(header), sysv_hash_off)) {
+                out->sysv_nbucket = header[0];
+                out->sysv_nchain = header[1];
+
+                off_t buckets_off = sysv_hash_off + 8; // 2 uint32_t = 8 bytes
+                off_t chains_off = buckets_off + (off_t)(out->sysv_nbucket * 4);
+
+                // Safety checks avoid gigantic allocations from corrupted ELFs
+                if (out->sysv_nbucket > 0 && out->sysv_nbucket <= 1024 * 1024) {
+                    out->sysv_buckets = std::make_unique<uint32_t[]>(out->sysv_nbucket);
+                    read_loop_offset(fd, out->sysv_buckets.get(), out->sysv_nbucket * 4, buckets_off);
+                }
+                if (out->sysv_nchain > 0 && out->sysv_nchain <= 1024 * 1024) {
+                    out->sysv_chains = std::make_unique<uint32_t[]>(out->sysv_nchain);
+                    read_loop_offset(fd, out->sysv_chains.get(), out->sysv_nchain * 4, chains_off);
+                }
+
+                // The nchain in SysV Hash is the total number of symbols in the table
+                // If there was no GNU_HASH, we took the opportunity to set the nsyms here
+                if (!out->nsyms) out->nsyms = out->sysv_nchain;
+            }
+        }
+    }
+
     if (out->nsyms > 0) {
         out->symtab = std::make_unique<ElfW(Sym)[]>(out->nsyms);
         if (!read_loop_offset(fd, out->symtab.get(), out->nsyms * sizeof(ElfW(Sym)), out->symtab_off)) {
             return false;
+        }
+        if (versym_vaddr) {
+            off_t versym_off = 0;
+            if (vaddr_to_offset(phdr, eh->e_phnum, versym_vaddr, &versym_off)) {
+                out->versym = std::make_unique<ElfW(Half)[]>(out->nsyms);
+                // If the reading fails, nothing happens, we simply do not filter by version
+                read_loop_offset(fd, out->versym.get(), out->nsyms * sizeof(ElfW(Half)), versym_off);
+            }
         }
     }
     return true;
@@ -235,6 +274,16 @@ static uint32_t calc_gnu_hash(const char *name) {
     uint32_t h = 5381;
     for (unsigned char c = *name; c != '\0'; c = *++name) {
         h = (h << 5) + h + c;
+    }
+    return h;
+}
+
+static uint32_t calc_sysv_hash(const char *name) {
+    uint32_t h = 0, g;
+    while (*name) {
+        h = (h << 4) + *name++;
+        g = h & 0xf0000000;
+        h ^= g; h ^= g >> 24;
     }
     return h;
 }
@@ -259,14 +308,37 @@ bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr
                         const ElfW(Sym)& sym = info->symtab[sym_idx];
                         const char *name = &info->strtab[sym.st_name];
                         if (strcmp(name, sym_name) == 0 && sym.st_shndx != SHN_UNDEF) {
-                            *out_value = sym.st_value;
-                            if (out_type) *out_type = ELF_ST_TYPE(sym.st_info);
-                            return true;
+                            // Ignore hidden versions
+                            if (!(info->versym && (info->versym[sym_idx] & 0x8000))) {
+                                *out_value = sym.st_value;
+                                if (out_type) *out_type = ELF_ST_TYPE(sym.st_info);
+                                return true;
+                            }
                         }
                     }
                     if (chain_val & 1) break;
                     chain_idx++;
                     sym_idx++;
+                }
+            }
+        }
+        return false;
+    }
+    else if (info->sysv_buckets != nullptr && info->sysv_chains != nullptr && info->sysv_nbucket > 0) {
+        uint32_t hash = calc_sysv_hash(sym_name);
+        
+        for (uint32_t i = info->sysv_buckets[hash % info->sysv_nbucket]; i != 0; i = info->sysv_chains[i]) {
+            if (i >= info->nsyms) break; // Sanity check
+
+            const ElfW(Sym)& sym = info->symtab[i];
+            if (sym.st_name == 0 || sym.st_name >= info->strsz) continue;
+            
+            const char *name = &info->strtab[sym.st_name];
+            if (strcmp(name, sym_name) == 0 && sym.st_shndx != SHN_UNDEF) {
+                if (!(info->versym && (info->versym[i] & 0x8000))) {
+                    *out_value = sym.st_value;
+                    if (out_type) *out_type = ELF_ST_TYPE(sym.st_info);
+                    return true;
                 }
             }
         }
@@ -278,6 +350,7 @@ bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr
         if (sym.st_name == 0 || sym.st_name >= info->strsz) continue;
         const char *name = &info->strtab[sym.st_name];
         if (strcmp(name, sym_name) != 0 || sym.st_shndx == SHN_UNDEF) continue;
+        if (info->versym && (info->versym[i] & 0x8000)) continue;
         *out_value = sym.st_value;
         if (out_type) *out_type = ELF_ST_TYPE(sym.st_info);
         return true;

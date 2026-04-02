@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <sys/auxv.h>
 
 #include <string>
 #include <vector>
@@ -33,21 +34,107 @@
 #ifndef STT_GNU_IFUNC
 #define STT_GNU_IFUNC 10
 #endif
+#ifndef R_AARCH64_TLSDESC
+#define R_AARCH64_TLSDESC 1031
+#endif
+#ifndef R_AARCH64_IRELATIVE
+#define R_AARCH64_IRELATIVE 1032
+#endif
+#ifndef R_X86_64_IRELATIVE
+#define R_X86_64_IRELATIVE 37
+#endif
+#ifndef R_ARM_IRELATIVE
+#define R_ARM_IRELATIVE 160
+#endif
+#ifndef R_386_IRELATIVE
+#define R_386_IRELATIVE 42
+#endif
+
+#if defined(__aarch64__)
+// Bionic-grade TLSDESC resolver. Saves all volatile registers 
+// before calling the C++ TLS allocator.
+__asm__ (
+    ".global custom_tlsdesc_resolver_stub\n"
+    ".hidden custom_tlsdesc_resolver_stub\n"
+    ".type custom_tlsdesc_resolver_stub, %function\n"
+    "custom_tlsdesc_resolver_stub:\n"
+    "    stp x29, x30, [sp, #-256]!\n"
+    "    mov x29, sp\n"
+    "    stp x1, x2, [sp, #16]\n"
+    "    stp x3, x4, [sp, #32]\n"
+    "    stp x5, x6, [sp, #48]\n"
+    "    stp x7, x8, [sp, #64]\n"
+    "    stp x9, x10, [sp, #80]\n"
+    "    stp x11, x12, [sp, #96]\n"
+    "    stp x13, x14, [sp, #112]\n"
+    "    stp x15, x16, [sp, #128]\n"
+    "    stp x17, x18, [sp, #144]\n"
+    "    stp d0, d1, [sp, #160]\n"
+    "    stp d2, d3, [sp, #176]\n"
+    "    stp d4, d5, [sp, #192]\n"
+    "    stp d6, d7, [sp, #208]\n"
+    
+    // x0 points to the tlsdesc structure. Our tls_index* is at [x0, #8]
+    "    ldr x0, [x0, #8]\n"
+    
+    // Call our C++ function (which returns an absolute pointer)
+    "    bl custom_tls_get_addr\n"
+    
+    // Transform the absolute pointer into an offset of tpidr_el0
+    "    mrs x1, tpidr_el0\n"
+    "    sub x0, x0, x1\n"
+    
+    // Restore volatile logs
+    "    ldp d6, d7, [sp, #208]\n"
+    "    ldp d4, d5, [sp, #192]\n"
+    "    ldp d2, d3, [sp, #176]\n"
+    "    ldp d0, d1, [sp, #160]\n"
+    "    ldp x17, x18, [sp, #144]\n"
+    "    ldp x15, x16, [sp, #128]\n"
+    "    ldp x13, x14, [sp, #112]\n"
+    "    ldp x11, x12, [sp, #96]\n"
+    "    ldp x9, x10, [sp, #80]\n"
+    "    ldp x7, x8, [sp, #64]\n"
+    "    ldp x5, x6, [sp, #48]\n"
+    "    ldp x3, x4, [sp, #32]\n"
+    "    ldp x1, x2, [sp, #16]\n"
+    "    ldp x29, x30, [sp], #256\n"
+    "    ret\n"
+);
+
+extern "C" ptrdiff_t custom_tlsdesc_resolver_stub(void*);
+#endif
 
 extern "C" void __register_frame(void*) __attribute__((weak));
 extern "C" void __deregister_frame(void*) __attribute__((weak));
+
+struct deferred_ifunc {
+    uintptr_t target;
+    uintptr_t resolver;
+};
+
+struct tlsdesc {
+    void* resolver;
+    uint64_t arg;
+};
 
 struct CustomTlsInfo {
     size_t module_id;
     pthread_key_t key;
 };
 
+struct tls_index {
+    size_t module_id;
+    size_t offset;
+};
+
 struct DestructorAction {
-    enum Type { FUNC_PTR, TLS_CLEANUP, DWARF_CLEANUP } type;
+    enum Type { FUNC_PTR, TLS_CLEANUP, DWARF_CLEANUP, TLSDESC_CLEANUP } type;
     union {
         void (*func_ptr)();
         size_t mod_id;
         uintptr_t frame_ptr;
+        tls_index* tlsdesc_arg;
     };
 };
 
@@ -104,6 +191,8 @@ void custom_linker_unload(void* handle) {
                     CustomTlsInfo* tls_info = reinterpret_cast<CustomTlsInfo*>(d.mod_id);
                     pthread_key_delete(tls_info->key);
                     delete tls_info;
+                } else if (d.type == DestructorAction::TLSDESC_CLEANUP) {
+                    delete d.tlsdesc_arg;
                 } else if (d.type == DestructorAction::DWARF_CLEANUP && __deregister_frame) {
                     __deregister_frame(reinterpret_cast<void*>(d.frame_ptr));
                 }
@@ -130,6 +219,7 @@ struct LoadedModule {
 
     bool eh_registered = false;
     uintptr_t eh_frame_ptr = 0;
+    std::vector<tls_index*> tlsdesc_args;
 };
 
 
@@ -148,13 +238,15 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
 
     if (sym_idx >= info->nsyms) return false;
     const ElfW(Sym)& sym = info->symtab[sym_idx];
+    uint64_t hwcap = getauxval(AT_HWCAP);
 
     if (sym.st_shndx != SHN_UNDEF) { 
         uintptr_t addr = (uintptr_t)load_bias + (uintptr_t)sym.st_value;
         if (ELF_ST_TYPE(sym.st_info) == STT_GNU_IFUNC) {
-            auto ifunc = reinterpret_cast<void* (*)()>(addr);
+            typedef void* (*ifunc_resolver_t)(uint64_t);
+            auto ifunc = reinterpret_cast<ifunc_resolver_t>(addr);
             // IFUNC resolvers can return PAC-signed pointers
-            addr = PAC_STRIP(reinterpret_cast<uintptr_t>(ifunc()));
+            addr = PAC_STRIP(reinterpret_cast<uintptr_t>(ifunc(hwcap)));
         }
         *out_addr = PAC_STRIP(addr); 
         return true; 
@@ -169,8 +261,9 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
     if (find_dynsym_value(info, name, &local_val, &local_type) && local_val != 0) {
         uintptr_t addr = (uintptr_t)load_bias + local_val;
         if (local_type == STT_GNU_IFUNC) {
-            auto ifunc = reinterpret_cast<void* (*)()>(addr);
-            addr = PAC_STRIP(reinterpret_cast<uintptr_t>(ifunc()));
+            typedef void* (*ifunc_resolver_t)(uint64_t);
+            auto ifunc = reinterpret_cast<ifunc_resolver_t>(addr);
+            addr = PAC_STRIP(reinterpret_cast<uintptr_t>(ifunc(hwcap)));
         }
         *out_addr = PAC_STRIP(addr);
         return true;
@@ -187,8 +280,9 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
                 if (find_dynsym_value(&mod.dinfo, name, &mod_val, &mod_type) && mod_val != 0) {
                     uintptr_t addr = (uintptr_t)mod.load_bias + mod_val;
                     if (mod_type == STT_GNU_IFUNC) {
-                        auto ifunc = reinterpret_cast<void* (*)()>(addr);
-                        addr = PAC_STRIP(reinterpret_cast<uintptr_t>(ifunc()));
+                        typedef void* (*ifunc_resolver_t)(uint64_t);
+                        auto ifunc = reinterpret_cast<ifunc_resolver_t>(addr);
+                        addr = PAC_STRIP(reinterpret_cast<uintptr_t>(ifunc(hwcap)));
                     }
                     *out_addr = PAC_STRIP(addr);
                     return true;
@@ -273,6 +367,16 @@ static uint64_t read_uleb128(const uint8_t **p, const uint8_t *end) {
 #define DW_EH_PE_pcrel    0x10
 #define DW_EH_PE_datarel  0x30
 #define DW_EH_PE_indirect 0x80
+
+#ifndef DT_VERSYM
+#define DT_VERSYM 0x6ffffff0
+#endif
+#ifndef ELF_ST_BIND
+#define ELF_ST_BIND(i) ((i)>>4)
+#endif
+#ifndef STB_WEAK
+#define STB_WEAK 2
+#endif
 
 static int read_u16(const uint8_t **p, const uint8_t *end, uint16_t *out) {
     if ((size_t)(end - *p) < sizeof(uint16_t)) return -1;
@@ -372,11 +476,14 @@ static uintptr_t decode_eh_value(uint8_t enc, const uint8_t **p, uintptr_t base,
     return value;
 }
 
-static bool apply_rela_section(int fd, [[maybe_unused]] const elf_dyn_info *info,
+static bool apply_rela_section(int fd, LoadedModule& mod,
                                [[maybe_unused]] const char** needed_paths, 
                                [[maybe_unused]] size_t needed_count,
                                [[maybe_unused]] const std::vector<LoadedModule>& loaded_modules,
-                               uintptr_t load_bias, off_t rela_off, size_t rela_sz) {
+                               off_t rela_off, size_t rela_sz,
+                               [[maybe_unused]] std::vector<deferred_ifunc>& ifuncs) {
+    [[maybe_unused]] const elf_dyn_info* info = &mod.dinfo;
+    uintptr_t load_bias = mod.load_bias;
     size_t count = rela_sz / sizeof(ElfW(Rela));
     auto rels = std::make_unique<ElfW(Rela)[]>(count);
     if (!read_loop_offset(fd, rels.get(), rela_sz, rela_off)) return false;
@@ -391,15 +498,40 @@ static bool apply_rela_section(int fd, [[maybe_unused]] const elf_dyn_info *info
 
 #if defined(__aarch64__)
         if (type == R_AARCH64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))r.r_addend;
-        else if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT || type == R_AARCH64_ABS64) {
+        else if (type == R_AARCH64_IRELATIVE) {
+            ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)r.r_addend});
+        } else if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT || type == R_AARCH64_ABS64) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
+            if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) {
+                if (ELF_ST_BIND(info->symtab[sym].st_info) != STB_WEAK) {
+                    LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                    return false; // abort load
+                }
+                sym_addr = 0;
+            }
             value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))r.r_addend : 0;
         } else if (type == R_AARCH64_TLS_DTPMOD) {
             value = info->tls_mod_id;
         } else if (type == R_AARCH64_TLS_DTPREL) {
             const ElfW(Sym)& symb = info->symtab[sym];
             value = (ElfW(Addr))symb.st_value + r.r_addend;
+        } else if (type == R_AARCH64_TLSDESC) {
+            tlsdesc* td = reinterpret_cast<tlsdesc*>(target);
+            tls_index* ti = new tls_index;
+            ti->module_id = info->tls_mod_id;
+            uintptr_t sym_addr = 0;
+            if (sym == 0) {
+                ti->offset = r.r_addend;
+            } else if (resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) {
+                ti->offset = (sym_addr - load_bias) + r.r_addend;
+            } else {
+                ti->offset = r.r_addend;
+            }
+            td->resolver = reinterpret_cast<void*>(custom_tlsdesc_resolver_stub);
+            td->arg = reinterpret_cast<uint64_t>(ti);
+            const_cast<LoadedModule&>(mod).tlsdesc_args.push_back(ti);
+
+            continue;
         } else if (type == R_AARCH64_TLS_TPREL) {
             uintptr_t sym_addr = 0;
             if (sym == 0) {
@@ -410,9 +542,18 @@ static bool apply_rela_section(int fd, [[maybe_unused]] const elf_dyn_info *info
         } else return false;
 #elif defined(__x86_64__)
         if (type == R_X86_64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))r.r_addend;
-        else if (type == R_X86_64_GLOB_DAT || type == R_X86_64_JUMP_SLOT || type == R_X86_64_64) {
+        else if (type == R_X86_64_IRELATIVE) {
+            ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)r.r_addend});
+            continue;
+        } else if (type == R_X86_64_GLOB_DAT || type == R_X86_64_JUMP_SLOT || type == R_X86_64_64) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
+            if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) {
+                if (ELF_ST_BIND(info->symtab[sym].st_info) != STB_WEAK) {
+                    LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                    return false;
+                }
+                sym_addr = 0;
+            }
             value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))r.r_addend : 0;
         } else if (type == R_X86_64_DTPMOD64) {
             value = info->tls_mod_id;
@@ -436,11 +577,14 @@ static bool apply_rela_section(int fd, [[maybe_unused]] const elf_dyn_info *info
     return true;
 }
 
-static bool apply_rel_section(int fd, [[maybe_unused]] const elf_dyn_info *info,
+static bool apply_rel_section(int fd, LoadedModule& mod,
                               [[maybe_unused]] const char** needed_paths,
                               [[maybe_unused]] size_t needed_count,
                               [[maybe_unused]] const std::vector<LoadedModule>& loaded_modules,
-                              uintptr_t load_bias, off_t rel_off, size_t rel_sz) {
+                              off_t rel_off, size_t rel_sz,
+                              [[maybe_unused]] std::vector<deferred_ifunc>& ifuncs) {
+    [[maybe_unused]] const elf_dyn_info* info = &mod.dinfo;
+    uintptr_t load_bias = mod.load_bias;
     size_t count = rel_sz / sizeof(ElfW(Rel));
     auto rels = std::make_unique<ElfW(Rel)[]>(count);
     if (!read_loop_offset(fd, rels.get(), rel_sz, rel_off)) return false;
@@ -458,9 +602,19 @@ static bool apply_rel_section(int fd, [[maybe_unused]] const elf_dyn_info *info,
         if (type == R_ARM_RELATIVE) {
             addend = *reinterpret_cast<ElfW(Addr)*>(target);
             value = (ElfW(Addr))load_bias + addend;
+        } else if (type == R_ARM_IRELATIVE) {
+            addend = *reinterpret_cast<ElfW(Addr)*>(target);
+            ifuncs.push_back({target, (uintptr_t)load_bias + addend});
+            continue;
         } else if (type == R_ARM_GLOB_DAT || type == R_ARM_JUMP_SLOT || type == R_ARM_ABS32) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
+            if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) {
+                if (ELF_ST_BIND(info->symtab[sym].st_info) != STB_WEAK) {
+                    LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                    return false;
+                }
+                sym_addr = 0;
+            }
             if (sym_addr == 0) value = 0;
             else if (type == R_ARM_ABS32) {
                 addend = *reinterpret_cast<ElfW(Addr)*>(target);
@@ -483,9 +637,19 @@ static bool apply_rel_section(int fd, [[maybe_unused]] const elf_dyn_info *info,
         if (type == R_386_RELATIVE) {
             addend = *reinterpret_cast<ElfW(Addr)*>(target);
             value = (ElfW(Addr))load_bias + addend;
+        } else if (type == R_386_IRELATIVE) {
+            addend = *reinterpret_cast<ElfW(Addr)*>(target);
+            ifuncs.push_back({target, (uintptr_t)load_bias + addend});
+            continue;
         } else if (type == R_386_GLOB_DAT || type == R_386_JMP_SLOT || type == R_386_32) {
             uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) sym_addr = 0;
+            if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, sym, &sym_addr)) {
+                if (ELF_ST_BIND(info->symtab[sym].st_info) != STB_WEAK) {
+                    LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                    return false;
+                }
+                sym_addr = 0;
+            }
             if (sym_addr == 0) value = 0;
             else if (type == R_386_32) {
                 addend = *reinterpret_cast<ElfW(Addr)*>(target);
@@ -512,10 +676,13 @@ static bool apply_rel_section(int fd, [[maybe_unused]] const elf_dyn_info *info,
     return true;
 }
 
-static bool apply_android_relocations(int fd, const elf_dyn_info *info,
+static bool apply_android_relocations(int fd, LoadedModule& mod,
                                       const char** needed_paths, size_t needed_count,
                                       const std::vector<LoadedModule>& loaded_modules,
-                                      uintptr_t load_bias, off_t reloc_off, size_t reloc_sz, bool is_rela) {
+                                      off_t reloc_off, size_t reloc_sz,
+                                      std::vector<deferred_ifunc>& ifuncs, bool is_rela) {
+    const elf_dyn_info* info = &mod.dinfo;
+    uintptr_t load_bias = mod.load_bias;
     auto reloc_data = std::make_unique<uint8_t[]>(reloc_sz);
     if (!read_loop_offset(fd, reloc_data.get(), reloc_sz, reloc_off)) return false;
 
@@ -591,9 +758,18 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
 
 #if defined(__aarch64__)
             if (current_type == R_AARCH64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
-            else if (current_type == R_AARCH64_GLOB_DAT || current_type == R_AARCH64_JUMP_SLOT || current_type == R_AARCH64_ABS64) {
+            else if (current_type == R_AARCH64_IRELATIVE) {
+                ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)current_addend});
+                continue;
+            } else if (current_type == R_AARCH64_GLOB_DAT || current_type == R_AARCH64_JUMP_SLOT || current_type == R_AARCH64_ABS64) {
                 uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
+                if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+                    if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
+                        LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                        return false;
+                    }
+                    sym_addr = 0;
+                }
                 value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
             } else if (current_type == R_AARCH64_TLS_DTPMOD) {
                 value = info->tls_mod_id;
@@ -607,12 +783,38 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
                 } else if (resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
                     value = sym_addr - load_bias + info->tls_segment_vaddr; // Rough TPREL emulation without tpidr thread-context
                 }
+            } else if (current_type == R_AARCH64_TLSDESC) {
+                tlsdesc* td = reinterpret_cast<tlsdesc*>(target);
+                tls_index* ti = new tls_index;
+                ti->module_id = info->tls_mod_id;
+                uintptr_t sym_addr = 0;
+                if (current_sym_idx == 0) {
+                    ti->offset = current_addend;
+                } else if (resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+                    ti->offset = (sym_addr - load_bias) + current_addend;
+                } else {
+                    ti->offset = current_addend;
+                }
+                td->resolver = reinterpret_cast<void*>(custom_tlsdesc_resolver_stub);
+                td->arg = reinterpret_cast<uint64_t>(ti);                
+                const_cast<LoadedModule&>(mod).tlsdesc_args.push_back(ti);
+
+                continue;
             } else return false;
 #elif defined(__x86_64__)
             if (current_type == R_X86_64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
-            else if (current_type == R_X86_64_GLOB_DAT || current_type == R_X86_64_JUMP_SLOT || current_type == R_X86_64_64) {
+            else if (current_type == R_X86_64_IRELATIVE) {
+                ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)current_addend});
+                continue;
+            } else if (current_type == R_X86_64_GLOB_DAT || current_type == R_X86_64_JUMP_SLOT || current_type == R_X86_64_64) {
                 uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
+                if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+                    if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
+                        LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                        return false;
+                    }
+                    sym_addr = 0;
+                }
                 value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
             } else if (current_type == R_X86_64_DTPMOD64) {
                 value = info->tls_mod_id;
@@ -631,9 +833,18 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
             if (current_type == R_ARM_RELATIVE) {
                 ElfW(Addr) addend_rel = *reinterpret_cast<ElfW(Addr)*>(target);
                 value = (ElfW(Addr))load_bias + addend_rel;
+            } else if (current_type == R_ARM_IRELATIVE) {
+                ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)current_addend});
+                continue;
             } else if (current_type == R_ARM_GLOB_DAT || current_type == R_ARM_JUMP_SLOT || current_type == R_ARM_ABS32) {
                 uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
+                if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+                    if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
+                        LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                        return false;
+                    }
+                    sym_addr = 0;
+                }
                 if (sym_addr == 0) value = 0;
                 else if (current_type == R_ARM_ABS32) {
                     ElfW(Addr) addend_rel = *reinterpret_cast<ElfW(Addr)*>(target);
@@ -656,9 +867,18 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
             if (current_type == R_386_RELATIVE) {
                 ElfW(Addr) addend_rel = *reinterpret_cast<ElfW(Addr)*>(target);
                 value = (ElfW(Addr))load_bias + addend_rel;
+            } else if (current_type == R_386_IRELATIVE) {
+                ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)current_addend});
+                continue;
             } else if (current_type == R_386_GLOB_DAT || current_type == R_386_JMP_SLOT || current_type == R_386_32) {
                 uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) sym_addr = 0;
+                if (!resolve_symbol_addr(info, needed_paths, needed_count, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+                    if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
+                        LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                        return false;
+                    }
+                    sym_addr = 0;
+                }
                 if (sym_addr == 0) value = 0;
                 else if (current_type == R_386_32) {
                     ElfW(Addr) addend_rel = *reinterpret_cast<ElfW(Addr)*>(target);
@@ -688,7 +908,8 @@ static bool apply_android_relocations(int fd, const elf_dyn_info *info,
     return true;
 }
 
-static bool apply_relr_section(int fd, uintptr_t load_bias, off_t relr_off, size_t relr_sz) {
+static bool apply_relr_section(int fd, LoadedModule& mod, off_t relr_off, size_t relr_sz) {
+    uintptr_t load_bias = mod.load_bias;
     size_t count = relr_sz / sizeof(ElfW(Addr));
     auto relr = std::make_unique<ElfW(Addr)[]>(count);
     if (!read_loop_offset(fd, relr.get(), relr_sz, relr_off)) return false;
@@ -730,6 +951,7 @@ static bool apply_relr_section(int fd, uintptr_t load_bias, off_t relr_off, size
 }
 
 static bool apply_module_relocations(int memfd, LoadedModule& mod, const std::vector<LoadedModule>& loaded_modules) {
+    std::vector<deferred_ifunc> ifuncs;
     UniqueFd fd;
 
     if (strcmp(mod.path, "main_module") == 0 && memfd >= 0) {
@@ -763,24 +985,34 @@ static bool apply_module_relocations(int memfd, LoadedModule& mod, const std::ve
     }
 
     if (mod.dinfo.rela_sz && mod.dinfo.rela_off) {
-        if (!apply_rela_section(fd, &mod.dinfo, needed_paths, needed_count, loaded_modules, mod.load_bias, mod.dinfo.rela_off, mod.dinfo.rela_sz)) return false;
+        if (!apply_rela_section(fd, mod, needed_paths, needed_count, loaded_modules, mod.dinfo.rela_off, mod.dinfo.rela_sz, ifuncs)) return false;
     }
     if (mod.dinfo.rel_sz && mod.dinfo.rel_off) {
-        if (!apply_rel_section(fd, &mod.dinfo, needed_paths, needed_count, loaded_modules, mod.load_bias, mod.dinfo.rel_off, mod.dinfo.rel_sz)) return false;
+        if (!apply_rel_section(fd, mod, needed_paths, needed_count, loaded_modules, mod.dinfo.rel_off, mod.dinfo.rel_sz, ifuncs)) return false;
     }
     if (mod.dinfo.jmprel_sz && mod.dinfo.jmprel_off) {
         if (mod.dinfo.pltrel_type == DT_RELA) {
-            if (!apply_rela_section(fd, &mod.dinfo, needed_paths, needed_count, loaded_modules, mod.load_bias, mod.dinfo.jmprel_off, mod.dinfo.jmprel_sz)) return false;
+            if (!apply_rela_section(fd, mod, needed_paths, needed_count, loaded_modules, mod.dinfo.jmprel_off, mod.dinfo.jmprel_sz, ifuncs)) return false;
         } else {
-            if (!apply_rel_section(fd, &mod.dinfo, needed_paths, needed_count, loaded_modules, mod.load_bias, mod.dinfo.jmprel_off, mod.dinfo.jmprel_sz)) return false;
+            if (!apply_rel_section(fd, mod, needed_paths, needed_count, loaded_modules, mod.dinfo.jmprel_off, mod.dinfo.jmprel_sz, ifuncs)) return false;
         }
     }
 
     if (mod.dinfo.android_rel_sz && mod.dinfo.android_rel_off) {
-        if (!apply_android_relocations(fd, &mod.dinfo, needed_paths, needed_count, loaded_modules, mod.load_bias, mod.dinfo.android_rel_off, mod.dinfo.android_rel_sz, mod.dinfo.android_is_rela)) return false;
+        if (!apply_android_relocations(fd, mod, needed_paths, needed_count, loaded_modules, mod.dinfo.android_rel_off, mod.dinfo.android_rel_sz, ifuncs, mod.dinfo.android_is_rela)) return false;
     }
     if (mod.dinfo.relr_sz && mod.dinfo.relr_off) {
-        if (!apply_relr_section(fd, mod.load_bias, mod.dinfo.relr_off, mod.dinfo.relr_sz)) return false;
+        if (!apply_relr_section(fd, mod, mod.dinfo.relr_off, mod.dinfo.relr_sz)) return false;
+    }
+
+    // At this point all global tables (GOT, BSS, etc) are initialized.
+    // It is safe to call executable code from the module.
+    uint64_t hwcap = getauxval(AT_HWCAP);
+    for (const auto& ifunc : ifuncs) {
+        typedef void* (*ifunc_resolver_t)(uint64_t);
+        auto resolver = reinterpret_cast<ifunc_resolver_t>(ifunc.resolver);
+        uintptr_t value = PAC_STRIP(reinterpret_cast<uintptr_t>(resolver(hwcap)));
+        *reinterpret_cast<ElfW(Addr)*>(ifunc.target) = value;
     }
 
     return true;
@@ -835,10 +1067,24 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
                 memset(reinterpret_cast<void*>(file_end), 0, file_page_end - file_end);
             }
         }
-        if (seg_page_end > file_page_end) {
-            void* bss_map = mmap(reinterpret_cast<void*>(file_page_end), seg_page_end - file_page_end, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (bss_map == MAP_FAILED) return false;
+
+        if (phdr[i].p_memsz > phdr[i].p_filesz) {
+            uintptr_t bss_start = file_end;
+            uintptr_t bss_end = seg_end;
+            uintptr_t bss_page_end_align = page_start(bss_start + page_size - 1, page_size);
+
+            size_t zero_size = bss_page_end_align - bss_start;
+            if (zero_size > 0 && is_writable) {
+                memset(reinterpret_cast<void*>(bss_start), 0, zero_size);
+            }
+
+            if (bss_end > bss_page_end_align) {
+                void* bss_map = mmap(reinterpret_cast<void*>(bss_page_end_align), bss_end - bss_page_end_align, 
+                                     PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (bss_map == MAP_FAILED) return false;
+            }
         }
+
         int prot = 0;
         if (phdr[i].p_flags & PF_R) prot |= PROT_READ;
         if (phdr[i].p_flags & PF_W) prot |= PROT_WRITE;
@@ -991,11 +1237,6 @@ static inline void cleanup_failed_load(const std::vector<LoadedModule>& loaded_m
         }
     }
 }
-
-struct tls_index {
-    size_t module_id;
-    size_t offset;
-};
 
 extern "C" void* custom_tls_get_addr(tls_index* ti) {
     CustomTlsInfo* tls_info = reinterpret_cast<CustomTlsInfo*>(ti->module_id);
@@ -1189,6 +1430,13 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
                 DestructorAction action;
                 action.type = DestructorAction::DWARF_CLEANUP;
                 action.frame_ptr = mod.eh_frame_ptr;
+                region.destructors.push_back(action);
+            }
+
+            for (tls_index* ti : mod.tlsdesc_args) {
+                DestructorAction action;
+                action.type = DestructorAction::TLSDESC_CLEANUP;
+                action.tlsdesc_arg = ti;
                 region.destructors.push_back(action);
             }
         }

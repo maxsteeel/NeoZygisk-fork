@@ -70,6 +70,11 @@ struct elf_dyn_info {
     size_t gnu_buckets_size = 0;
     std::unique_ptr<uint32_t[]> gnu_chains;
     size_t gnu_chains_size = 0;
+    std::unique_ptr<uint32_t[]> sysv_buckets;
+    uint32_t sysv_nbucket = 0;
+    std::unique_ptr<uint32_t[]> sysv_chains;
+    uint32_t sysv_nchain = 0;
+    std::unique_ptr<ElfW(Half)[]> versym;
     std::unique_ptr<char[]> strtab;
     size_t needed_str_offsets[128];
     size_t needed_count = 0;
