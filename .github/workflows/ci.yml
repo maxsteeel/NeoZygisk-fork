@@ -76,3 +76,27 @@ jobs:
           name: ${{ steps.prepare_artifacts.outputs.DEBUG_NAME }}
           path: debug-artifact/
 
+      # ====================================================================
+      # 4. TELEGRAM NOTIFICATION
+      # ====================================================================
+      - name: Upload to Telegram
+        if: success() && github.event_name != 'pull_request' && env.BOT_TOKEN != ''
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          IS_FORCED: ${{ github.event.forced }}
+        run: |
+          export RELEASE_ZIP_PATH=$(find module/build/outputs/release -type f -name 'NeoZygisk-fork-v*-release.zip' | head -n 1)
+          export DEBUG_ZIP_PATH=$(find module/build/outputs/release -type f -name 'NeoZygisk-fork-v*-debug.zip' | head -n 1)
+          
+          if [[ -f "$RELEASE_ZIP_PATH" && -f "$DEBUG_ZIP_PATH" ]]; then
+            python3 .github/scripts/telegram_url.py
+          else
+            echo "Error: No .zip files were found to upload."
+            exit 1
+          fi
+
