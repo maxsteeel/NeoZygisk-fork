@@ -486,6 +486,20 @@ void ZygiskContext::run_modules_pre() {
             LOGW("WARNING: A crash during dlopen may leave the bionic linker mutex locked, "
                  "potentially causing a deadlock in future library loading.");
 
+            // 1. Close the FD so that it does not appear in /proc/self/fd
+            if (m.memfd >= 0) {
+                close(m.memfd);
+                m.memfd = -1;
+            }
+
+            // 2. Unmap the module
+            // This function will use the global pointer to do munmap() 
+            // of everything that the linker managed to map before he died.
+            if (!custom_linker_cleanup()) {
+                LOGE("Failed to clean up after module `%s` crash. The process may be left in an unstable state.", m.name);
+            }
+
+            // 3. Report the crash to the daemon for disable module
             if (zygiskd::ReportModuleCrash(i) != 0) {
                 PLOGE("Failed to report module crash for module `%s`", m.name);
             }
@@ -497,6 +511,7 @@ void ZygiskContext::run_modules_pre() {
 
     for (auto it = modules.begin(); it != modules.end(); ) {
         auto &m = *it;
+        auto &mod = ms[m.getId()];
         bool crashed = false;
 
         g_in_module_load = 1;
@@ -509,7 +524,7 @@ void ZygiskContext::run_modules_pre() {
             }
         } else {
             crashed = true;
-            LOGE("Module `%s` crashed during onLoad/preSpecialize.", m.name);
+            LOGE("Module `%s` crashed during onLoad/preSpecialize.", mod.name);
         }
         g_in_module_load = 0;
 

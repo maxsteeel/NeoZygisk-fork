@@ -1221,6 +1221,77 @@ static bool load_dependencies_recursive(const char *lib_path, int memfd, std::ve
     return true;
 }
 
+static std::vector<LoadedModule>* g_currently_loading_modules = nullptr;
+
+static void register_loaded_modules(const std::vector<LoadedModule>& loaded_modules) {
+    if (loaded_modules.empty()) return;
+
+    init_region_tracking();
+    std::lock_guard<std::mutex> lock(*g_custom_regions_lock);
+    const LoadedModule& main_mod = loaded_modules[0];
+    DestructorAction action;
+    CustomRegion region;
+    MemMap map;
+    region.handle = main_mod.base; // Use this as primary ID
+
+    // We save the memory addresses of all modules (Main + Dependencies)
+    for (const auto& mod : loaded_modules) {
+        if (mod.base != 0 && mod.size != 0) {
+            map.base = mod.base;
+            map.size = mod.size;
+            region.maps.push_back(map);
+        }
+    }
+
+    // We collect all destroyers in reverse order of loading
+    for (auto it = loaded_modules.rbegin(); it != loaded_modules.rend(); ++it) {
+        const auto& mod = *it;
+
+        // 1. FINI_ARRAY is executed in reverse order
+        if (mod.dinfo.fini_array_vaddr && mod.dinfo.fini_arraysz) {
+            size_t count = mod.dinfo.fini_arraysz / sizeof(ElfW(Addr));
+            ElfW(Addr)* array_addr = reinterpret_cast<ElfW(Addr)*>(mod.load_bias + mod.dinfo.fini_array_vaddr);
+            for (size_t i = 0; i < count; ++i) {
+                if (array_addr[count - 1 - i]) {
+                    auto func = reinterpret_cast<void (*)()>(array_addr[count - 1 - i]);
+                    action.type = DestructorAction::FUNC_PTR;
+                    action.func_ptr = func;
+                    region.destructors.push_back(action);
+                }
+            }
+        }
+
+        // 2. DT_FINI is executed after FINI_ARRAY
+        if (mod.dinfo.fini_vaddr) {
+            auto func = reinterpret_cast<void (*)()>(mod.load_bias + mod.dinfo.fini_vaddr);
+            action.type = DestructorAction::FUNC_PTR;
+            action.func_ptr = func;
+            region.destructors.push_back(action);
+        }
+
+        // 3. It's also the perfect time to clean up TLS and DWARF
+        if (mod.dinfo.tls_mod_id) {
+            action.type = DestructorAction::TLS_CLEANUP;
+            action.mod_id = mod.dinfo.tls_mod_id;
+            region.destructors.push_back(action);
+        }
+
+        if (mod.eh_registered && __deregister_frame) {
+            action.type = DestructorAction::DWARF_CLEANUP;
+            action.frame_ptr = mod.eh_frame_ptr;
+            region.destructors.push_back(action);
+        }
+
+        for (tls_index* ti : mod.tlsdesc_args) {
+            action.type = DestructorAction::TLSDESC_CLEANUP;
+            action.tlsdesc_arg = ti;
+            region.destructors.push_back(action);
+        }
+    }
+
+    g_custom_regions->push_back(std::move(region));
+}
+
 static inline void cleanup_failed_load(const std::vector<LoadedModule>& loaded_modules) {
     for (auto it = loaded_modules.rbegin(); it != loaded_modules.rend(); ++it) {
         const auto& mod = *it;
@@ -1236,6 +1307,16 @@ static inline void cleanup_failed_load(const std::vector<LoadedModule>& loaded_m
             munmap(reinterpret_cast<void*>(mod.base), mod.size);
         }
     }
+}
+
+bool custom_linker_cleanup() {
+    if (g_currently_loading_modules) {
+        LOGW("Unmapping orphan modules.");
+        cleanup_failed_load(*g_currently_loading_modules);
+        g_currently_loading_modules = nullptr;
+        return true;
+    }
+    return false;
 }
 
 extern "C" void* custom_tls_get_addr(tls_index* ti) {
@@ -1266,6 +1347,7 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
     }
 
     if (loaded_modules.empty()) return false;
+    g_currently_loading_modules = &loaded_modules;
 
     // Step 1: Hook TLS for all modules first
     for (auto& mod : loaded_modules) {
@@ -1374,74 +1456,8 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
     *out_init_array = main_mod.dinfo.init_array_vaddr ? ((uintptr_t)main_mod.load_bias + main_mod.dinfo.init_array_vaddr) : 0;
     *out_init_count = main_mod.dinfo.init_arraysz ? (main_mod.dinfo.init_arraysz / sizeof(ElfW(Addr))) : 0;
 
-    {
-        init_region_tracking();
-        std::lock_guard<std::mutex> lock(*g_custom_regions_lock);
-        CustomRegion region;
-        region.handle = main_mod.base; // Use this as primary ID
+    register_loaded_modules(loaded_modules);
+    g_currently_loading_modules = nullptr;
 
-        // We save the memory addresses of all modules (Main + Dependencies)
-        for (const auto& mod : loaded_modules) {
-            if (mod.base != 0 && mod.size != 0) {
-                MemMap map;
-                map.base = mod.base;
-                map.size = mod.size;
-                region.maps.push_back(map);
-            }
-        }
-
-        // We collect all destroyers in reverse order of loading
-        for (auto it = loaded_modules.rbegin(); it != loaded_modules.rend(); ++it) {
-            const auto& mod = *it;
-
-            // 1. FINI_ARRAY is executed in reverse order
-            if (mod.dinfo.fini_array_vaddr && mod.dinfo.fini_arraysz) {
-                size_t count = mod.dinfo.fini_arraysz / sizeof(ElfW(Addr));
-                ElfW(Addr)* array_addr = reinterpret_cast<ElfW(Addr)*>(mod.load_bias + mod.dinfo.fini_array_vaddr);
-                for (size_t i = 0; i < count; ++i) {
-                    if (array_addr[count - 1 - i]) {
-                        auto func = reinterpret_cast<void (*)()>(array_addr[count - 1 - i]);
-                        DestructorAction action;
-                        action.type = DestructorAction::FUNC_PTR;
-                        action.func_ptr = func;
-                        region.destructors.push_back(action);
-                    }
-                }
-            }
-
-            // 2. DT_FINI is executed after FINI_ARRAY
-            if (mod.dinfo.fini_vaddr) {
-                auto func = reinterpret_cast<void (*)()>(mod.load_bias + mod.dinfo.fini_vaddr);
-                DestructorAction action;
-                action.type = DestructorAction::FUNC_PTR;
-                action.func_ptr = func;
-                region.destructors.push_back(action);
-            }
-
-            // 3. It's also the perfect time to clean up TLS and DWARF
-            if (mod.dinfo.tls_mod_id) {
-                DestructorAction action;
-                action.type = DestructorAction::TLS_CLEANUP;
-                action.mod_id = mod.dinfo.tls_mod_id;
-                region.destructors.push_back(action);
-            }
-
-            if (mod.eh_registered && __deregister_frame) {
-                DestructorAction action;
-                action.type = DestructorAction::DWARF_CLEANUP;
-                action.frame_ptr = mod.eh_frame_ptr;
-                region.destructors.push_back(action);
-            }
-
-            for (tls_index* ti : mod.tlsdesc_args) {
-                DestructorAction action;
-                action.type = DestructorAction::TLSDESC_CLEANUP;
-                action.tlsdesc_arg = ti;
-                region.destructors.push_back(action);
-            }
-        }
-
-        g_custom_regions->push_back(std::move(region));
-    }
     return true;
 }
