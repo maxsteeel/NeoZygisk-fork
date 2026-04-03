@@ -30,6 +30,7 @@
 #include "logging.hpp"
 #include "files.hpp"
 #include "elf_utils.hpp"
+#include "utils.hpp"
 
 #ifndef STT_GNU_IFUNC
 #define STT_GNU_IFUNC 10
@@ -1171,6 +1172,60 @@ static bool _linker_find_library_path(const char *lib_name, char *full_path, siz
     return false;
 }
 
+// Helper function to check if a library is already mapped into the process memory
+static bool is_library_loaded_in_memory(const char* soname) {
+    UniqueFd fd(open("/proc/self/maps", O_RDONLY | O_CLOEXEC));
+    if (fd < 0) return false;
+
+    char buf[4096];      // Stack buffer to hold kernel data
+    char line[512];      // Stack buffer to build individual lines
+    size_t line_pos = 0;
+    ssize_t bytes_read;
+    bool found = false;
+
+    // Build the target string (e.g., "/libc++.so") safely on the stack
+    char target[256];
+    target[0] = '/';
+    size_t soname_len = strlen(soname);
+    if (soname_len > 250) soname_len = 250; // Safety boundary
+    memcpy(target + 1, soname, soname_len);
+    target[soname_len + 1] = '\0';
+    size_t target_len = soname_len + 1;
+
+    // Read chunks directly from the kernel
+    while ((bytes_read = read(fd, buf, sizeof(buf))) > 0) {
+        for (ssize_t i = 0; i < bytes_read; i++) {
+            if (buf[i] == '\n') {
+                line[line_pos] = '\0'; // End of line reached
+
+                char* pos = strstr(line, target);
+                if (pos != nullptr) {
+                    // Ensure exact match (prevent "libcore.so" matching "libcore_custom.so")
+                    char after = *(pos + target_len);
+                    if (after == '\0' || after == ' ' || after == '\n') {
+                        // Validate trusted OS partition
+                        if (strstr(line, " /system/") ||
+                            strstr(line, " /apex/") ||
+                            strstr(line, " /vendor/")) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+
+                line_pos = 0; // Reset for the next line
+            } else {
+                if (line_pos < sizeof(line) - 1) {
+                    line[line_pos++] = buf[i];
+                }
+            }
+        }
+        if (found) break; // Break outer loop if found
+    }
+
+    return found;
+}
+
 static bool load_dependencies_recursive(const char *lib_path, int memfd, std::vector<LoadedModule>& loaded_modules) {
     const char *soname = strrchr(lib_path, '/');
     soname = soname ? soname + 1 : lib_path;
@@ -1183,13 +1238,9 @@ static bool load_dependencies_recursive(const char *lib_path, int memfd, std::ve
         }
     }
 
-    // Allows the system linker (Bionic) to load the library if it is system.
-    // We remove RTLD_NOLOAD so that Bionic can safely load it if it is missing, 
-    // avoiding mapping duplicate manual copies of the OS.
-    void* existing_handle = dlopen(soname, RTLD_NOW);
-    if (existing_handle != nullptr) {
-        // We INTENTIONALLY do not do dlclose(). We want the system to maintain
-        // the library lives in memory so that our module can use it.
+    // Check if library is already loaded into memory
+    if (is_library_loaded_in_memory(soname)) {
+        LOGV("Dependency `%s` is already present in memory. Skipping manual load.", soname);
         return true;
     }
 
