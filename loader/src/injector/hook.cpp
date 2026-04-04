@@ -25,6 +25,7 @@
 #include <lsplt.hpp>
 
 #include "android_util.hpp"
+#include "elf_utils.hpp"
 #include "daemon.hpp"
 #include "misc.hpp"
 #include "module.hpp"
@@ -616,18 +617,11 @@ void HookContext::hook_zygote_jni() {
     auto get_created_java_vms = reinterpret_cast<jint (*)(JavaVM **, jsize, jsize *)>(
         dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs"));
     if (!get_created_java_vms) {
-        if (const auto* info = find_in_cache(map_info_cache, "libnativehelper.so")) {
-            void *h = dlopen(info->path, RTLD_LAZY);
-            if (!h) {
-                LOGW("cannot dlopen libnativehelper.so: %s", dlerror());
-            } else {
-                get_created_java_vms =
-                    reinterpret_cast<decltype(get_created_java_vms)>(dlsym(h, "JNI_GetCreatedJavaVMs"));
-                dlclose(h);
-            }
-        }
-        if (!get_created_java_vms) {
-            LOGW("JNI_GetCreatedJavaVMs not found");
+        void* sym = resolve_symbol("libnativehelper.so", "JNI_GetCreatedJavaVMs");
+        if (sym) {
+            get_created_java_vms = reinterpret_cast<decltype(get_created_java_vms)>(sym);
+        } else {
+            LOGW("JNI_GetCreatedJavaVMs not found in memory");
             return;
         }
     }

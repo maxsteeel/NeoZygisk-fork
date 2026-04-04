@@ -92,3 +92,5 @@ bool vaddr_to_offset(const std::unique_ptr<ElfW(Phdr)[]>& phdr, size_t phnum, El
 bool elf_load_dyn_info(int fd, const ElfW(Ehdr) *eh, const std::unique_ptr<ElfW(Phdr)[]>& phdr, elf_dyn_info *out);
 
 bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr) *out_value, uint8_t *out_type = nullptr);
+
+void* resolve_symbol(const char* lib_name, const char* sym_name);

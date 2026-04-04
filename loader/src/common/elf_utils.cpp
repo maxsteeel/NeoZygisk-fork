@@ -357,3 +357,89 @@ bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr
     }
     return false;
 }
+
+struct SymData {
+    const char* lib_name;
+    const char* sym_name;
+    void* result;
+};
+
+static int sym_cb(struct dl_phdr_info* info, size_t size, void* data) {
+    auto* search = reinterpret_cast<SymData*>(data);
+
+    // Check if this is the library we are looking for
+    if (!info->dlpi_name || !strstr(info->dlpi_name, search->lib_name)) {
+        return 0; // Continue searching
+    }
+
+    ElfW(Addr) base = info->dlpi_addr;
+    ElfW(Dyn)* dyn = nullptr;
+
+    // Find the PT_DYNAMIC section
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+            dyn = reinterpret_cast<ElfW(Dyn)*>(base + info->dlpi_phdr[i].p_vaddr);
+            break;
+        }
+    }
+
+    if (!dyn) return 0;
+
+    ElfW(Sym)* symtab = nullptr;
+    const char* strtab = nullptr;
+    uint32_t* gnu_hash = nullptr;
+
+    // Extract tables
+    for (ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; d++) {
+        if (d->d_tag == DT_SYMTAB) symtab = reinterpret_cast<ElfW(Sym)*>(base + d->d_un.d_ptr);
+        if (d->d_tag == DT_STRTAB) strtab = reinterpret_cast<const char*>(base + d->d_un.d_ptr);
+        if (d->d_tag == DT_GNU_HASH) gnu_hash = reinterpret_cast<uint32_t*>(base + d->d_un.d_ptr);
+    }
+
+    // Android libraries rely on GNU_HASH
+    if (symtab && strtab && gnu_hash) {
+        auto calc_gnu_hash = [](const char* name) -> uint32_t {
+            uint32_t h = 5381;
+            for (unsigned char c = *name; c != '\0'; c = *++name) {
+                h = (h << 5) + h + c;
+            }
+            return h;
+        };
+
+        uint32_t nbuckets = gnu_hash[0];
+        uint32_t symoffset = gnu_hash[1];
+        uint32_t bloom_size = gnu_hash[2];
+
+        const ElfW(Addr)* bloom_filter = reinterpret_cast<const ElfW(Addr)*>(&gnu_hash[4]);
+        const uint32_t* buckets = reinterpret_cast<const uint32_t*>(&bloom_filter[bloom_size]);
+        const uint32_t* chains = &buckets[nbuckets];
+
+        uint32_t hash = calc_gnu_hash(search->sym_name);
+        uint32_t bucket = hash % nbuckets;
+        uint32_t sym_idx = buckets[bucket];
+
+        // Walk the hash chain
+        if (sym_idx >= symoffset) {
+            do {
+                const ElfW(Sym)& sym = symtab[sym_idx];
+                if (((chains[sym_idx - symoffset] ^ hash) >> 1) == 0 && sym.st_shndx != SHN_UNDEF) {
+                    if (strcmp(strtab + sym.st_name, search->sym_name) == 0) {
+                        // Symbol found! Apply PAC stripping if necessary depending on your environment, 
+                        // though for JNI calls it's usually safe as-is.
+                        search->result = reinterpret_cast<void*>(base + sym.st_value);
+                        return 1; // Stop iterating
+                    }
+                }
+                sym_idx++;
+            } while ((chains[sym_idx - 1 - symoffset] & 1) == 0);
+        }
+    }
+    return 0; // Continue just in case
+}
+
+// Drops dlopen/dlclose and extracts the symbol purely from mapped memory
+void* resolve_symbol(const char* lib_name, const char* sym_name) {
+    SymData search = {lib_name, sym_name, nullptr};
+    dl_iterate_phdr(sym_cb, &search);
+    return search.result;
+}
