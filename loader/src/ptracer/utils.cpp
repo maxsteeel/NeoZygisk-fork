@@ -27,6 +27,7 @@
 #include <sys/mman.h>
 #include <memory>
 
+#include "daemon.hpp"
 #include "logging.hpp"
 #include "elf_utils.hpp"
 
@@ -150,39 +151,57 @@ void *find_module_base(int pid, std::string_view suffix) {
 /**
  * @brief Calculates the address of a function in a remote process.
  *
- * This works by finding the function's address in our own process (`dlopen`/`dlsym`),
+ * This works by finding the function's address in our own process (avoiding `dlopen`/`dlsym`),
  * then finding the base address of its containing library in both our process and the
  * remote process. The remote address is then calculated using the offset from the base.
  * remote_sym = remote_base + (local_sym - local_base)
  */
 void *find_func_addr(int local_pid, int remote_pid, std::string_view module, std::string_view func) {
-    auto lib = dlopen(module.data(), RTLD_NOW);
-    if (lib == nullptr) {
-        LOGE("failed to open lib %s: %s", module.data(), dlerror());
-        return nullptr;
-    }
-    void *local_sym = dlsym(lib, func.data());
-    dlclose(lib);  // Close the library handle immediately to avoid resource leaks.
-    if (local_sym == nullptr) {
-        LOGE("failed to find sym %s in %s: %s", func.data(), module.data(), dlerror());
-        return nullptr;
-    }
-
-    void *local_base = find_module_base(local_pid, module);
-    if (local_base == nullptr) {
-        LOGE("failed to find local base for module %s", module.data());
-        return nullptr;
-    }
-
+    // Get the base address of the library in the target remote process
     void *remote_base = find_module_base(remote_pid, module);
     if (remote_base == nullptr) {
         LOGE("failed to find remote base for module %s", module.data());
         return nullptr;
     }
 
-    uintptr_t remote_addr = (uintptr_t)remote_base + ((uintptr_t) local_sym - (uintptr_t) local_base);
-    LOGV("found remote %s!%s at 0x%" PRIxPTR " (local base 0x%" PRIxPTR ", remote base 0x%" PRIxPTR ")",
-         module.data(), func.data(), (uintptr_t)remote_addr, (uintptr_t)local_base, (uintptr_t)remote_base);
+    // Open the file on disk
+    UniqueFd fd(open(module.data(), O_RDONLY | O_CLOEXEC));
+    if (fd < 0) {
+        LOGE("failed to open lib %s for offline parsing", module.data());
+        return nullptr;
+    }
+
+    // Parse the ELF headers to find the symbol's offset (st_value)
+    ElfW(Ehdr) eh;
+    std::unique_ptr<ElfW(Phdr)[]> phdr;
+    ElfW(Addr) min_vaddr = 0;
+    size_t map_size = 0;
+    long page_size = sysconf(_SC_PAGESIZE);
+
+    if (!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size)) {
+        LOGE("failed to compute layout for %s", module.data());
+        return nullptr;
+    }
+
+    elf_dyn_info dinfo;
+    if (!elf_load_dyn_info(fd, &eh, phdr, &dinfo)) {
+        LOGE("failed to load dynamic info for %s", module.data());
+        return nullptr;
+    }
+
+    // Extract the raw offset (st_value) from the symbol table
+    ElfW(Addr) sym_offset = 0;
+    if (!find_dynsym_value(&dinfo, func.data(), &sym_offset) || sym_offset == 0) {
+        LOGE("failed to find sym %s in offline ELF file %s", func.data(), module.data());
+        return nullptr;
+    }
+
+    // Calculate the absolute remote address
+    // remote_sym = remote_base + raw_offset
+    uintptr_t remote_addr = (uintptr_t)remote_base + (uintptr_t)sym_offset;
+
+    LOGV("found remote %s!%s at 0x%" PRIxPTR " (remote base 0x%" PRIxPTR ", offset 0x%" PRIxPTR ")",
+         module.data(), func.data(), remote_addr, (uintptr_t)remote_base, (uintptr_t)sym_offset);
 
     return (void *) remote_addr;
 }
