@@ -1061,23 +1061,29 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
         uintptr_t file_page_end = page_end(file_end, page_size);
 
         if (phdr[i].p_filesz > 0) {
+            // Normal segment backed by file
             void* seg_map = mmap(reinterpret_cast<void*>(seg_page), file_page_end - seg_page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, fd, file_page_offset);
             if (seg_map == MAP_FAILED) return false;
 
+            // Fill with zeros the difference between the end of the data and the end of the page
             if (is_writable && file_page_end > file_end) {
                 memset(reinterpret_cast<void*>(file_end), 0, file_page_end - file_end);
             }
+        } else {
+            // BSS segment (p_filesz == 0).
+            // It has no data in the file, only reserved space in memory.
+            // We map it as anonymous memory so that it doesn't stay in PROT_NONE.
+            void* seg_map = mmap(reinterpret_cast<void*>(seg_page), seg_page_len, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (seg_map == MAP_FAILED) return false;
+
+            // The MAP_ANONYMOUS memory is already initialized with zeros by the Linux kernel.
+            // We don't need to do memset.
         }
 
-        if (phdr[i].p_memsz > phdr[i].p_filesz) {
-            uintptr_t bss_start = file_end;
+        // Handling BSS expansion for hybrid segments (.data + .bss)
+        if (phdr[i].p_memsz > phdr[i].p_filesz && phdr[i].p_filesz > 0) {
             uintptr_t bss_end = seg_end;
-            uintptr_t bss_page_end_align = page_start(bss_start + page_size - 1, page_size);
-
-            size_t zero_size = bss_page_end_align - bss_start;
-            if (zero_size > 0 && is_writable) {
-                memset(reinterpret_cast<void*>(bss_start), 0, zero_size);
-            }
+            uintptr_t bss_page_end_align = page_start(file_end + page_size - 1, page_size);
 
             if (bss_end > bss_page_end_align) {
                 void* bss_map = mmap(reinterpret_cast<void*>(bss_page_end_align), bss_end - bss_page_end_align, 
@@ -1100,7 +1106,8 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
     elf_dyn_info dinfo;
     if (!elf_load_dyn_info(fd, &eh, phdr, &dinfo)) return false;
 
-    for (const auto& s : segs) {
+    for (size_t k = 0; k < seg_count; k++) {
+        const auto& s = segs[k];
         if (s.prot == (PROT_READ | PROT_WRITE)) continue;
         mprotect(reinterpret_cast<void*>(s.addr), s.len, s.prot);
     }
@@ -1402,6 +1409,7 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
 
     // Step 1: Hook TLS for all modules first
     for (auto& mod : loaded_modules) {
+        if (mod.dinfo.nsyms == 0 || mod.dinfo.symtab == nullptr) continue;
         for (size_t i = 0; i < mod.dinfo.nsyms; i++) {
             ElfW(Sym)& sym = mod.dinfo.symtab[i];
             if (sym.st_name != 0 && sym.st_name < mod.dinfo.strsz) {
