@@ -157,17 +157,31 @@ void *find_module_base(int pid, std::string_view suffix) {
  * remote_sym = remote_base + (local_sym - local_base)
  */
 void *find_func_addr(int local_pid, int remote_pid, std::string_view module, std::string_view func) {
-    // Get the base address of the library in the target remote process
-    void *remote_base = find_module_base(remote_pid, module);
-    if (remote_base == nullptr) {
-        LOGE("failed to find remote base for module %s", module.data());
+    std::string module_str(module);
+    std::string func_str(func);
+    char absolute_path[512] = {0};
+    void *remote_base = nullptr;
+
+    // Find the local address of the function.
+    MapInfo::Scan(remote_pid, [&](const MapInfo& m) {
+        if (m.offset == 0 && std::string_view(m.path).ends_with(module)) {
+            remote_base = (void *) m.start;
+            // Capture the absolute path (e.g., /system/lib64/libc.so)
+            strlcpy(absolute_path, m.path, sizeof(absolute_path));
+            return true; // Found, stop scanning
+        }
+        return false;
+    });
+
+    if (remote_base == nullptr || absolute_path[0] == '\0') {
+        LOGE("failed to find remote base or path for module %s", module_str.c_str());
         return nullptr;
     }
 
     // Open the file on disk
-    UniqueFd fd(open(module.data(), O_RDONLY | O_CLOEXEC));
+    UniqueFd fd(open(absolute_path, O_RDONLY | O_CLOEXEC));
     if (fd < 0) {
-        LOGE("failed to open lib %s for offline parsing", module.data());
+        LOGE("failed to open lib %s for offline parsing", absolute_path);
         return nullptr;
     }
 
@@ -179,20 +193,20 @@ void *find_func_addr(int local_pid, int remote_pid, std::string_view module, std
     long page_size = sysconf(_SC_PAGESIZE);
 
     if (!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size)) {
-        LOGE("failed to compute layout for %s", module.data());
+        LOGE("failed to compute layout for %s", absolute_path);
         return nullptr;
     }
 
     elf_dyn_info dinfo;
     if (!elf_load_dyn_info(fd, &eh, phdr, &dinfo)) {
-        LOGE("failed to load dynamic info for %s", module.data());
+        LOGE("failed to load dynamic info for %s", absolute_path);
         return nullptr;
     }
 
     // Extract the raw offset (st_value) from the symbol table
     ElfW(Addr) sym_offset = 0;
-    if (!find_dynsym_value(&dinfo, func.data(), &sym_offset) || sym_offset == 0) {
-        LOGE("failed to find sym %s in offline ELF file %s", func.data(), module.data());
+    if (!find_dynsym_value(&dinfo, func_str.c_str(), &sym_offset) || sym_offset == 0) {
+        LOGE("failed to find sym %s in offline ELF file %s", func_str.c_str(), absolute_path);
         return nullptr;
     }
 
@@ -201,7 +215,7 @@ void *find_func_addr(int local_pid, int remote_pid, std::string_view module, std
     uintptr_t remote_addr = (uintptr_t)remote_base + (uintptr_t)sym_offset;
 
     LOGV("found remote %s!%s at 0x%" PRIxPTR " (remote base 0x%" PRIxPTR ", offset 0x%" PRIxPTR ")",
-         module.data(), func.data(), remote_addr, (uintptr_t)remote_base, (uintptr_t)sym_offset);
+         absolute_path, func_str.c_str(), remote_addr, (uintptr_t)remote_base, (uintptr_t)sym_offset);
 
     return (void *) remote_addr;
 }
