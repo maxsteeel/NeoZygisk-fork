@@ -54,33 +54,33 @@ void AppMonitor::write_abi_status_section(char *status_text, const Status &daemo
 void AppMonitor::update_status() {
     if (prop_fd_ < 0) return;
 
-    memset(final_output_, 0, sizeof(final_output_));
-    strcat(final_output_, pre_section_);
-    strcat(final_output_, "\n\tmonitor: \t");
+    final_output_[0] = '\0';
+    strlcat(final_output_, pre_section_, sizeof(final_output_));
+    strlcat(final_output_, "\n\tmonitor: \t", sizeof(final_output_));
 
     switch (tracing_state_) {
     case TRACING:
-        strcat(final_output_, "😋 tracing");
+        strlcat(final_output_, "😋 tracing", sizeof(final_output_));
         break;
     case STOPPING:
         [[fallthrough]];
     case STOPPED:
-        strcat(final_output_, "❌ stopped");
+        strlcat(final_output_, "❌ stopped", sizeof(final_output_));
         break;
     case EXITING:
-        strcat(final_output_, "❌ exited");
+        strlcat(final_output_, "❌ exited", sizeof(final_output_));
         break;
     }
     if (tracing_state_ != TRACING && monitor_stop_reason_[0] != '\0') {
-        strcat(final_output_, "(");
-        strcat(final_output_, monitor_stop_reason_);
-        strcat(final_output_, ")");
+        strlcat(final_output_, "(", sizeof(final_output_));
+        strlcat(final_output_, monitor_stop_reason_, sizeof(final_output_));
+        strlcat(final_output_, ")", sizeof(final_output_));
     }
 
-    strcat(final_output_, "\n\n");
+    strlcat(final_output_, "\n\n", sizeof(final_output_));
     write_abi_status_section(final_output_, zygote_.get_status());
-    strcat(final_output_, "\n\n");
-    strcat(final_output_, post_section_);
+    strlcat(final_output_, "\n\n", sizeof(final_output_));
+    strlcat(final_output_, post_section_, sizeof(final_output_));
 
     ftruncate(prop_fd_, 0);
     pwrite(prop_fd_, final_output_, strlen(final_output_), 0);
