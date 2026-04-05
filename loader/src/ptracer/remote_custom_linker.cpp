@@ -23,6 +23,7 @@
 #include <string>
 #include <memory>
 #include <sys/uio.h>
+#include <sys/stat.h>
 #include <linux/memfd.h>
 #include <sys/utsname.h>
 
@@ -166,7 +167,7 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
     for (size_t k = 0; k < needed_count; k++) {
         const char* mod_path = needed_paths[k];
         if (!mod_path || !*mod_path) continue;
-        void *addr = find_func_addr(local_pid, remote_pid, mod_path, name);
+        void *addr = find_func_addr(remote_pid, mod_path, name);
         if (addr) { *out_addr = (uintptr_t)addr; return true; }
     }
     
@@ -176,14 +177,16 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
 static bool write_remote_addr(int pid, uintptr_t addr, ElfW(Addr) value) { return write_proc(pid, addr, &value, sizeof(value)); }
 [[maybe_unused]] static bool read_remote_addr(int pid, uintptr_t addr, ElfW(Addr) *out) { return read_proc(pid, addr, out, sizeof(*out)); }
 
-static bool apply_rela_section(int pid, int fd, [[maybe_unused]] const elf_dyn_info *info,
-                               [[maybe_unused]] int local_pid, [[maybe_unused]] int remote_pid,
-                               [[maybe_unused]] const char** needed_paths, 
-                               [[maybe_unused]] size_t needed_count,
-                               uintptr_t load_bias, off_t rela_off, size_t rela_sz) {
+static bool apply_rela_section(int pid, void* file_map, [[maybe_unused]] const std::unique_ptr<ElfW(Phdr)[]>& phdr, size_t phnum,
+                               [[maybe_unused]] const elf_dyn_info *info, [[maybe_unused]] int local_pid, 
+                               [[maybe_unused]] int remote_pid, [[maybe_unused]] const char** needed_paths, 
+                               [[maybe_unused]] size_t needed_count, uintptr_t load_bias, ElfW(Addr) rela_vaddr, size_t rela_sz) {
+    off_t rela_off = 0;
+    if (!vaddr_to_offset(phdr, phnum, rela_vaddr, &rela_off)) return false;
+
     size_t count = rela_sz / sizeof(ElfW(Rela));
-    auto rels = std::make_unique<ElfW(Rela)[]>(count);
-    if (!read_loop_offset(fd, rels.get(), rela_sz, rela_off)) return false;
+    // Pointer math directly to mapped file.
+    ElfW(Rela)* rels = reinterpret_cast<ElfW(Rela)*>(reinterpret_cast<uint8_t*>(file_map) + rela_off);
 
     for (size_t i = 0; i < count; i++) {
         const ElfW(Rela)& r = rels[i];
@@ -216,14 +219,16 @@ static bool apply_rela_section(int pid, int fd, [[maybe_unused]] const elf_dyn_i
     return true;
 }
 
-static bool apply_rel_section(int pid, int fd, [[maybe_unused]] const elf_dyn_info *info,
-                              [[maybe_unused]] int local_pid, [[maybe_unused]] int remote_pid,
-                              [[maybe_unused]] const char** needed_paths, 
-                              [[maybe_unused]] size_t needed_count,
-                              uintptr_t load_bias, off_t rel_off, size_t rel_sz) {
+static bool apply_rel_section(int pid, void* file_map, [[maybe_unused]] const std::unique_ptr<ElfW(Phdr)[]>& phdr, size_t phnum,
+                              [[maybe_unused]] const elf_dyn_info *info, [[maybe_unused]] int local_pid, 
+                              [[maybe_unused]] int remote_pid, [[maybe_unused]] const char** needed_paths,
+                              [[maybe_unused]] size_t needed_count, uintptr_t load_bias, ElfW(Addr) rel_vaddr, size_t rel_sz) {
+    off_t rel_off = 0;
+    if (!vaddr_to_offset(phdr, phnum, rel_vaddr, &rel_off)) return false;
+
     size_t count = rel_sz / sizeof(ElfW(Rel));
-    auto rels = std::make_unique<ElfW(Rel)[]>(count);
-    if (!read_loop_offset(fd, rels.get(), rel_sz, rel_off)) return false;
+    // Pointer math directly to mapped file.
+    ElfW(Rel)* rels = reinterpret_cast<ElfW(Rel)*>(reinterpret_cast<uint8_t*>(file_map) + rel_off);
 
     for (size_t i = 0; i < count; i++) {
         const ElfW(Rel)& r = rels[i];
@@ -323,16 +328,26 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
     UniqueFd fd(open(lib_path, O_RDONLY | O_CLOEXEC));
     if (fd < 0) return false;
 
+    // Map the file locally
+    struct stat st;
+    if (fstat(fd, &st) != 0) return false;
+    void* file_map = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (file_map == MAP_FAILED) return false;
+
     ElfW(Ehdr) eh;
     std::unique_ptr<ElfW(Phdr)[]> phdr;
     ElfW(Addr) min_vaddr = 0;
     size_t map_size = 0;
 
-    if (!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size)) { return false; }
+    if (!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size)) { 
+        munmap(file_map, st.st_size);
+        return false; 
+    }
 
     uintptr_t syscall_gadget = find_syscall_gadget(local_pid, remote_pid);
     if (!syscall_gadget) {
         LOGE("Failed to find syscall gadget for Remote-Custom Linker");
+        munmap(file_map, st.st_size);
         return false;
     }
 
@@ -357,6 +372,7 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
 
     if (remote_fd < 0) {
         LOGE("Failed to open remote file via raw syscall");
+        munmap(file_map, st.st_size);
         return false;
     }
 
@@ -385,6 +401,7 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
     if (!remote_base || remote_base == (uintptr_t)MAP_FAILED) {
         long args_close_fd[] = {remote_fd};
         remote_syscall(pid, call_regs, syscall_gadget, SYS_close, args_close_fd, 1);
+        munmap(file_map, st.st_size);
         return false;
     }
 
@@ -412,7 +429,7 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
             long offset_arg = remote_mmap_offset_arg(file_page_offset, page_size);
             long args_mmap_seg[] = {(long)seg_page, (long)(file_page_end - seg_page), PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, remote_fd, offset_arg};
             uintptr_t seg_map = remote_syscall(pid, call_regs, syscall_gadget, SYS_mmap, args_mmap_seg, 6);
-            if (!seg_map || seg_map == (uintptr_t)MAP_FAILED) return false;
+            if (!seg_map || seg_map == (uintptr_t)MAP_FAILED) { munmap(file_map, st.st_size); return false; }
 
             if (is_writable && file_page_end > file_end) {
                 size_t tail_len = (size_t)(file_page_end - file_end);
@@ -427,7 +444,7 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
         if (seg_page_end > file_page_end) {
             long args_mmap_bss[] = {(long)file_page_end, (long)(seg_page_end - file_page_end), PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
             uintptr_t bss_map = remote_syscall(pid, call_regs, syscall_gadget, SYS_mmap, args_mmap_bss, 6);
-            if (!bss_map || bss_map == (uintptr_t)MAP_FAILED) return false;
+            if (!bss_map || bss_map == (uintptr_t)MAP_FAILED) { munmap(file_map, st.st_size); return false; }
         }
         int prot = 0;
         if (phdr[i].p_flags & PF_R) prot |= PROT_READ;
@@ -435,8 +452,6 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
         if (phdr[i].p_flags & PF_X) prot |= PROT_EXEC;
         if (seg_count < 32) {
             segs[seg_count++] = {seg_page, seg_page_len, prot};
-        } else {
-            LOGW("Too many segments in the ELF, some may not have correct permissions set");
         }
     }
 
@@ -444,7 +459,11 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
     remote_syscall(pid, call_regs, syscall_gadget, SYS_close, args_close_fd, 1);
 
     elf_dyn_info dinfo;
-    if (!elf_load_dyn_info(fd, &eh, phdr, &dinfo)) return false;
+    // Pass the local memory map directly.
+    if (!elf_load_dyn_info(file_map, true, &eh, phdr, &dinfo)) {
+        munmap(file_map, st.st_size);
+        return false;
+    }
 
     size_t needed_count = dinfo.needed_count;
     const char** needed_paths = (const char**)alloca(needed_count * sizeof(const char*));
@@ -463,11 +482,12 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
         }
     }
 
-    if (dinfo.rela_sz && dinfo.rela_off) apply_rela_section(pid, fd, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.rela_off, dinfo.rela_sz);
-    if (dinfo.rel_sz && dinfo.rel_off) apply_rel_section(pid, fd, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.rel_off, dinfo.rel_sz);
-    if (dinfo.jmprel_sz && dinfo.jmprel_off) {
-        if (dinfo.pltrel_type == DT_RELA) apply_rela_section(pid, fd, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.jmprel_off, dinfo.jmprel_sz);
-        else apply_rel_section(pid, fd, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.jmprel_off, dinfo.jmprel_sz);
+    // Apply relocations passing the local file_map
+    if (dinfo.rela_sz && dinfo.rela_vaddr) apply_rela_section(pid, file_map, phdr, eh.e_phnum, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.rela_vaddr, dinfo.rela_sz);
+    if (dinfo.rel_sz && dinfo.rel_vaddr) apply_rel_section(pid, file_map, phdr, eh.e_phnum, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.rel_vaddr, dinfo.rel_sz);
+    if (dinfo.jmprel_sz && dinfo.jmprel_vaddr) {
+        if (dinfo.pltrel_type == DT_RELA) apply_rela_section(pid, file_map, phdr, eh.e_phnum, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.jmprel_vaddr, dinfo.jmprel_sz);
+        else apply_rel_section(pid, file_map, phdr, eh.e_phnum, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.jmprel_vaddr, dinfo.jmprel_sz);
     }
 
     for (size_t k = 0; k < seg_count; k++) {
@@ -478,13 +498,19 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
     }
 
     ElfW(Addr) entry_value = 0;
-    if (!find_dynsym_value(&dinfo, "entry", &entry_value)) { return false; }
+    if (!find_dynsym_value(&dinfo, "entry", &entry_value)) {
+        munmap(file_map, st.st_size);
+        return false; 
+    }
 
     *out_base = remote_base;
     *out_total_size = map_size;
     *out_entry = (uintptr_t)load_bias + (uintptr_t)entry_value;
     *out_init_array = dinfo.init_array_vaddr ? ((uintptr_t)load_bias + dinfo.init_array_vaddr) : 0;
     *out_init_count = dinfo.init_arraysz ? (dinfo.init_arraysz / sizeof(ElfW(Addr))) : 0;
+
+    // We no longer need the local file mapping. Clean it up.
+    munmap(file_map, st.st_size);
 
     return true;
 }

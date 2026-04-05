@@ -156,14 +156,14 @@ void *find_module_base(int pid, std::string_view suffix) {
  * remote process. The remote address is then calculated using the offset from the base.
  * remote_sym = remote_base + (local_sym - local_base)
  */
-void *find_func_addr(int local_pid, int remote_pid, std::string_view module, std::string_view func) {
+void *find_func_addr(int pid, std::string_view module, std::string_view func) {
     std::string module_str(module);
     std::string func_str(func);
     char absolute_path[512] = {0};
     void *remote_base = nullptr;
 
     // Find the local address of the function.
-    MapInfo::Scan(remote_pid, [&](const MapInfo& m) {
+    MapInfo::Scan(pid, [&](const MapInfo& m) {
         if (m.offset == 0 && std::string_view(m.path).ends_with(module)) {
             remote_base = (void *) m.start;
             // Capture the absolute path (e.g., /system/lib64/libc.so)
@@ -186,6 +186,12 @@ void *find_func_addr(int local_pid, int remote_pid, std::string_view module, std
     }
 
     // Parse the ELF headers to find the symbol's offset (st_value)
+    struct stat st;
+    if (fstat(fd, &st) < 0) return nullptr;
+
+    void* file_map = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (file_map == MAP_FAILED) return nullptr;
+
     ElfW(Ehdr) eh;
     std::unique_ptr<ElfW(Phdr)[]> phdr;
     ElfW(Addr) min_vaddr = 0;
@@ -194,12 +200,14 @@ void *find_func_addr(int local_pid, int remote_pid, std::string_view module, std
 
     if (!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size)) {
         LOGE("failed to compute layout for %s", absolute_path);
+        munmap(file_map, st.st_size);
         return nullptr;
     }
 
     elf_dyn_info dinfo;
-    if (!elf_load_dyn_info(fd, &eh, phdr, &dinfo)) {
+    if (!elf_load_dyn_info(file_map, true, &eh, phdr, &dinfo)) {
         LOGE("failed to load dynamic info for %s", absolute_path);
+        munmap(file_map, st.st_size);
         return nullptr;
     }
 
@@ -207,8 +215,11 @@ void *find_func_addr(int local_pid, int remote_pid, std::string_view module, std
     ElfW(Addr) sym_offset = 0;
     if (!find_dynsym_value(&dinfo, func_str.c_str(), &sym_offset) || sym_offset == 0) {
         LOGE("failed to find sym %s in offline ELF file %s", func_str.c_str(), absolute_path);
+        munmap(file_map, st.st_size);
         return nullptr;
     }
+    
+    munmap(file_map, st.st_size);
 
     // Calculate the absolute remote address
     // remote_sym = remote_base + raw_offset
