@@ -1,5 +1,24 @@
+import java.nio.file.Paths
+import org.gradle.internal.os.OperatingSystem
+
 plugins {
     id("com.android.library")
+}
+
+fun Project.findInPath(executable: String, property: String): String? {
+    val pathEnv = System.getenv("PATH")
+    return pathEnv.split(File.pathSeparator).map { folder ->
+        Paths.get("${folder}${File.separator}${executable}${if (OperatingSystem.current().isWindows) ".exe" else ""}")
+            .toFile()
+    }.firstOrNull { path ->
+        path.exists()
+    }?.absolutePath ?: properties.getOrDefault(property, null) as? String?
+}
+
+val ccachePath by lazy {
+    project.findInPath("ccache", "ccache.path")?.also {
+        println("zygiskd: Use ccache: $it")
+    }
 }
 
 val defaultCFlags = arrayOf(
@@ -41,7 +60,8 @@ android {
         externalNativeBuild {
             cmake {
                 cFlags("-std=c18", *defaultCFlags)
-		        cppFlags("-std=c++23", *defaultCFlags)
+                cppFlags("-std=c++23", *defaultCFlags)
+
                 arguments(
                     "-DZKSU_VERSION=\"${rootProject.extra["verName"]}\"",
                     "-DMIN_APATCH_VERSION=${rootProject.extra["minAPatchVersion"]}",
@@ -51,6 +71,13 @@ android {
                     "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--entry=main",
                     "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--entry=main"
                 )
+
+                ccachePath?.let {
+                    arguments(
+                        "-DCMAKE_C_COMPILER_LAUNCHER=$it",
+                        "-DCMAKE_CXX_COMPILER_LAUNCHER=$it"
+                    )
+                }
                 abiFilters("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
             }
         }

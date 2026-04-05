@@ -77,7 +77,10 @@ android {
             cFlags("-std=c18", *defaultCFlags)
             cppFlags("-std=c++20", *defaultCFlags)
             ccachePath?.let {
-                arguments += "-DNDK_CCACHE=$it"
+                arguments(
+                    "-DCMAKE_C_COMPILER_LAUNCHER=$it",
+                    "-DCMAKE_CXX_COMPILER_LAUNCHER=$it"
+                )
             }
         }
     }
