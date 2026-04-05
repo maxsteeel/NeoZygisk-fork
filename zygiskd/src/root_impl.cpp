@@ -4,31 +4,9 @@
 #include <optional>
 #include "logging.hpp"
 
-namespace apatch {
-    enum class Version { Supported, TooOld };
-    std::optional<Version> detect_version();
-    bool uid_granted_root(int32_t uid);
-    bool uid_should_umount(int32_t uid);
-    bool uid_is_manager(int32_t uid);
-    bool uid_is_manager(int32_t uid, int64_t now_ms);
-}
-
-namespace kernelsu {
-    enum class Version { Supported, TooOld };
-    std::optional<Version> detect_version();
-    bool uid_granted_root(int32_t uid);
-    bool uid_should_umount(int32_t uid);
-    bool uid_is_manager(int32_t uid);
-    bool uid_is_manager(int32_t uid, int64_t now_ms);
-}
-
-namespace magisk {
-    enum class Version { Supported, TooOld };
-    std::optional<Version> detect_version();
-    bool uid_granted_root(int32_t uid);
-    bool uid_should_umount(int32_t uid);
-    bool uid_is_manager(int32_t uid);
-}
+#include "root_impl/apatch.hpp"
+#include "root_impl/kernelsu.hpp"
+#include "root_impl/magisk.hpp"
 
 namespace root_impl {
 
@@ -106,6 +84,14 @@ bool uid_is_manager(int32_t uid, int64_t now_ms) {
         case RootImpl::APatch: return apatch::uid_is_manager(uid, now_ms);
         case RootImpl::KernelSU: return kernelsu::uid_is_manager(uid, now_ms);
         default: return false;
+    }
+}
+
+void refresh_cache() {
+    switch (get()) {
+        case RootImpl::APatch: apatch::refresh_cache(); break;
+        case RootImpl::Magisk: magisk::refresh_cache(); break;
+        default: break;
     }
 }
 

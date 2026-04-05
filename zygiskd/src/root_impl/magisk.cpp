@@ -338,7 +338,7 @@ static bool cache_update_required(struct stat* db_st, struct stat* pkg_st) {
            !g_cache.manager_resolved; // We will set this to true after attempting to resolve once
 }
 
-static void update_cache() {
+void refresh_cache() {
     struct stat db_st, pkg_st;
     if (!cache_update_required(&db_st, &pkg_st)) {
         return;
@@ -539,13 +539,11 @@ static bool get_package_by_uid_from_xml(int32_t uid, auto& pkg_name) {
 }
 
 bool uid_granted_root(int32_t uid) {
-    update_cache();
     std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
     return list_contains_uid(g_cache.granted_uids, uid);
 }
 
 bool uid_should_umount(int32_t uid) {
-    update_cache();
     std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
     if (list_contains_uid(g_cache.denylist_uids, uid)) return true;
     if (list_contains_uid(g_cache.all_known_uids, uid)) return false;
@@ -564,7 +562,6 @@ bool uid_should_umount(int32_t uid) {
 }
 
 bool uid_is_manager(int32_t uid) {
-    update_cache();
     std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
     return g_cache.manager_uid == uid;
 }

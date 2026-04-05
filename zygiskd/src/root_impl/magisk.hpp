@@ -8,4 +8,5 @@ namespace magisk {
     bool uid_granted_root(int32_t uid);
     bool uid_should_umount(int32_t uid);
     bool uid_is_manager(int32_t uid);
+    void refresh_cache();
 }

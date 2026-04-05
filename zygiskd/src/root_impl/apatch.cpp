@@ -55,30 +55,22 @@ std::optional<Version> detect_version() {
     return cached_version;
 }
 
-static const ConfigData* get_config() {
+void refresh_cache() {
     struct timespec now_ts;
     clock_gettime(CLOCK_MONOTONIC, &now_ts);
     int64_t now_ms = now_ts.tv_sec * 1000LL + now_ts.tv_nsec / 1000000LL;
 
     auto cached_data = config_cache_rcu.load(std::memory_order_acquire);
-
-    // VDSO Rate-Limiting: Check max once every 500ms
-    if (cached_data && now_ms - last_stat_time_ms.load(std::memory_order_relaxed) < 500) {
-        return cached_data;
-    }
+    if (cached_data && now_ms - last_stat_time_ms.load(std::memory_order_relaxed) < 2000) return;
 
     struct stat st;
-    if (stat(CONFIG_FILE, &st) != 0) {
-        return nullptr;
-    }
+    if (stat(CONFIG_FILE, &st) != 0) return;
 
     last_stat_time_ms.store(now_ms, std::memory_order_relaxed);
 
     if (cached_data) {
         if (cached_data->mtim.tv_sec == st.st_mtim.tv_sec &&
-            cached_data->mtim.tv_nsec == st.st_mtim.tv_nsec) {
-            return cached_data;
-        }
+            cached_data->mtim.tv_nsec == st.st_mtim.tv_nsec) return;
     }
 
     std::lock_guard<std::mutex> lock(writer_mutex);
@@ -86,12 +78,10 @@ static const ConfigData* get_config() {
     // Double check after acquiring the lock
     cached_data = config_cache_rcu.load(std::memory_order_acquire);
     if (cached_data && cached_data->mtim.tv_sec == st.st_mtim.tv_sec &&
-        cached_data->mtim.tv_nsec == st.st_mtim.tv_nsec) {
-        return cached_data;
-    }
+        cached_data->mtim.tv_nsec == st.st_mtim.tv_nsec) return;
 
     UniqueFd fd(open(CONFIG_FILE, O_RDONLY | O_CLOEXEC));
-    if (fd < 0) return nullptr;
+    if (fd < 0) return;
 
     // Allocate raw pointer to avoid NDK shared_ptr atomic limitation
     ConfigData* new_config = new ConfigData();
@@ -176,7 +166,7 @@ static const ConfigData* get_config() {
     // However, if we know threads finish quickly, we could theoretically delete old_config here.
     // For maximum safety without a hazard pointer framework, we leave it orphaned.
 
-    return new_config;
+    return;
 }
 
 static uint32_t find_package(const ConfigData* config, int32_t uid) {
@@ -200,14 +190,14 @@ static uint32_t find_package(const ConfigData* config, int32_t uid) {
 }
 
 bool uid_granted_root(int32_t uid) {
-    auto config = get_config();
+    auto config = config_cache_rcu.load(std::memory_order_acquire);
     if (!config) return false;
     uint32_t pkg = find_package(config, uid);
     return (pkg & (1U << 30)) != 0;
 }
 
 bool uid_should_umount(int32_t uid) {
-    auto config = get_config();
+    auto config = config_cache_rcu.load(std::memory_order_acquire);
     if (!config) return false;
     uint32_t pkg = find_package(config, uid);
     return (pkg & (1U << 31)) != 0;

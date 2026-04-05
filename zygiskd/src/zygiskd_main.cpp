@@ -133,9 +133,11 @@ static bool initialize_globals() {
 static void shm_refresh_thread() {
     prctl(PR_SET_NAME, "zygiskd-refresh");
     while (true) {
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        std::this_thread::sleep_for(std::chrono::seconds(10));
 
         if (!g_shm_base) continue;
+        
+        root_impl::refresh_cache();
 
         // Calculate time once per loop
         struct timespec ts;
@@ -416,6 +418,8 @@ static int spawn_companion_complete(const char* name, int lib_fd) {
 static void handle_get_process_flags(int stream) {
     int32_t uid = socket_utils::read_u32(stream);
     ProcessFlags flags = ProcessFlags::NONE;
+    
+    root_impl::refresh_cache();
 
     if (root_impl::uid_is_manager(uid)) {
         flags |= ProcessFlags::PROCESS_IS_MANAGER;
