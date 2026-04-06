@@ -598,11 +598,10 @@ void ZygiskContext::app_specialize_pre() {
                     const char *info_str = env->GetStringUTFChars(pkg_data_info, nullptr);
                     if (info_str) {
                         // string format is: "packageName,volumeUuid,inode,dataDir"
-                        const char *comma1 = strchr(info_str, ',');
-                        const char *comma2 = comma1 ? strchr(comma1 + 1, ',') : nullptr;
-                        const char *comma3 = comma2 ? strchr(comma2 + 1, ',') : nullptr;
-                        if (comma3 && *(comma3 + 1) != '\0') {
-                            const char *data_dir = comma3 + 1;
+                        const char *p = info_str;
+                        if ((p = strchr(p, ',')) && (p = strchr(p + 1, ',')) &&
+                            (p = strchr(p + 1, ',')) && *(++p) != '\0') {
+                            const char *data_dir = p;
                             struct stat st;
                             if (stat(data_dir, &st) == 0) {
                                 uid = st.st_uid;
