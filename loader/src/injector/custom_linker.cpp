@@ -332,6 +332,171 @@ static int64_t sleb128_decode(sleb128_decoder *decoder) {
     return value;
 }
 
+
+static inline bool process_relocation(
+    [[maybe_unused]] LoadedModule& mod, const std::vector<LoadedModule>& loaded_modules,
+    uintptr_t load_bias, const elf_dyn_info* info,
+    uintptr_t target, unsigned current_type, unsigned current_sym_idx,
+    ElfW(Addr) current_addend, [[maybe_unused]] bool is_rela,
+    std::vector<deferred_ifunc>& ifuncs
+) {
+    ElfW(Addr) value = 0;
+
+#if defined(__aarch64__)
+    if (current_type == R_AARCH64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
+    else if (current_type == R_AARCH64_IRELATIVE) {
+        ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)current_addend});
+        return true;
+    } else if (current_type == R_AARCH64_GLOB_DAT || current_type == R_AARCH64_JUMP_SLOT || current_type == R_AARCH64_ABS64) {
+        uintptr_t sym_addr = 0;
+        if (!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+            if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
+                LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                return false;
+            }
+            sym_addr = 0;
+        }
+        value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
+    } else if (current_type == R_AARCH64_TLS_DTPMOD) {
+        value = info->tls_mod_id;
+    } else if (current_type == R_AARCH64_TLS_DTPREL) {
+        const ElfW(Sym)& sym = info->symtab[current_sym_idx];
+        value = (ElfW(Addr))sym.st_value + current_addend;
+    } else if (current_type == R_AARCH64_TLS_TPREL) {
+        uintptr_t sym_addr = 0;
+        if (current_sym_idx == 0) {
+            value = info->tls_segment_vaddr + current_addend;
+        } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+            value = sym_addr - load_bias + info->tls_segment_vaddr;
+        }
+    } else if (current_type == R_AARCH64_TLSDESC) {
+        tlsdesc* td = reinterpret_cast<tlsdesc*>(target);
+        tls_index* ti = new tls_index;
+        ti->module_id = info->tls_mod_id;
+        uintptr_t sym_addr = 0;
+        if (current_sym_idx == 0) {
+            ti->offset = current_addend;
+        } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+            ti->offset = (sym_addr - load_bias) + current_addend;
+        } else {
+            ti->offset = current_addend;
+        }
+        td->resolver = reinterpret_cast<void*>(custom_tlsdesc_resolver_stub);
+        td->arg = reinterpret_cast<uint64_t>(ti);
+        mod.tlsdesc_args.push_back(ti);
+        return true;
+    } else return false;
+
+#elif defined(__x86_64__)
+    if (current_type == R_X86_64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
+    else if (current_type == R_X86_64_IRELATIVE) {
+        ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)current_addend});
+        return true;
+    } else if (current_type == R_X86_64_GLOB_DAT || current_type == R_X86_64_JUMP_SLOT || current_type == R_X86_64_64) {
+        uintptr_t sym_addr = 0;
+        if (!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+            if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
+                LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                return false;
+            }
+            sym_addr = 0;
+        }
+        value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
+    } else if (current_type == R_X86_64_DTPMOD64) {
+        value = info->tls_mod_id;
+    } else if (current_type == R_X86_64_DTPOFF64) {
+        const ElfW(Sym)& sym = info->symtab[current_sym_idx];
+        value = (ElfW(Addr))sym.st_value + current_addend;
+    } else if (current_type == R_X86_64_TPOFF64) {
+        uintptr_t sym_addr = 0;
+        if (current_sym_idx == 0) {
+            value = info->tls_segment_vaddr + current_addend;
+        } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+            value = sym_addr - load_bias + info->tls_segment_vaddr;
+        }
+    } else return false;
+
+#elif defined(__arm__)
+    if (current_type == R_ARM_RELATIVE) {
+        ElfW(Addr) addend_rel = is_rela ? current_addend : *reinterpret_cast<ElfW(Addr)*>(target);
+        value = (ElfW(Addr))load_bias + addend_rel;
+    } else if (current_type == R_ARM_IRELATIVE) {
+        ElfW(Addr) addend_rel = is_rela ? current_addend : *reinterpret_cast<ElfW(Addr)*>(target);
+        ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)addend_rel});
+        return true;
+    } else if (current_type == R_ARM_GLOB_DAT || current_type == R_ARM_JUMP_SLOT || current_type == R_ARM_ABS32) {
+        uintptr_t sym_addr = 0;
+        if (!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+            if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
+                LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                return false;
+            }
+            sym_addr = 0;
+        }
+        if (sym_addr == 0) value = 0;
+        else if (current_type == R_ARM_ABS32) {
+            ElfW(Addr) addend_rel = is_rela ? current_addend : *reinterpret_cast<ElfW(Addr)*>(target);
+            value = (ElfW(Addr))sym_addr + addend_rel;
+        } else value = (ElfW(Addr))sym_addr;
+    } else if (current_type == R_ARM_TLS_DTPMOD32) {
+        value = info->tls_mod_id;
+    } else if (current_type == R_ARM_TLS_DTPOFF32) {
+        const ElfW(Sym)& sym = info->symtab[current_sym_idx];
+        value = (ElfW(Addr))sym.st_value + current_addend;
+    } else if (current_type == R_ARM_TLS_TPOFF32) {
+        uintptr_t sym_addr = 0;
+        if (current_sym_idx == 0) {
+            value = info->tls_segment_vaddr + current_addend;
+        } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+            value = sym_addr - load_bias + info->tls_segment_vaddr;
+        }
+    } else return false;
+
+#elif defined(__i386__)
+    if (current_type == R_386_RELATIVE) {
+        ElfW(Addr) addend_rel = is_rela ? current_addend : *reinterpret_cast<ElfW(Addr)*>(target);
+        value = (ElfW(Addr))load_bias + addend_rel;
+    } else if (current_type == R_386_IRELATIVE) {
+        ElfW(Addr) addend_rel = is_rela ? current_addend : *reinterpret_cast<ElfW(Addr)*>(target);
+        ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)addend_rel});
+        return true;
+    } else if (current_type == R_386_GLOB_DAT || current_type == R_386_JMP_SLOT || current_type == R_386_32) {
+        uintptr_t sym_addr = 0;
+        if (!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+            if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
+                LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                return false;
+            }
+            sym_addr = 0;
+        }
+        if (sym_addr == 0) value = 0;
+        else if (current_type == R_386_32) {
+            ElfW(Addr) addend_rel = is_rela ? current_addend : *reinterpret_cast<ElfW(Addr)*>(target);
+            value = (ElfW(Addr))sym_addr + addend_rel;
+        } else value = (ElfW(Addr))sym_addr;
+    } else if (current_type == R_386_TLS_DTPMOD32) {
+        value = info->tls_mod_id;
+    } else if (current_type == R_386_TLS_DTPOFF32) {
+        const ElfW(Sym)& sym = info->symtab[current_sym_idx];
+        value = (ElfW(Addr))sym.st_value + current_addend;
+    } else if (current_type == R_386_TLS_TPOFF) {
+        uintptr_t sym_addr = 0;
+        if (current_sym_idx == 0) {
+            value = info->tls_segment_vaddr + current_addend;
+        } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+            value = sym_addr - load_bias + info->tls_segment_vaddr;
+        }
+    } else return false;
+
+#else
+    if (current_type == 0) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
+    else return false;
+#endif
+
+    *reinterpret_cast<ElfW(Addr)*>(target) = value;
+    return true;
+}
+
 static bool apply_rela_section(LoadedModule& mod, [[maybe_unused]] const std::vector<LoadedModule>& loaded_modules,
                                off_t rela_vaddr, size_t rela_sz, [[maybe_unused]] std::vector<deferred_ifunc>& ifuncs) {
     [[maybe_unused]] const elf_dyn_info* info = &mod.dinfo;
@@ -345,85 +510,10 @@ static bool apply_rela_section(LoadedModule& mod, [[maybe_unused]] const std::ve
         [[maybe_unused]] unsigned type = (unsigned)ELF_R_TYPE(r.r_info);
         [[maybe_unused]] unsigned sym = (unsigned)ELF_R_SYM(r.r_info);
         uintptr_t target = (uintptr_t)load_bias + (uintptr_t)r.r_offset;
-        ElfW(Addr) value = 0;
 
-#if defined(__aarch64__)
-        if (type == R_AARCH64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))r.r_addend;
-        else if (type == R_AARCH64_IRELATIVE) {
-            ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)r.r_addend});
-        } else if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT || type == R_AARCH64_ABS64) {
-            uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, loaded_modules, load_bias, sym, &sym_addr)) {
-                if (ELF_ST_BIND(info->symtab[sym].st_info) != STB_WEAK) {
-                    LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
-                    return false; // abort load
-                }
-                sym_addr = 0;
-            }
-            value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))r.r_addend : 0;
-        } else if (type == R_AARCH64_TLS_DTPMOD) {
-            value = info->tls_mod_id;
-        } else if (type == R_AARCH64_TLS_DTPREL) {
-            const ElfW(Sym)& symb = info->symtab[sym];
-            value = (ElfW(Addr))symb.st_value + r.r_addend;
-        } else if (type == R_AARCH64_TLSDESC) {
-            tlsdesc* td = reinterpret_cast<tlsdesc*>(target);
-            tls_index* ti = new tls_index;
-            ti->module_id = info->tls_mod_id;
-            uintptr_t sym_addr = 0;
-            if (sym == 0) {
-                ti->offset = r.r_addend;
-            } else if (resolve_symbol_addr(info, loaded_modules, load_bias, sym, &sym_addr)) {
-                ti->offset = (sym_addr - load_bias) + r.r_addend;
-            } else {
-                ti->offset = r.r_addend;
-            }
-            td->resolver = reinterpret_cast<void*>(custom_tlsdesc_resolver_stub);
-            td->arg = reinterpret_cast<uint64_t>(ti);
-            const_cast<LoadedModule&>(mod).tlsdesc_args.push_back(ti);
-
-            continue;
-        } else if (type == R_AARCH64_TLS_TPREL) {
-            uintptr_t sym_addr = 0;
-            if (sym == 0) {
-                value = info->tls_segment_vaddr + r.r_addend;
-            } else if (resolve_symbol_addr(info, loaded_modules, load_bias, sym, &sym_addr)) {
-                value = sym_addr - load_bias + info->tls_segment_vaddr;
-            }
-        } else return false;
-#elif defined(__x86_64__)
-        if (type == R_X86_64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))r.r_addend;
-        else if (type == R_X86_64_IRELATIVE) {
-            ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)r.r_addend});
-            continue;
-        } else if (type == R_X86_64_GLOB_DAT || type == R_X86_64_JUMP_SLOT || type == R_X86_64_64) {
-            uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, loaded_modules, load_bias, sym, &sym_addr)) {
-                if (ELF_ST_BIND(info->symtab[sym].st_info) != STB_WEAK) {
-                    LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
-                    return false;
-                }
-                sym_addr = 0;
-            }
-            value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))r.r_addend : 0;
-        } else if (type == R_X86_64_DTPMOD64) {
-            value = info->tls_mod_id;
-        } else if (type == R_X86_64_DTPOFF64) {
-            const ElfW(Sym)& symb = info->symtab[sym];
-            value = (ElfW(Addr))symb.st_value + r.r_addend;
-        } else if (type == R_X86_64_TPOFF64) {
-            uintptr_t sym_addr = 0;
-            if (sym == 0) {
-                value = info->tls_segment_vaddr + r.r_addend;
-            } else if (resolve_symbol_addr(info, loaded_modules, load_bias, sym, &sym_addr)) {
-                value = sym_addr - load_bias + info->tls_segment_vaddr;
-            }
-        } else return false;
-#else
-        if (type == 0) value = (ElfW(Addr))load_bias + (ElfW(Addr))r.r_addend;
-        else return false;
-#endif
-        *reinterpret_cast<ElfW(Addr)*>(target) = value;
+        if (!process_relocation(mod, loaded_modules, load_bias, info, target, type, sym, r.r_addend, true, ifuncs)) {
+            return false;
+        }
     }
     return true;
 }
@@ -441,88 +531,15 @@ static bool apply_rel_section(LoadedModule& mod, [[maybe_unused]] const std::vec
         [[maybe_unused]] unsigned type = (unsigned)ELF_R_TYPE(r.r_info);
         [[maybe_unused]] unsigned sym = (unsigned)ELF_R_SYM(r.r_info);
         uintptr_t target = (uintptr_t)load_bias + (uintptr_t)r.r_offset;
-        [[maybe_unused]] ElfW(Addr) addend = 0;
-        ElfW(Addr) value = 0;
 
-#if defined(__arm__)
-        if (type == R_ARM_RELATIVE) {
-            addend = *reinterpret_cast<ElfW(Addr)*>(target);
-            value = (ElfW(Addr))load_bias + addend;
-        } else if (type == R_ARM_IRELATIVE) {
-            addend = *reinterpret_cast<ElfW(Addr)*>(target);
-            ifuncs.push_back({target, (uintptr_t)load_bias + addend});
-            continue;
-        } else if (type == R_ARM_GLOB_DAT || type == R_ARM_JUMP_SLOT || type == R_ARM_ABS32) {
-            uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, loaded_modules, load_bias, sym, &sym_addr)) {
-                if (ELF_ST_BIND(info->symtab[sym].st_info) != STB_WEAK) {
-                    LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
-                    return false;
-                }
-                sym_addr = 0;
-            }
-            if (sym_addr == 0) value = 0;
-            else if (type == R_ARM_ABS32) {
-                addend = *reinterpret_cast<ElfW(Addr)*>(target);
-                value = (ElfW(Addr))sym_addr + addend;
-            } else value = (ElfW(Addr))sym_addr;
-        } else if (type == R_ARM_TLS_DTPMOD32) {
-            value = info->tls_mod_id;
-        } else if (type == R_ARM_TLS_DTPOFF32) {
-            const ElfW(Sym)& symb = info->symtab[sym];
-            value = (ElfW(Addr))symb.st_value; // REL section relies on addend read from mem if present but usually 0 for dtpoff unless added manually
-        } else if (type == R_ARM_TLS_TPOFF32) {
-            uintptr_t sym_addr = 0;
-            if (sym == 0) {
-                value = info->tls_segment_vaddr;
-            } else if (resolve_symbol_addr(info, loaded_modules, load_bias, sym, &sym_addr)) {
-                value = sym_addr - load_bias + info->tls_segment_vaddr;
-            }
-        } else return false;
-#elif defined(__i386__)
-        if (type == R_386_RELATIVE) {
-            addend = *reinterpret_cast<ElfW(Addr)*>(target);
-            value = (ElfW(Addr))load_bias + addend;
-        } else if (type == R_386_IRELATIVE) {
-            addend = *reinterpret_cast<ElfW(Addr)*>(target);
-            ifuncs.push_back({target, (uintptr_t)load_bias + addend});
-            continue;
-        } else if (type == R_386_GLOB_DAT || type == R_386_JMP_SLOT || type == R_386_32) {
-            uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, loaded_modules, load_bias, sym, &sym_addr)) {
-                if (ELF_ST_BIND(info->symtab[sym].st_info) != STB_WEAK) {
-                    LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
-                    return false;
-                }
-                sym_addr = 0;
-            }
-            if (sym_addr == 0) value = 0;
-            else if (type == R_386_32) {
-                addend = *reinterpret_cast<ElfW(Addr)*>(target);
-                value = (ElfW(Addr))sym_addr + addend;
-            } else value = (ElfW(Addr))sym_addr;
-        } else if (type == R_386_TLS_DTPMOD32) {
-            value = info->tls_mod_id;
-        } else if (type == R_386_TLS_DTPOFF32) {
-            const ElfW(Sym)& symb = info->symtab[sym];
-            value = (ElfW(Addr))symb.st_value;
-        } else if (type == R_386_TLS_TPOFF) {
-            uintptr_t sym_addr = 0;
-            if (sym == 0) {
-                value = info->tls_segment_vaddr;
-            } else if (resolve_symbol_addr(info, loaded_modules, load_bias, sym, &sym_addr)) {
-                value = sym_addr - load_bias + info->tls_segment_vaddr;
-            }
-        } else return false;
-#else
-        return false;
-#endif
-        *reinterpret_cast<ElfW(Addr)*>(target) = value;
+        if (!process_relocation(mod, loaded_modules, load_bias, info, target, type, sym, 0, false, ifuncs)) {
+            return false;
+        }
     }
     return true;
 }
 
-static bool apply_android_relocations(LoadedModule& mod, const std::vector<LoadedModule>& loaded_modules,
+static bool apply_android_relocations([[maybe_unused]] LoadedModule& mod, const std::vector<LoadedModule>& loaded_modules,
                                       off_t reloc_vaddr, size_t reloc_sz,
                                       std::vector<deferred_ifunc>& ifuncs, bool is_rela) {
     const elf_dyn_info* info = &mod.dinfo;
@@ -597,153 +614,9 @@ static bool apply_android_relocations(LoadedModule& mod, const std::vector<Loade
             }
 
             uintptr_t target = (uintptr_t)load_bias + (uintptr_t)current_offset;
-            ElfW(Addr) value = 0;
-
-#if defined(__aarch64__)
-            if (current_type == R_AARCH64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
-            else if (current_type == R_AARCH64_IRELATIVE) {
-                ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)current_addend});
-                continue;
-            } else if (current_type == R_AARCH64_GLOB_DAT || current_type == R_AARCH64_JUMP_SLOT || current_type == R_AARCH64_ABS64) {
-                uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-                    if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
-                        LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
-                        return false;
-                    }
-                    sym_addr = 0;
-                }
-                value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
-            } else if (current_type == R_AARCH64_TLS_DTPMOD) {
-                value = info->tls_mod_id;
-            } else if (current_type == R_AARCH64_TLS_DTPREL) {
-                const ElfW(Sym)& sym = info->symtab[current_sym_idx];
-                value = (ElfW(Addr))sym.st_value + current_addend;
-            } else if (current_type == R_AARCH64_TLS_TPREL) {
-                uintptr_t sym_addr = 0;
-                if (current_sym_idx == 0) {
-                    value = info->tls_segment_vaddr + current_addend;
-                } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-                    value = sym_addr - load_bias + info->tls_segment_vaddr; // Rough TPREL emulation without tpidr thread-context
-                }
-            } else if (current_type == R_AARCH64_TLSDESC) {
-                tlsdesc* td = reinterpret_cast<tlsdesc*>(target);
-                tls_index* ti = new tls_index;
-                ti->module_id = info->tls_mod_id;
-                uintptr_t sym_addr = 0;
-                if (current_sym_idx == 0) {
-                    ti->offset = current_addend;
-                } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-                    ti->offset = (sym_addr - load_bias) + current_addend;
-                } else {
-                    ti->offset = current_addend;
-                }
-                td->resolver = reinterpret_cast<void*>(custom_tlsdesc_resolver_stub);
-                td->arg = reinterpret_cast<uint64_t>(ti);                
-                const_cast<LoadedModule&>(mod).tlsdesc_args.push_back(ti);
-
-                continue;
-            } else return false;
-#elif defined(__x86_64__)
-            if (current_type == R_X86_64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
-            else if (current_type == R_X86_64_IRELATIVE) {
-                ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)current_addend});
-                continue;
-            } else if (current_type == R_X86_64_GLOB_DAT || current_type == R_X86_64_JUMP_SLOT || current_type == R_X86_64_64) {
-                uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-                    if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
-                        LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
-                        return false;
-                    }
-                    sym_addr = 0;
-                }
-                value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
-            } else if (current_type == R_X86_64_DTPMOD64) {
-                value = info->tls_mod_id;
-            } else if (current_type == R_X86_64_DTPOFF64) {
-                const ElfW(Sym)& sym = info->symtab[current_sym_idx];
-                value = (ElfW(Addr))sym.st_value + current_addend;
-            } else if (current_type == R_X86_64_TPOFF64) {
-                uintptr_t sym_addr = 0;
-                if (current_sym_idx == 0) {
-                    value = info->tls_segment_vaddr + current_addend;
-                } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-                    value = sym_addr - load_bias + info->tls_segment_vaddr;
-                }
-            } else return false;
-#elif defined(__arm__)
-            if (current_type == R_ARM_RELATIVE) {
-                ElfW(Addr) addend_rel = *reinterpret_cast<ElfW(Addr)*>(target);
-                value = (ElfW(Addr))load_bias + addend_rel;
-            } else if (current_type == R_ARM_IRELATIVE) {
-                ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)current_addend});
-                continue;
-            } else if (current_type == R_ARM_GLOB_DAT || current_type == R_ARM_JUMP_SLOT || current_type == R_ARM_ABS32) {
-                uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-                    if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
-                        LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
-                        return false;
-                    }
-                    sym_addr = 0;
-                }
-                if (sym_addr == 0) value = 0;
-                else if (current_type == R_ARM_ABS32) {
-                    ElfW(Addr) addend_rel = *reinterpret_cast<ElfW(Addr)*>(target);
-                    value = (ElfW(Addr))sym_addr + addend_rel;
-                } else value = (ElfW(Addr))sym_addr;
-            } else if (current_type == R_ARM_TLS_DTPMOD32) {
-                value = info->tls_mod_id;
-            } else if (current_type == R_ARM_TLS_DTPOFF32) {
-                const ElfW(Sym)& sym = info->symtab[current_sym_idx];
-                value = (ElfW(Addr))sym.st_value + current_addend;
-            } else if (current_type == R_ARM_TLS_TPOFF32) {
-                uintptr_t sym_addr = 0;
-                if (current_sym_idx == 0) {
-                    value = info->tls_segment_vaddr + current_addend;
-                } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-                    value = sym_addr - load_bias + info->tls_segment_vaddr;
-                }
-            } else return false;
-#elif defined(__i386__)
-            if (current_type == R_386_RELATIVE) {
-                ElfW(Addr) addend_rel = *reinterpret_cast<ElfW(Addr)*>(target);
-                value = (ElfW(Addr))load_bias + addend_rel;
-            } else if (current_type == R_386_IRELATIVE) {
-                ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)current_addend});
-                continue;
-            } else if (current_type == R_386_GLOB_DAT || current_type == R_386_JMP_SLOT || current_type == R_386_32) {
-                uintptr_t sym_addr = 0;
-                if (!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-                    if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
-                        LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
-                        return false;
-                    }
-                    sym_addr = 0;
-                }
-                if (sym_addr == 0) value = 0;
-                else if (current_type == R_386_32) {
-                    ElfW(Addr) addend_rel = *reinterpret_cast<ElfW(Addr)*>(target);
-                    value = (ElfW(Addr))sym_addr + addend_rel;
-                } else value = (ElfW(Addr))sym_addr;
-            } else if (current_type == R_386_TLS_DTPMOD32) {
-                value = info->tls_mod_id;
-            } else if (current_type == R_386_TLS_DTPOFF32) {
-                const ElfW(Sym)& sym = info->symtab[current_sym_idx];
-                value = (ElfW(Addr))sym.st_value + current_addend;
-            } else if (current_type == R_386_TLS_TPOFF) {
-                uintptr_t sym_addr = 0;
-                if (current_sym_idx == 0) {
-                    value = info->tls_segment_vaddr + current_addend;
-                } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-                    value = sym_addr - load_bias + info->tls_segment_vaddr;
-                }
-            } else return false;
-#else
-            return false;
-#endif
-            *reinterpret_cast<ElfW(Addr)*>(target) = value;
+            if (!process_relocation(mod, loaded_modules, load_bias, info, target, current_type, current_sym_idx, current_addend, is_rela, ifuncs)) {
+                return false;
+            }
         }
 
         i += group_size;
