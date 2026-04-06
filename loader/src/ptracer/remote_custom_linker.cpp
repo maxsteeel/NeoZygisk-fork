@@ -32,23 +32,6 @@
 #include "utils.hpp"
 #include "elf_utils.hpp"
 
-static bool find_remote_module_path(int remote_pid, const char *soname, char* out_path, size_t out_size) {
-    bool found = false;
-    MapInfo::Scan(remote_pid, [&](const MapInfo& m) {
-        if (m.offset != 0) return false;
-        const char *filename = strrchr(m.path, '/');
-        filename = filename ? filename + 1 : m.path;
-        if (strcmp(filename, soname) == 0) {
-            strlcpy(out_path, m.path, out_size);
-            found = true;
-            return true; // Found, stop scanning
-        }
-        return false;
-    });
-    return found;
-}
-
-
 #ifdef __LP64__
 #define ELF_R_TYPE ELF64_R_TYPE
 #define ELF_R_SYM ELF64_R_SYM
@@ -177,98 +160,107 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
 static bool write_remote_addr(int pid, uintptr_t addr, ElfW(Addr) value) { return write_proc(pid, addr, &value, sizeof(value)); }
 [[maybe_unused]] static bool read_remote_addr(int pid, uintptr_t addr, ElfW(Addr) *out) { return read_proc(pid, addr, out, sizeof(*out)); }
 
+static inline bool process_remote_relocation(
+    int pid, uintptr_t load_bias, const elf_dyn_info* info, int local_pid, int remote_pid,
+    const char** needed_paths, size_t needed_count,
+    uintptr_t target, unsigned current_type, unsigned current_sym_idx,
+    ElfW(Addr) current_addend, bool is_rela
+) {
+    ElfW(Addr) value = 0;
+
+#if defined(__aarch64__)
+    if (current_type == R_AARCH64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
+    else if (current_type == R_AARCH64_GLOB_DAT || current_type == R_AARCH64_JUMP_SLOT || current_type == R_AARCH64_ABS64) {
+        uintptr_t sym_addr = 0;
+        if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, current_sym_idx, &sym_addr)) return false;
+        value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
+    } else return false;
+#elif defined(__x86_64__)
+    if (current_type == R_X86_64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
+    else if (current_type == R_X86_64_GLOB_DAT || current_type == R_X86_64_JUMP_SLOT || current_type == R_X86_64_64) {
+        uintptr_t sym_addr = 0;
+        if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, current_sym_idx, &sym_addr)) return false;
+        value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
+    } else return false;
+#elif defined(__arm__)
+    if (current_type == R_ARM_RELATIVE) {
+        ElfW(Addr) addend_rel = 0;
+        if (is_rela) addend_rel = current_addend;
+        else if (!read_remote_addr(pid, target, &addend_rel)) return false;
+        value = (ElfW(Addr))load_bias + addend_rel;
+    } else if (current_type == R_ARM_GLOB_DAT || current_type == R_ARM_JUMP_SLOT || current_type == R_ARM_ABS32) {
+        uintptr_t sym_addr = 0;
+        if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, current_sym_idx, &sym_addr)) return false;
+        if (sym_addr == 0) value = 0;
+        else if (current_type == R_ARM_ABS32) {
+            ElfW(Addr) addend_rel = 0;
+            if (is_rela) addend_rel = current_addend;
+            else if (!read_remote_addr(pid, target, &addend_rel)) return false;
+            value = (ElfW(Addr))sym_addr + addend_rel;
+        } else value = (ElfW(Addr))sym_addr;
+    } else return false;
+#elif defined(__i386__)
+    if (current_type == R_386_RELATIVE) {
+        ElfW(Addr) addend_rel = 0;
+        if (is_rela) addend_rel = current_addend;
+        else if (!read_remote_addr(pid, target, &addend_rel)) return false;
+        value = (ElfW(Addr))load_bias + addend_rel;
+    } else if (current_type == R_386_GLOB_DAT || current_type == R_386_JMP_SLOT || current_type == R_386_32) {
+        uintptr_t sym_addr = 0;
+        if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, current_sym_idx, &sym_addr)) return false;
+        if (sym_addr == 0) value = 0;
+        else if (current_type == R_386_32) {
+            ElfW(Addr) addend_rel = 0;
+            if (is_rela) addend_rel = current_addend;
+            else if (!read_remote_addr(pid, target, &addend_rel)) return false;
+            value = (ElfW(Addr))sym_addr + addend_rel;
+        } else value = (ElfW(Addr))sym_addr;
+    } else return false;
+#else
+    if (current_type == 0) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
+    else return false;
+#endif
+
+    return write_remote_addr(pid, target, value);
+}
+
+
 static bool apply_rela_section(int pid, void* file_map, [[maybe_unused]] const std::unique_ptr<ElfW(Phdr)[]>& phdr, size_t phnum,
-                               [[maybe_unused]] const elf_dyn_info *info, [[maybe_unused]] int local_pid, 
-                               [[maybe_unused]] int remote_pid, [[maybe_unused]] const char** needed_paths, 
-                               [[maybe_unused]] size_t needed_count, uintptr_t load_bias, ElfW(Addr) rela_vaddr, size_t rela_sz) {
+                               const elf_dyn_info *info, int local_pid, 
+                               int remote_pid, const char** needed_paths, 
+                               size_t needed_count, uintptr_t load_bias, ElfW(Addr) rela_vaddr, size_t rela_sz) {
     off_t rela_off = 0;
     if (!vaddr_to_offset(phdr, phnum, rela_vaddr, &rela_off)) return false;
 
     size_t count = rela_sz / sizeof(ElfW(Rela));
-    // Pointer math directly to mapped file.
     ElfW(Rela)* rels = reinterpret_cast<ElfW(Rela)*>(reinterpret_cast<uint8_t*>(file_map) + rela_off);
 
     for (size_t i = 0; i < count; i++) {
         const ElfW(Rela)& r = rels[i];
-
-        [[maybe_unused]] unsigned type = (unsigned)ELF_R_TYPE(r.r_info);
-        [[maybe_unused]] unsigned sym = (unsigned)ELF_R_SYM(r.r_info);
-        uintptr_t target = (uintptr_t)load_bias + (uintptr_t)r.r_offset;
-        ElfW(Addr) value = 0;
-
-#if defined(__aarch64__)
-        if (type == R_AARCH64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))r.r_addend;
-        else if (type == R_AARCH64_GLOB_DAT || type == R_AARCH64_JUMP_SLOT || type == R_AARCH64_ABS64) {
-            uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, sym, &sym_addr)) return false;
-            value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))r.r_addend : 0;
-        } else return false;
-#elif defined(__x86_64__)
-        if (type == R_X86_64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))r.r_addend;
-        else if (type == R_X86_64_GLOB_DAT || type == R_X86_64_JUMP_SLOT || type == R_X86_64_64) {
-            uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, sym, &sym_addr)) return false;
-            value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))r.r_addend : 0;
-        } else return false;
-#else
-        if (type == 0) value = (ElfW(Addr))load_bias + (ElfW(Addr))r.r_addend;
-        else return false;
-#endif
-        if (!write_remote_addr(pid, target, value)) return false;
+        if (!process_remote_relocation(pid, load_bias, info, local_pid, remote_pid, needed_paths, needed_count,
+            (uintptr_t)load_bias + (uintptr_t)r.r_offset, ELF_R_TYPE(r.r_info), ELF_R_SYM(r.r_info), r.r_addend, true)) {
+            return false;
+        }
     }
     return true;
 }
 
 static bool apply_rel_section(int pid, void* file_map, [[maybe_unused]] const std::unique_ptr<ElfW(Phdr)[]>& phdr, size_t phnum,
-                              [[maybe_unused]] const elf_dyn_info *info, [[maybe_unused]] int local_pid, 
-                              [[maybe_unused]] int remote_pid, [[maybe_unused]] const char** needed_paths,
-                              [[maybe_unused]] size_t needed_count, uintptr_t load_bias, ElfW(Addr) rel_vaddr, size_t rel_sz) {
+                              const elf_dyn_info *info, int local_pid, 
+                              int remote_pid, const char** needed_paths,
+                              size_t needed_count, uintptr_t load_bias, ElfW(Addr) rel_vaddr, size_t rel_sz) {
     off_t rel_off = 0;
     if (!vaddr_to_offset(phdr, phnum, rel_vaddr, &rel_off)) return false;
 
     size_t count = rel_sz / sizeof(ElfW(Rel));
-    // Pointer math directly to mapped file.
     ElfW(Rel)* rels = reinterpret_cast<ElfW(Rel)*>(reinterpret_cast<uint8_t*>(file_map) + rel_off);
 
     for (size_t i = 0; i < count; i++) {
         const ElfW(Rel)& r = rels[i];
-
-        [[maybe_unused]] unsigned type = (unsigned)ELF_R_TYPE(r.r_info);
-        [[maybe_unused]] unsigned sym = (unsigned)ELF_R_SYM(r.r_info);
-        uintptr_t target = (uintptr_t)load_bias + (uintptr_t)r.r_offset;
-        [[maybe_unused]] ElfW(Addr) addend = 0; 
-        ElfW(Addr) value = 0;
-
-#if defined(__arm__)
-        if (type == R_ARM_RELATIVE) {
-            if (!read_remote_addr(pid, target, &addend)) return false;
-            value = (ElfW(Addr))load_bias + addend;
-        } else if (type == R_ARM_GLOB_DAT || type == R_ARM_JUMP_SLOT || type == R_ARM_ABS32) {
-            uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, sym, &sym_addr)) return false;
-            if (sym_addr == 0) value = 0;
-            else if (type == R_ARM_ABS32) {
-                if (!read_remote_addr(pid, target, &addend)) return false;
-                value = (ElfW(Addr))sym_addr + addend;
-            } else value = (ElfW(Addr))sym_addr;
-        } else return false;
-#elif defined(__i386__)
-        if (type == R_386_RELATIVE) {
-            if (!read_remote_addr(pid, target, &addend)) return false;
-            value = (ElfW(Addr))load_bias + addend;
-        } else if (type == R_386_GLOB_DAT || type == R_386_JMP_SLOT || type == R_386_32) {
-            uintptr_t sym_addr = 0;
-            if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, sym, &sym_addr)) return false;
-            if (sym_addr == 0) value = 0;
-            else if (type == R_386_32) {
-                if (!read_remote_addr(pid, target, &addend)) return false;
-                value = (ElfW(Addr))sym_addr + addend;
-            } else value = (ElfW(Addr))sym_addr;
-        } else return false;
-#else
-        return false;
-#endif
-        if (!write_remote_addr(pid, target, value)) return false;
+        if (!process_remote_relocation(pid, load_bias, info, local_pid, remote_pid, needed_paths, needed_count,
+            (uintptr_t)load_bias + (uintptr_t)r.r_offset, ELF_R_TYPE(r.r_info), ELF_R_SYM(r.r_info), 0, false)) {
+            return false;
+        }
     }
     return true;
 }
@@ -467,19 +459,12 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
 
     size_t needed_count = dinfo.needed_count;
     const char** needed_paths = (const char**)alloca(needed_count * sizeof(const char*));
-    memset(needed_paths, 0, needed_count * sizeof(const char*));
 
+    // Only store the sonames directly from the string table.
+    // find_func_addr resolves sonames dynamically via MapInfo::Scan. No need for find_remote_module_path.
     for (size_t i = 0; i < needed_count; i++) {
         size_t off = dinfo.needed_str_offsets[i];
-        if (off < dinfo.strsz) {
-            const char *soname = &dinfo.strtab[off];
-            char remote_path[256]; 
-            if(find_remote_module_path(pid, soname, remote_path, sizeof(remote_path))) { 
-                needed_paths[i] = remote_path;
-            } else {
-                LOGW("Failed to find remote path for needed library: %s", soname);
-            }
-        }
+        needed_paths[i] = (off < dinfo.strsz) ? &dinfo.strtab[off] : "";
     }
 
     // Apply relocations passing the local file_map
