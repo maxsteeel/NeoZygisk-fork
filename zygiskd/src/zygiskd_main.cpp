@@ -22,6 +22,7 @@
 #include <linux/memfd.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/sendfile.h>
 
 #include "logging.hpp"
 #include "companion.hpp"
@@ -239,12 +240,21 @@ static int create_library_fd(int raw_file_fd) {
         return -1;
     }
 
-    char buf[4096];
-    ssize_t bytes_read;
-    while ((bytes_read = read(file_fd, buf, sizeof(buf))) > 0) {
-        if (socket_utils::xwrite(memfd, buf, bytes_read) != static_cast<size_t>(bytes_read)) {
-            PLOGE("write memfd");
+    struct stat st;
+    if (fstat(file_fd, &st) < 0) {
+        PLOGE("fstat file_fd");
+        return -1;
+    }
+
+    off_t offset = 0;
+    while (offset < st.st_size) {
+        ssize_t res = sendfile(memfd, file_fd, &offset, st.st_size - offset);
+        if (res < 0) {
+            PLOGE("sendfile memfd");
             return -1;
+        }
+        if (res == 0) {
+            break;
         }
     }
 
