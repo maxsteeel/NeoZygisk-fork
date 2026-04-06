@@ -281,13 +281,21 @@ static void load_modules(AppContext* context) {
 
     LOGD("Daemon architecture: %s", arch);
 
-    UniqueDir dir(opendir(constants::PATH_MODULES_DIR));
-    if (!dir) {
-        LOGW("Failed to read modules directory %s", constants::PATH_MODULES_DIR);
+    UniqueFd tmp_dir_fd(open(constants::PATH_MODULES_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (tmp_dir_fd < 0) {
+        LOGW("Failed to open modules directory %s", constants::PATH_MODULES_DIR);
         return;
     }
 
-    int dir_fd = dirfd(dir);
+    // Release ownership from UniqueFd to prevent double-close
+    int dir_fd = tmp_dir_fd.release();
+    UniqueDir dir(fdopendir(dir_fd));
+    if (!dir) {
+        close(dir_fd); // Manual close if fdopendir fails
+        LOGW("Failed to fdopendir modules directory");
+        return;
+    }
+
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
         if (entry->d_name[0] == '.') continue;
