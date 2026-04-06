@@ -764,6 +764,15 @@ void ZygiskContext::nativeForkAndSpecialize_pre() {
     fork_pre();
     if (is_child()) {
         app_specialize_pre();
+
+        if (flags & DO_REVERT_UNMOUNT) {
+            LOGI("Reverting mounts for denylisted app: %s", process);
+            auto traces = check_zygote_traces(info_flags);
+            for (const auto &trace : traces) {
+                LOGV("Child unmounting %s", trace.target);
+                umount2(trace.target, MNT_DETACH);
+            }
+        }
     }
 
     sanitize_fds();
