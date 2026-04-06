@@ -230,16 +230,12 @@ static const char* get_arch() {
     return "";
 }
 
-static int create_library_fd(const char* so_path) {
+static int create_library_fd(int raw_file_fd) {
+    UniqueFd file_fd(raw_file_fd);
+
     UniqueFd memfd(memfd_create("zygisk-module", MFD_ALLOW_SEALING | MFD_CLOEXEC));
     if (memfd < 0) {
         PLOGE("memfd_create");
-        return -1;
-    }
-
-    UniqueFd file_fd(open(so_path, O_RDONLY | O_CLOEXEC));
-    if (file_fd < 0) {
-        PLOGE("open %s", so_path);
         return -1;
     }
 
@@ -281,6 +277,7 @@ static void load_modules(AppContext* context) {
         return;
     }
 
+    int dir_fd = dirfd(dir);
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
         if (entry->d_name[0] == '.') continue;
@@ -291,17 +288,18 @@ static void load_modules(AppContext* context) {
         }
 
         char disable_path[256];
-        snprintf(disable_path, sizeof(disable_path), "%s/%s/disable", constants::PATH_MODULES_DIR, entry->d_name);
-        struct stat st;
-        if (stat(disable_path, &st) == 0) continue; // Disabled
+        snprintf(disable_path, sizeof(disable_path), "%s/disable", entry->d_name);
+        if (faccessat(dir_fd, disable_path, F_OK, 0) == 0) continue; // Disabled
 
         char so_path[256];
-        snprintf(so_path, sizeof(so_path), "%s/%s/zygisk/%s.so", constants::PATH_MODULES_DIR, entry->d_name, arch);
-        if (stat(so_path, &st) != 0) continue; // No so file
+        snprintf(so_path, sizeof(so_path), "%s/zygisk/%s.so", entry->d_name, arch);
 
-        LOGI("Loading module `%s`...", entry->d_name);
-        int lib_fd = create_library_fd(so_path);
+        int raw_file_fd = openat(dir_fd, so_path, O_RDONLY | O_CLOEXEC);
+        if (raw_file_fd < 0) continue; // No so file
+
+        int lib_fd = create_library_fd(raw_file_fd);
         if (lib_fd >= 0) {
+            LOGI("Loading module `%s`...", entry->d_name);
             Module* mod = new Module(); 
             strlcpy(mod->name, entry->d_name, sizeof(mod->name));
             mod->lib_fd = lib_fd;
