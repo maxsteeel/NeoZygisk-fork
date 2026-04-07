@@ -1,32 +1,43 @@
+#include <sys/sysmacros.h>  // For makedev
+#include <sys/types.h>
 #include <fcntl.h>
-#include <algorithm>
-#include <string_view>
+#include <unistd.h>
+#include <cstdlib>          // For qsort
 #include <cstring>
 #include <vector>
 
 #include "daemon.hpp"
 #include "logging.hpp"
 #include "module.hpp"
-
-// We need an extended struct to hold fs_opt during parsing
-struct parsed_mount {
-    mount_info info;
-    char fs_opt[1024];
-};
+#include "zygisk.hpp"
 
 std::vector<mount_info> check_zygote_traces(uint32_t info_flags) {
     std::vector<mount_info> traces;
 
-    if (!(info_flags & (PROCESS_ROOT_IS_APATCH | PROCESS_ROOT_IS_KSU | PROCESS_ROOT_IS_MAGISK))) {
-        LOGE("Could not determine root implementation, aborting unmount.");
+    const char* mount_source_name = nullptr;
+    bool is_kernelsu = false;
+
+    // Check flags early to avoid reading the file if we don't need to
+    if (info_flags & PROCESS_ROOT_IS_APATCH) {
+        mount_source_name = "APatch";
+    } else if (info_flags & PROCESS_ROOT_IS_KSU) {
+        mount_source_name = "KSU";
+        is_kernelsu = true;
+    } else if (info_flags & PROCESS_ROOT_IS_MAGISK) {
+        mount_source_name = "magisk";
+    } else {
+        LOGE("could not determine root implementation, aborting unmount.");
         return traces;
     }
 
     UniqueFd fd(open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC));
-    if (fd < 0) return traces;
+    if (fd < 0) {
+        PLOGE("open /proc/self/mountinfo");
+        return traces;
+    }
 
     std::vector<char> buf;
-    buf.resize(1024 * 128);
+    buf.resize(1024 * 128); // 128KB is usually enough, avoids vector reallocations
     size_t total_read = 0;
 
     while (true) {
@@ -37,102 +48,74 @@ std::vector<mount_info> check_zygote_traces(uint32_t info_flags) {
     }
 
     if (total_read == 0) return traces;
-    buf[total_read] = '\0';
+    buf[total_read] = '\0'; // Null terminate
 
-    std::vector<parsed_mount> all_mounts;
-    char root_loop_device[256] = {0};
+    std::vector<mount_info> all_mounts;
+    char ksu_module_source[256] = {0};
 
-    // Parse all mounts
     char* p = buf.data();
     char* end = buf.data() + total_read;
 
     while (p < end) {
+        // Fast line splitting using memchr
         char* line_end = static_cast<char*>(memchr(p, '\n', end - p));
         if (!line_end) line_end = end;
-        *line_end = '\0';
+        *line_end = '\0'; // Null terminate
 
         char* separator = strstr(p, " - ");
         if (separator) {
-            parsed_mount pm = {};
-            if (sscanf(p, "%u %u %*s %127s %255s", &pm.info.id, &pm.info.parent, pm.info.root, pm.info.target) >= 4) {
-                if (sscanf(separator + 3, "%63s %255s %1023[^\n]", pm.info.type, pm.info.source, pm.fs_opt) >= 2) {
+            mount_info info = {};
+            unsigned int maj = 0, min = 0;
 
-                    // Track the exact loop device used by KSU/APatch for its modules
-                    if (strncmp(pm.info.source, "/dev/block/loop", 15) == 0 &&
-                        (strstr(pm.info.target, "/data/adb/") || strstr(pm.info.target, "/ksu/") || strstr(pm.info.target, "/apatch/"))) {
-                        strlcpy(root_loop_device, pm.info.source, sizeof(root_loop_device));
+            if (sscanf(p, "%u %u %u:%u %127s %255s", &info.id, &info.parent, &maj, &min, info.root, info.target) >= 6) {
+                info.device = makedev(maj, min);
+
+                if (sscanf(separator + 3, "%63s %255s", info.type, info.source) >= 2) {
+
+                    if (is_kernelsu && strcmp(info.target, "/data/adb/modules") == 0 &&
+                        strncmp(info.source, "/dev/block/loop", 15) == 0) {
+                        strlcpy(ksu_module_source, info.source, sizeof(ksu_module_source));
+                        LOGV("detected KernelSU loop device module source: %s", ksu_module_source);
                     }
 
-                    all_mounts.push_back(pm);
+                    all_mounts.push_back(info);
                 }
             }
         }
         p = line_end + 1;
     }
 
-    // Execute unmount rules
-    for (const auto& pm : all_mounts) {
+    for (const auto& info : all_mounts) {
         bool should_unmount = false;
 
-        // Catch Known Root Sources
-        if (strcmp(pm.info.source, "magisk") == 0   ||
-            strcmp(pm.info.source, "KSU") == 0      ||
-            strcmp(pm.info.source, "APatch") == 0   ||
-            strcmp(pm.info.source, "worker") == 0   ||
-            strncmp(pm.info.source, "ksu_", 4) == 0 ||
-            strcmp(pm.info.source, "none") == 0) {  // some mounts are hidden using mount source "none"
+        if (strncmp(info.root, "/adb/modules", 12) == 0) {
+            should_unmount = true;
+        } else if (strncmp(info.target, "/data/adb/modules", 17) == 0) {
+            should_unmount = true;
+        } else if (strcmp(info.source, mount_source_name) == 0) {
+            should_unmount = true;
+        } else if (ksu_module_source[0] != '\0' && strcmp(info.source, ksu_module_source) == 0) {
             should_unmount = true;
         }
 
-        // Catch Suspicious Paths
-        if (!should_unmount) {
-            if (strstr(pm.info.root, "/adb/") || strstr(pm.info.root, "/ksu/")        ||
-                strstr(pm.info.root, "/magisk/") || strstr(pm.info.root, "/apatch/")  ||
-                strstr(pm.info.target, "/data/adb/") || strstr(pm.info.target, "/ksu/")) {
-                should_unmount = true;
-            }
-        }
-
-        // Search module image bind-mounts
-        if (!should_unmount && root_loop_device[0] != '\0') {
-            if (strcmp(pm.info.source, root_loop_device) == 0) {
-                should_unmount = true;
-            }
-        }
-
-        if (!should_unmount) {
-            bool is_system_target = (strncmp(pm.info.target, "/system", 7) == 0      ||
-                                     strncmp(pm.info.target, "/system_ext", 11) == 0 ||
-                                     strncmp(pm.info.target, "/vendor", 7) == 0      ||
-                                     strncmp(pm.info.target, "/product", 8) == 0     ||
-                                     strncmp(pm.info.target, "/etc", 4) == 0         ||
-                                     strncmp(pm.info.target, "/odm", 4) == 0);
-
-            if (is_system_target) {
-                // If a module mounted an overlay or a tmpfs over a system file, nuke it.
-                if (strcmp(pm.info.type, "overlay") == 0 || strcmp(pm.info.type, "tmpfs") == 0) {
-                    should_unmount = true;
-                }
-            }
-        }
-
         if (should_unmount) {
-            traces.push_back(pm.info);
+            traces.push_back(info);
         }
     }
 
-    if (traces.empty()) return traces;
+    if (traces.empty()) {
+        LOGV("no relevant mount points found to unmount.");
+        return traces;
+    }
 
-    // Sort by ID descending to unmount children before parents
     qsort(traces.data(), traces.size(), sizeof(mount_info), +[](const void* a, const void* b) -> int {
         const auto* m1 = static_cast<const mount_info*>(a);
         const auto* m2 = static_cast<const mount_info*>(b);
-
         if (m1->id > m2->id) return -1;
         if (m1->id < m2->id) return 1;
         return 0;
     });
 
-    LOGV("found %zu mounting traces to revert.", traces.size());
+    LOGV("found %zu mounting traces in zygote.", traces.size());
     return traces;
 }
