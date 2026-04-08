@@ -30,6 +30,79 @@ static std::mutex writer_mutex;
 static std::atomic<const ConfigData*> config_cache_rcu{nullptr};
 static std::atomic<int64_t> last_stat_time_ms{0};
 
+static void parse_and_sort_config(int fd, size_t size, ConfigData* new_config) {
+    if (size == 0) return;
+
+    void* map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) return;
+
+    const char* start = static_cast<const char*>(map);
+    const char* end = start + size;
+
+    // Count newlines to preallocate vector and avoid reallocations
+    [[maybe_unused]] size_t lines = 0;
+    const char* p_count = start;
+    while ((p_count = static_cast<const char*>(memchr(p_count, '\n', end - p_count)))) {
+        lines++;
+        p_count++;
+    }
+
+    // Skip header: find first newline
+    const char* p = static_cast<const char*>(memchr(start, '\n', end - start));
+    if (p) {
+        p++; // move past header newline
+
+        // Parse backwards from each newline for zero-allocation performance
+        while (p < end) {
+            const char* line_end = static_cast<const char*>(memchr(p, '\n', end - p));
+            if (!line_end) line_end = end;
+
+            if (line_end > p) {
+                const char* cursor = line_end - 1;
+
+                // Extract uid (last component)
+                while (cursor >= p && *cursor != ',') cursor--;
+                if (cursor >= p) {
+                    int uid_val = fast_atoi(cursor + 1);
+
+                    // Extract allow
+                    cursor--;
+                    while (cursor >= p && *cursor != ',') cursor--;
+                    if (cursor >= p) {
+                        int allow_val = fast_atoi(cursor + 1);
+
+                        // Extract exclude
+                        cursor--;
+                        while (cursor >= p && *cursor != ',') cursor--;
+                        if (cursor >= p) {
+                            int exclude_val = fast_atoi(cursor + 1);
+
+                            uint32_t packed = (static_cast<uint32_t>(uid_val) & 0x3FFFFFFF);
+                            if (allow_val == 1) packed |= (1U << 30);
+                            if (exclude_val == 1) packed |= (1U << 31);
+                            new_config->packages.push_back(packed);
+                        }
+                    }
+                }
+            }
+            p = line_end + 1;
+        }
+    }
+    munmap(map, size);
+
+    auto cmp_apatch_pkg = [](const void* a, const void* b) -> int {
+        uint32_t v1 = *(static_cast<const uint32_t*>(a)) & 0x3FFFFFFF;
+        uint32_t v2 = *(static_cast<const uint32_t*>(b)) & 0x3FFFFFFF;
+        if (v1 < v2) return -1;
+        if (v1 > v2) return 1;
+        return 0;
+    };
+
+    if (new_config->packages.size > 0) {
+        qsort(new_config->packages.data, new_config->packages.size, sizeof(uint32_t), cmp_apatch_pkg);
+    }
+}
+
 std::optional<Version> detect_version() {
     static std::optional<Version> cached_version = std::nullopt;
     static std::once_flag flag;
@@ -87,76 +160,7 @@ void refresh_cache() {
     ConfigData* new_config = new ConfigData();
     new_config->mtim = st.st_mtim;
 
-    if (st.st_size > 0) {
-        void* map = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (map != MAP_FAILED) {
-            const char* start = static_cast<const char*>(map);
-            const char* end = start + st.st_size;
-
-            // Count newlines to preallocate vector and avoid reallocations
-            [[maybe_unused]] size_t lines = 0;
-            const char* p_count = start;
-            while ((p_count = static_cast<const char*>(memchr(p_count, '\n', end - p_count)))) {
-                lines++;
-                p_count++;
-            }
-
-            // Skip header: find first newline
-            const char* p = static_cast<const char*>(memchr(start, '\n', end - start));
-            if (p) {
-                p++; // move past header newline
-
-                // Parse backwards from each newline for zero-allocation performance
-                while (p < end) {
-                    const char* line_end = static_cast<const char*>(memchr(p, '\n', end - p));
-                    if (!line_end) line_end = end;
-
-                    if (line_end > p) {
-                        const char* cursor = line_end - 1;
-
-                        // Extract uid (last component)
-                        while (cursor >= p && *cursor != ',') cursor--;
-                        if (cursor >= p) {
-                            int uid_val = fast_atoi(cursor + 1);
-
-                            // Extract allow
-                            cursor--;
-                            while (cursor >= p && *cursor != ',') cursor--;
-                            if (cursor >= p) {
-                                int allow_val = fast_atoi(cursor + 1);
-
-                                // Extract exclude
-                                cursor--;
-                                while (cursor >= p && *cursor != ',') cursor--;
-                                if (cursor >= p) {
-                                    int exclude_val = fast_atoi(cursor + 1);
-
-                                    uint32_t packed = (static_cast<uint32_t>(uid_val) & 0x3FFFFFFF);
-                                    if (allow_val == 1) packed |= (1U << 30);
-                                    if (exclude_val == 1) packed |= (1U << 31);
-                                    new_config->packages.push_back(packed);
-                                }
-                            }
-                        }
-                    }
-                    p = line_end + 1;
-                }
-            }
-            munmap(map, st.st_size);
-        }
-    }
-
-    auto cmp_apatch_pkg = [](const void* a, const void* b) -> int {
-        uint32_t v1 = *(const uint32_t*)a & 0x3FFFFFFF;
-        uint32_t v2 = *(const uint32_t*)b & 0x3FFFFFFF;
-        if (v1 < v2) return -1;
-        if (v1 > v2) return 1;
-        return 0;
-    };
-
-    if (new_config->packages.size > 0) {
-        qsort(new_config->packages.data, new_config->packages.size, sizeof(uint32_t), cmp_apatch_pkg);
-    }
+    parse_and_sort_config(fd, st.st_size, new_config);
 
     // Store new configuration
     (void)config_cache_rcu.exchange(new_config, std::memory_order_release);
@@ -174,8 +178,8 @@ static uint32_t find_package(const ConfigData* config, int32_t uid) {
 
     uint32_t target = static_cast<uint32_t>(uid) & 0x3FFFFFFF;
     auto cmp_apatch_search = [](const void* key, const void* element) -> int {
-        uint32_t k = *(const uint32_t*)key;
-        uint32_t e = *(const uint32_t*)element & 0x3FFFFFFF;
+        uint32_t k = *(static_cast<const uint32_t*>(key));
+        uint32_t e = *(static_cast<const uint32_t*>(element)) & 0x3FFFFFFF;
         if (k < e) return -1;
         if (k > e) return 1;
         return 0;

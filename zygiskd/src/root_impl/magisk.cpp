@@ -338,6 +338,116 @@ static bool cache_update_required(struct stat* db_st, struct stat* pkg_st) {
            !g_cache.manager_resolved; // We will set this to true after attempting to resolve once
 }
 
+static void fetch_from_magisk_db(MagiskDB& db, StringList& denylist_pkgs) {
+    g_cache.granted_uids = db.get_int_list("SELECT uid FROM policies WHERE policy=2");
+    sort_uids(g_cache.granted_uids);
+
+    denylist_pkgs = db.get_string_list("SELECT package_name FROM denylist");
+
+    char val[128];
+    if (db.get_string("SELECT value FROM strings WHERE key='requester' LIMIT 1", val, sizeof(val))) {
+        char path[256];
+        snprintf(path, sizeof(path), "/data/user_de/0/%s", val);
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            g_cache.manager_uid = st.st_uid;
+        }
+    }
+}
+
+static void fetch_from_magisk_sqlite_fallback(StringList& denylist_pkgs) {
+    char buf[256];
+    if (utils::exec_command({"magisk", "--sqlite", "SELECT uid FROM policies WHERE policy=2"}, buf, sizeof(buf))) {
+        const char* out = buf;
+        while ((out = strstr(out, "uid=")) != nullptr) {
+            out += 4;
+            int32_t parsed_uid = fast_atoi(out);
+            if (parsed_uid > 0) g_cache.granted_uids.push_back(parsed_uid);
+            const char* next_line = strchr(out, '\n');
+            if (!next_line) break;
+            out = next_line + 1;
+        }
+        sort_uids(g_cache.granted_uids);
+    }
+
+    if (utils::exec_command({"magisk", "--sqlite", "SELECT package_name FROM denylist"}, buf, sizeof(buf))) {
+        char* line = buf;
+        while (line && *line) {
+            char* name_start = strstr(line, "package_name=");
+            if (name_start) {
+                name_start += 13;
+                char* name_end = strchr(name_start, '\n');
+                if (name_end) {
+                    *name_end = '\0';
+                    denylist_pkgs.push_back(name_start);
+                    line = name_end + 1;
+                } else {
+                    denylist_pkgs.push_back(name_start);
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    if (utils::exec_command({"magisk", "--sqlite", "SELECT value FROM strings WHERE key='requester' LIMIT 1"}, buf, sizeof(buf))) {
+        char* val_start = strstr(buf, "value=");
+        if (val_start) {
+            val_start += 6;
+            char* val_end = strchr(val_start, '\n');
+            if (val_end) {
+                *val_end = '\0';
+            }
+            if (*val_start != '\0') {
+                char path[256];
+                snprintf(path, sizeof(path), "/data/user_de/0/%s", val_start);
+                struct stat st;
+                if (stat(path, &st) == 0) {
+                    g_cache.manager_uid = st.st_uid;
+                }
+            }
+        }
+    }
+}
+
+static void resolve_manager_uid() {
+    if (g_cache.manager_uid == -1 && magisk_variant_pkg[0] != '\0') {
+        char path[256];
+        snprintf(path, sizeof(path), "/data/user_de/0/%s", magisk_variant_pkg);
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            g_cache.manager_uid = st.st_uid;
+        }
+    }
+}
+
+static void parse_packages_list() {
+    UniqueFile fp(fopen("/data/system/packages.list", "re"));
+    if (fp) {
+        char line[1024];
+        while (fgets(line, sizeof(line), fp)) {
+            char* space1 = strchr(line, ' ');
+            if (!space1) continue;
+
+            std::string_view pkg_name(line, space1 - line);
+
+            char* uid_str = space1 + 1;
+            char* space2 = strchr(uid_str, ' ');
+            if (space2) *space2 = '\0';
+
+            int32_t parsed_uid = fast_atoi(uid_str);
+            g_cache.all_known_uids.push_back(parsed_uid);
+
+            if (bsearch(&pkg_name, g_cache.denylist_pkgs.data, g_cache.denylist_pkgs.size, sizeof(char*), cmp_str) != nullptr) {
+                g_cache.denylist_uids.push_back(parsed_uid);
+            }
+        }
+        sort_uids(g_cache.all_known_uids); 
+        sort_uids(g_cache.denylist_uids);
+    }
+}
+
 void refresh_cache() {
     struct stat db_st, pkg_st;
     if (!cache_update_required(&db_st, &pkg_st)) {
@@ -365,85 +475,13 @@ void refresh_cache() {
     StringList denylist_pkgs;
 
     if (db.is_valid()) {
-        g_cache.granted_uids = db.get_int_list("SELECT uid FROM policies WHERE policy=2");
-        sort_uids(g_cache.granted_uids);
-
-        denylist_pkgs = db.get_string_list("SELECT package_name FROM denylist");
-
-        char val[128];
-        if (db.get_string("SELECT value FROM strings WHERE key='requester' LIMIT 1", val, sizeof(val))) {
-            char path[256];
-            snprintf(path, sizeof(path), "/data/user_de/0/%s", val);
-            struct stat st;
-            if (stat(path, &st) == 0) {
-                g_cache.manager_uid = st.st_uid;
-            }
-        }
+        fetch_from_magisk_db(db, denylist_pkgs);
     } else {
         // Fallback for libsqlite.so failure using magisk --sqlite
-        char buf[256];
-        if (utils::exec_command({"magisk", "--sqlite", "SELECT uid FROM policies WHERE policy=2"}, buf, sizeof(buf))) {
-            const char* out = buf;
-            while ((out = strstr(out, "uid=")) != nullptr) {
-                out += 4;
-                int32_t parsed_uid = fast_atoi(out);
-                if (parsed_uid > 0) g_cache.granted_uids.push_back(parsed_uid);
-                const char* next_line = strchr(out, '\n');
-                if (!next_line) break;
-                out = next_line + 1;
-            }
-            sort_uids(g_cache.granted_uids);
-        }
-
-        if (utils::exec_command({"magisk", "--sqlite", "SELECT package_name FROM denylist"}, buf, sizeof(buf))) {
-            char* line = buf;
-            while (line && *line) {
-                char* name_start = strstr(line, "package_name=");
-                if (name_start) {
-                    name_start += 13;
-                    char* name_end = strchr(name_start, '\n');
-                    if (name_end) {
-                        *name_end = '\0';
-                        denylist_pkgs.push_back(name_start);
-                        line = name_end + 1;
-                    } else {
-                        denylist_pkgs.push_back(name_start);
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-
-        if (utils::exec_command({"magisk", "--sqlite", "SELECT value FROM strings WHERE key='requester' LIMIT 1"}, buf, sizeof(buf))) {
-            char* val_start = strstr(buf, "value=");
-            if (val_start) {
-                val_start += 6;
-                char* val_end = strchr(val_start, '\n');
-                if (val_end) {
-                    *val_end = '\0';
-                }
-                if (*val_start != '\0') {
-                    char path[256];
-                    snprintf(path, sizeof(path), "/data/user_de/0/%s", val_start);
-                    struct stat st;
-                    if (stat(path, &st) == 0) {
-                        g_cache.manager_uid = st.st_uid;
-                    }
-                }
-            }
-        }
+        fetch_from_magisk_sqlite_fallback(denylist_pkgs);
     }
 
-    if (g_cache.manager_uid == -1 && magisk_variant_pkg[0] != '\0') {
-        char path[256];
-        snprintf(path, sizeof(path), "/data/user_de/0/%s", magisk_variant_pkg);
-        struct stat st;
-        if (stat(path, &st) == 0) {
-            g_cache.manager_uid = st.st_uid;
-        }
-    }
+    resolve_manager_uid();
 
     // Mark manager resolution as attempted to prevent infinite cache thrashing
     g_cache.manager_resolved = true;
@@ -453,29 +491,7 @@ void refresh_cache() {
     sort_pkgs(denylist_pkgs);
     g_cache.denylist_pkgs = std::move(denylist_pkgs);
 
-    UniqueFile fp(fopen("/data/system/packages.list", "re"));
-    if (fp) {
-        char line[1024];
-        while (fgets(line, sizeof(line), fp)) {
-            char* space1 = strchr(line, ' ');
-            if (!space1) continue;
-
-            std::string_view pkg_name(line, space1 - line);
-
-            char* uid_str = space1 + 1;
-            char* space2 = strchr(uid_str, ' ');
-            if (space2) *space2 = '\0';
-
-            int32_t parsed_uid = fast_atoi(uid_str);
-            g_cache.all_known_uids.push_back(parsed_uid);
-
-            if (bsearch(&pkg_name, g_cache.denylist_pkgs.data, g_cache.denylist_pkgs.size, sizeof(char*), cmp_str) != nullptr) {
-                g_cache.denylist_uids.push_back(parsed_uid);
-            }
-        }
-        sort_uids(g_cache.all_known_uids); 
-        sort_uids(g_cache.denylist_uids);
-    }
+    parse_packages_list();
 
     g_cache.db_mtime = db_st.st_mtim;
     g_cache.pkg_mtime = pkg_st.st_mtim;
