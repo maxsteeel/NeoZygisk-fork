@@ -1000,16 +1000,62 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
     g_currently_loading_modules = &loaded_modules;
 
     // Step 1: Hook TLS for all modules first
+    constexpr const char* target_tls = "__tls_get_addr";
+    constexpr uint32_t target_hash = calc_gnu_hash(target_tls);
+
     for (auto& mod : loaded_modules) {
-        if (mod.dinfo.nsyms == 0 || mod.dinfo.symtab == nullptr) continue;
-        for (size_t i = 0; i < mod.dinfo.nsyms; i++) {
-            ElfW(Sym)& sym = mod.dinfo.symtab[i];
-            if (sym.st_name != 0 && sym.st_name < mod.dinfo.strsz) {
-                const char *name = &mod.dinfo.strtab[sym.st_name];
-                if (strcmp(name, "__tls_get_addr") == 0) {
-                    // PAC Strip local function pointer before writing
+        const elf_dyn_info* info = &mod.dinfo;
+        if (info->nsyms == 0 || info->symtab == nullptr) continue;
+
+        bool found = false;
+
+        // imported (undefined) symbols reside in the unhashed portion of the GNU hash table
+        size_t limit = (info->gnu_buckets != nullptr) ? info->gnu_symndx : info->nsyms;
+        for (size_t i = 0; i < limit; i++) {
+            ElfW(Sym)& sym = info->symtab[i];
+            if (sym.st_name != 0 && sym.st_name < info->strsz) {
+                const char *name = &info->strtab[sym.st_name];
+                if (strcmp(name, target_tls) == 0) {
                     sym.st_value = PAC_STRIP(reinterpret_cast<uintptr_t>(&custom_tls_get_addr)) - mod.load_bias;
                     sym.st_shndx = 1;
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if (found) continue;
+
+        if (info->gnu_buckets != nullptr && info->gnu_bloom_filter != nullptr) {
+            uint32_t h2 = target_hash >> info->gnu_shift2;
+            uint32_t word_num = (target_hash / (sizeof(ElfW(Addr)) * 8)) & (info->gnu_bloom_filter_size - 1);
+
+            ElfW(Addr) mask = (((ElfW(Addr))1) << (target_hash % (sizeof(ElfW(Addr)) * 8))) |
+                              (((ElfW(Addr))1) << (h2 % (sizeof(ElfW(Addr)) * 8)));
+
+            if ((info->gnu_bloom_filter[word_num] & mask) == mask) {
+                uint32_t sym_idx = info->gnu_buckets[target_hash % info->gnu_buckets_size];
+                if (sym_idx >= info->gnu_symndx) {
+                    uint32_t chain_idx = sym_idx - info->gnu_symndx;
+
+                    while (sym_idx < info->nsyms) {
+                        uint32_t chain_val = info->gnu_chains[chain_idx];
+                        if ((chain_val | 1) == (target_hash | 1)) {
+                            ElfW(Sym)& sym = info->symtab[sym_idx];
+                            if (sym.st_name != 0 && sym.st_name < info->strsz) {
+                                const char *name = &info->strtab[sym.st_name];
+                                if (strcmp(name, target_tls) == 0) {
+                                    // PAC Strip local function pointer before writing
+                                    sym.st_value = PAC_STRIP(reinterpret_cast<uintptr_t>(&custom_tls_get_addr)) - mod.load_bias;
+                                    sym.st_shndx = 1;
+                                    break;
+                                }
+                            }
+                        }
+                        if (chain_val & 1) break;
+                        chain_idx++;
+                        sym_idx++;
+                    }
                 }
             }
         }

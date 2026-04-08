@@ -167,14 +167,6 @@ bool elf_load_dyn_info(void* memory_map, bool is_raw_file, const ElfW(Ehdr) *eh,
     return true;
 }
 
-static uint32_t calc_gnu_hash(const char *name) {
-    uint32_t h = 5381;
-    for (unsigned char c = *name; c != '\0'; c = *++name) {
-        h = (h << 5) + h + c;
-    }
-    return h;
-}
-
 bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr) *out_value, uint8_t *out_type) {
     if (info->gnu_buckets != nullptr && info->gnu_bloom_filter != nullptr) {
         uint32_t hash = calc_gnu_hash(sym_name);

@@ -24,6 +24,13 @@
 
 static inline uintptr_t page_start(uintptr_t addr, size_t page_size) { return ALIGN_DOWN(addr, page_size); }
 static inline uintptr_t page_end(uintptr_t addr, size_t page_size) { return ALIGN_DOWN(addr + page_size - 1, page_size); }
+static inline constexpr uint32_t calc_gnu_hash(const char* str) {
+    uint32_t h = 5381;
+    for (; *str != '\0'; ++str) {
+        h = (h << 5) + h + *str;
+    }
+    return h;
+}
 
 struct elf_dyn_info {
     ElfW(Addr) rel_vaddr = 0; size_t rel_sz = 0;
