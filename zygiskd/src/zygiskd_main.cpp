@@ -82,6 +82,16 @@ static UniqueFd g_shm_fd;
 static constants::ZygiskSharedData* g_shm_base = nullptr;
 static std::mutex g_shm_write_mutex;
 
+static std::mutex g_refresh_mutex;
+static std::condition_variable g_refresh_cv;
+static bool g_needs_refresh = false;
+
+static void trigger_shm_refresh() {
+    std::lock_guard<std::mutex> lock(g_refresh_mutex);
+    g_needs_refresh = true;
+    g_refresh_cv.notify_one();
+}
+
 static bool initialize_globals() {
     const char* env_tmp = getenv("TMP_PATH");
     if (!env_tmp) {
@@ -133,8 +143,15 @@ static bool initialize_globals() {
 
 static void shm_refresh_thread() {
     prctl(PR_SET_NAME, "zygiskd-refresh");
+    auto next_wake_time = std::chrono::steady_clock::now();
+
     while (true) {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
+        std::unique_lock<std::mutex> lock(g_refresh_mutex);
+
+        // Wait until next_wake_time or until explicitly triggered
+        g_refresh_cv.wait_for(lock, std::chrono::seconds(10), []{ return g_needs_refresh; });
+        g_needs_refresh = false;
+        lock.unlock();
 
         if (!g_shm_base) continue;
         
@@ -624,6 +641,7 @@ static void handle_connection(UniqueFd stream, AppContext* context) {
         }
         case DaemonSocketAction::GetSharedMemoryFd:
         case DaemonSocketAction::GetZygiskSharedData: {
+            trigger_shm_refresh();
             if (g_shm_fd >= 0) {
                 socket_utils::write_u8(stream, 1);
                 socket_utils::send_fd((int)stream, (int)g_shm_fd);
