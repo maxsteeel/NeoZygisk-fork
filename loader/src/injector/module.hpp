@@ -355,8 +355,12 @@ private:
 };
 
 inline const lsplt::MapInfo* find_in_cache(const std::vector<std::pair<std::string_view, const lsplt::MapInfo*>>& cache, std::string_view name) {
-    for (const auto& [key, value] : cache) {
-        if (key == name) return value;
+    auto it = std::lower_bound(cache.begin(), cache.end(), name,
+        [](const auto& pair, std::string_view n) {
+            return pair.first < n;
+        });
+    if (it != cache.end() && it->first == name) {
+        return it->second;
     }
     return nullptr;
 }

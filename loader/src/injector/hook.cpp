@@ -476,18 +476,32 @@ void HookContext::refresh_map_infos() {
             std::string_view filename = (last_slash != std::string_view::npos) 
                                         ? path.substr(last_slash + 1) 
                                         : path;
-            bool exists = false;
-            for (const auto& [name, _] : map_info_cache) {
-                if (name == filename) {
-                    exists = true;
-                    break;
-                }
-            }
-            if (!exists) {
-                map_info_cache.emplace_back(filename, &map);
-            }
+            map_info_cache.emplace_back(filename, &map);
         }
     }
+
+    if (map_info_cache.empty()) return;
+
+    using CacheEntry = std::pair<std::string_view, const lsplt::MapInfo*>;
+    qsort(map_info_cache.data(), map_info_cache.size(), sizeof(CacheEntry),
+        +[](const void* a, const void* b) -> int {
+            const auto* p1 = static_cast<const CacheEntry*>(a);
+            const auto* p2 = static_cast<const CacheEntry*>(b);
+            int name_cmp = p1->first.compare(p2->first);
+            if (name_cmp != 0) return name_cmp;
+            if (p1->second->start < p2->second->start) return -1;
+            if (p1->second->start > p2->second->start) return 1;
+            return 0;
+        });
+
+    size_t write_idx = 1;
+    for (size_t read_idx = 1; read_idx < map_info_cache.size(); ++read_idx) {
+        if (map_info_cache[read_idx].first != map_info_cache[write_idx - 1].first) {
+            map_info_cache[write_idx++] = map_info_cache[read_idx];
+        }
+    }
+
+    map_info_cache.resize(write_idx);
 }
 
 void HookContext::hook_plt() {
