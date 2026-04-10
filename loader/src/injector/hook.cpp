@@ -9,7 +9,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include <string_view>
 #include <algorithm>
 #include <unordered_map>
 #include <functional>
@@ -65,11 +64,11 @@ struct CustomCallbackCookie {
     void* original_cookie;
 };
 
-static string trim(const string& str) {
-    size_t first = str.find_first_not_of(" \t\r\n");
-    if (string::npos == first) return str;
-    size_t last = str.find_last_not_of(" \t\r\n");
-    return str.substr(first, (last - first + 1));
+static string_view trim(string_view sv) {
+    size_t first = sv.find_first_not_of(" \t\r\n");
+    if (string_view::npos == first) return "";
+    size_t last = sv.find_last_not_of(" \t\r\n");
+    return sv.substr(first, (last - first + 1));
 }
 
 static string generate_random_hex(int len) {
@@ -108,13 +107,13 @@ void LoadPropConfig() {
             char* saveptr;
             char* line = strtok_r(buffer.data(), "\n", &saveptr);
             while (line != nullptr) {
-                string sLine = trim(line);
+                string_view sLine = trim(line);
                 if (!sLine.empty() && sLine[0] != '#') {
                     size_t eq_pos = sLine.find('=');
-                    if (eq_pos != string::npos) {
-                        string key = trim(sLine.substr(0, eq_pos));
-                        string value = trim(sLine.substr(eq_pos + 1));
-                        g_spoof_props.push_back({key, value});
+                    if (eq_pos != string_view::npos) {
+                        string_view key = trim(sLine.substr(0, eq_pos));
+                        string_view value = trim(sLine.substr(eq_pos + 1));
+                        g_spoof_props.push_back({string(key), string(value)});
                     }
                 }
                 line = strtok_r(nullptr, "\n", &saveptr);
