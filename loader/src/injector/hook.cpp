@@ -72,20 +72,26 @@ static string_view trim(string_view sv) {
 }
 
 static string generate_random_hex(int len) {
-    string str(len, 0);
     UniqueFd fd(open("/dev/urandom", O_RDONLY));
     if (fd >= 0) {
         int read_len = len / 2;
-        vector<unsigned char> buffer(read_len);
-        if (read(fd, buffer.data(), read_len) == read_len) {
+        // len is hardcoded to 64 in InitRandomVbmeta, so alloca is safe
+        unsigned char* buffer = static_cast<unsigned char*>(alloca(read_len));
+        if (read(fd, buffer, read_len) == read_len) {
             const char* digits = "0123456789abcdef";
+            char* buf = static_cast<char*>(alloca(len));
             for (int i = 0; i < read_len; ++i) {
-                str[i * 2]     = digits[buffer[i] >> 4];
-                str[i * 2 + 1] = digits[buffer[i] & 0x0F];
+                buf[i * 2]     = digits[buffer[i] >> 4];
+                buf[i * 2 + 1] = digits[buffer[i] & 0x0F];
             }
+            // If len is odd, pad the last character with '0'
+            if (len % 2 != 0) {
+                buf[len - 1] = '0';
+            }
+            return string(buf, len);
         }
     }
-    return str;
+    return string(len, 0);
 }
 
 void InitRandomVbmeta() {
