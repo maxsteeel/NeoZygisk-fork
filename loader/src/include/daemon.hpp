@@ -1,6 +1,7 @@
 #pragma once
 
 #include <unistd.h>
+#include <cstdint>
 
 #include <string>
 #include <string_view>

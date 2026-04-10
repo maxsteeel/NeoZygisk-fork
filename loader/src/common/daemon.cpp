@@ -43,12 +43,18 @@ int Connect(uint8_t retry) {
     memcpy(addr.sun_path + 1, kCPSocketName, strlen(kCPSocketName));
     socklen_t socklen = sizeof(addr.sun_family) + strlen(kCPSocketName) + 1;
 
+    unsigned int delay_ms = 10;
     while (retry--) {
         int r = connect(fd, reinterpret_cast<struct sockaddr *>(&addr), socklen);
         if (r == 0) return fd.release();
         if (retry) {
-            LOGW("retrying to connect to zygiskd, sleep 1s");
-            sleep(1);
+            LOGW("retrying to connect to zygiskd, sleep %u ms", delay_ms);
+            struct timespec ts;
+            ts.tv_sec = delay_ms / 1000;
+            ts.tv_nsec = (delay_ms % 1000) * 1000000L;
+            nanosleep(&ts, nullptr);
+            delay_ms *= 2;
+            if (delay_ms > 1000) delay_ms = 1000;
         }
     }
 
