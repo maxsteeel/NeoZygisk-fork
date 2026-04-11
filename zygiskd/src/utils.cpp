@@ -1,23 +1,24 @@
 #include "utils.hpp"
 
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
-#include <poll.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/system_properties.h>
+#include <sys/un.h>
 #include <sys/wait.h>
-#include <cstring>
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstdlib>
-#include <vector>
+#include <cstring>
 #include <optional>
+#include <vector>
 
 #include "daemon.hpp"
 #include "logging.hpp"
-#include "socket_utils.hpp"
 #include "misc.hpp"
-#include <sys/syscall.h>
+#include "socket_utils.hpp"
 
 #ifndef __NR_close_range
 #define __NR_close_range 436
@@ -42,7 +43,8 @@ bool set_socket_create_context(const char* context) {
     if (fd < 0) {
         // Fallback for older kernels.
         char fallback_path[64];
-        snprintf(fallback_path, sizeof(fallback_path), "/proc/self/task/%d/attr/sockcreate", gettid());
+        snprintf(fallback_path, sizeof(fallback_path), "/proc/self/task/%d/attr/sockcreate",
+                 gettid());
         fd = UniqueFd(open(fallback_path, O_WRONLY | O_CLOEXEC));
     }
 
@@ -55,16 +57,16 @@ bool set_socket_create_context(const char* context) {
 }
 
 const char* get_current_attr() {
-    static char buf[256] = {0};
+    thread_local char buf[256] = {0};
     memset(buf, 0, sizeof(buf));
     UniqueFd fd(open("/proc/self/attr/current", O_RDONLY | O_CLOEXEC));
     if (fd >= 0) {
         // Use normal 'read', since the file has variable size
-        ssize_t r = read(fd, buf, sizeof(buf) - 1); 
+        ssize_t r = read(fd, buf, sizeof(buf) - 1);
         if (r > 0) {
             // Trim trailing newline if any
-            while (r > 0 && (buf[r-1] == '\n' || buf[r-1] == '\r')) {
-                buf[r-1] = '\0';
+            while (r > 0 && (buf[r - 1] == '\n' || buf[r - 1] == '\r')) {
+                buf[r - 1] = '\0';
                 r--;
             }
             return buf;
@@ -97,16 +99,17 @@ bool unix_datagram_sendto(const char* path, const void* buf, size_t len) {
         return false;
     }
 
-    struct sockaddr_un addr{};
+    struct sockaddr_un addr {};
     addr.sun_family = AF_UNIX;
     size_t path_len = strlen(path);
     if (path_len >= sizeof(addr.sun_path)) {
         LOGE("unix_datagram_sendto: path too long");
         return false;
     }
-    // Abstract socket name (first byte is 0) or regular? The Rust code used SocketAddrUnix::new(path.as_bytes())
-    // which binds an abstract socket if path doesn't contain null bytes but standard path strings. Wait, Rust new()
-    // uses standard path unless from_abstract_name is used. We use standard paths for datagram sendto.
+    // Abstract socket name (first byte is 0) or regular? The Rust code used
+    // SocketAddrUnix::new(path.as_bytes()) which binds an abstract socket if path doesn't contain
+    // null bytes but standard path strings. Wait, Rust new() uses standard path unless
+    // from_abstract_name is used. We use standard paths for datagram sendto.
     strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
 
     socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + path_len + 1;
@@ -132,7 +135,7 @@ bool unix_datagram_sendto(const char* path, const void* buf, size_t len) {
 }
 
 bool is_socket_alive(int fd) {
-    struct pollfd pfd{};
+    struct pollfd pfd {};
     pfd.fd = fd;
     pfd.events = POLLIN;
     pfd.revents = 0;
@@ -163,23 +166,27 @@ bool exec_command(std::initializer_list<const char*> args, char* out_buf, size_t
     if (pid == 0) {
         read_pipe = UniqueFd();
 
+        // Redirect write_pipe to STDOUT
         if (write_pipe != STDOUT_FILENO) {
             dup2(write_pipe, STDOUT_FILENO);
-            write_pipe = UniqueFd();
+        } else {
+            write_pipe.release(); // Prevents destructor from closing FD 1
         }
 
+        // Redirect /dev/null to STDERR
         UniqueFd null_fd(open("/dev/null", O_WRONLY | O_CLOEXEC));
         if (null_fd >= 0) {
             if (null_fd != STDERR_FILENO) {
                 dup2(null_fd, STDERR_FILENO);
-                null_fd = UniqueFd();
+            } else {
+                null_fd.release(); // Prevents destructor from closing FD 2
             }
         }
 
         char** c_args = (char**) alloca((args.size() + 1) * sizeof(char*));
         size_t i = 0;
         for (const auto& arg : args) {
-            c_args[i] = const_cast<char*>(arg); 
+            c_args[i] = const_cast<char*>(arg);
             i++;
         }
         c_args[i] = nullptr;
@@ -187,18 +194,22 @@ bool exec_command(std::initializer_list<const char*> args, char* out_buf, size_t
         if (syscall(__NR_close_range, 3, ~0U, 0) != 0) {
             UniqueFd fd_dir(open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
             if (fd_dir >= 0) {
-                char buf[1024];
+                alignas(struct linux_dirent64) char buf[1024];
                 int nread;
-                int fds_to_close[256]; 
+                int fds_to_close[256]{};
                 int fd_count = 0;
-                while ((nread = syscall(__NR_getdents64, (int)fd_dir, buf, sizeof(buf))) > 0) {
+                while ((nread = syscall(__NR_getdents64, (int) fd_dir, buf, sizeof(buf))) > 0) {
                     for (int bpos = 0; bpos < nread;) {
-                        auto d = reinterpret_cast<struct linux_dirent64 *>(buf + bpos);
+                        auto d = reinterpret_cast<struct linux_dirent64*>(buf + bpos);
                         if (d->d_name[0] >= '0' && d->d_name[0] <= '9') {
                             int fd = fast_atoi(d->d_name);
-                            if (fd > 2 && fd != (int)fd_dir) {
-                                if (fd_count < 256) {
-                                    fds_to_close[fd_count++] = fd;
+                            if (fd > 2 && fd != (int) fd_dir) {
+                                fds_to_close[fd_count++] = fd;
+                                if (fd_count == 256) {
+                                    for (int i = 0; i < 256; i++) {
+                                        close(fds_to_close[i]);
+                                    }
+                                    fd_count = 0;
                                 }
                             }
                         }
@@ -218,18 +229,19 @@ bool exec_command(std::initializer_list<const char*> args, char* out_buf, size_t
     write_pipe = UniqueFd();
     size_t total_read = 0;
     ssize_t n;
-    
+
     // Trim trailing whitespace and newlines
-    while (total_read < out_size - 1 && (n = read(read_pipe, out_buf + total_read, out_size - 1 - total_read)) > 0) {
+    while (total_read < out_size - 1 &&
+           (n = read(read_pipe, out_buf + total_read, out_size - 1 - total_read)) > 0) {
         total_read += n;
     }
-    out_buf[total_read] = '\0'; // null terminator
-    
+    out_buf[total_read] = '\0';  // null terminator
+
     // Wait for the child process to avoid leaving zombies
     int status;
     waitpid(pid, &status, 0);
-    
+
     return total_read > 0;
 }
 
-} // namespace utils
+}  // namespace utils
