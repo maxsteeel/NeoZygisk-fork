@@ -51,6 +51,7 @@ std::vector<mount_info> check_zygote_traces(uint32_t info_flags) {
     buf[total_read] = '\0'; // Null terminate
 
     std::vector<mount_info> all_mounts;
+    all_mounts.reserve(256); // Pre-allocate to avoid reallocations
     char ksu_module_source[256] = {0};
 
     char* p = buf.data();
@@ -84,6 +85,8 @@ std::vector<mount_info> check_zygote_traces(uint32_t info_flags) {
         }
         p = line_end + 1;
     }
+
+    traces.reserve(all_mounts.size());
 
     for (const auto& info : all_mounts) {
         bool should_unmount = false;

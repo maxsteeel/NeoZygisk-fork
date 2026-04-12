@@ -60,6 +60,39 @@ static void module_segv_handler(int sig, siginfo_t *info, void *context) {
     }
 }
 
+// RAII wrapper for modules protection
+class ModuleSecurityGuard {
+    void* altstack_mem;
+    struct sigaction old_segv, old_bus;
+    stack_t old_ss;
+
+public:
+    ModuleSecurityGuard() {
+        altstack_mem = malloc(SIGSTKSZ);
+        stack_t ss = {}; 
+        ss.ss_sp = altstack_mem;
+        ss.ss_flags = 0;
+        ss.ss_size = SIGSTKSZ;
+        sigaltstack(&ss, &old_ss);
+        struct sigaction sa = {};
+        sa.sa_sigaction = module_segv_handler;
+        sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, &old_segv);
+        sigaction(SIGBUS, &sa, &old_bus);
+    }
+
+    ~ModuleSecurityGuard() {
+        sigaction(SIGSEGV, &old_segv, nullptr);
+        sigaction(SIGBUS, &old_bus, nullptr);
+
+        stack_t disable_ss = {};
+        disable_ss.ss_flags = SS_DISABLE;
+        sigaltstack(&disable_ss, nullptr);
+        free(altstack_mem);
+    }
+};
+
 using namespace std;
 
 ZygiskModule::ZygiskModule(int id, void *handle, void *entry)
@@ -220,12 +253,12 @@ void ZygiskContext::plt_hook_exclude(const char *regex, const char *symbol) {
 
 void ZygiskContext::plt_hook_process_regex() {
     if (register_info.empty()) return;
+    const size_t ignore_count = ignore_info.size();
+    std::vector<uint8_t> ign_matches(ignore_count);
     for (auto &map : g_hook->cached_map_infos) {
         if (map.offset != 0 || !map.is_private || !(map.perms & PROT_READ)) continue;
 
-        // Pre-evaluate ignore rules that only depend on map.path
-        std::vector<uint8_t> ign_matches(ignore_info.size());
-        for (size_t i = 0; i < ignore_info.size(); ++i) {
+        for (size_t i = 0; i < ignore_count; ++i) {
             auto &ign = ignore_info[i];
             if (!ign.is_regex) {
                 ign_matches[i] = (strstr(map.path, ign.literal) != nullptr);
@@ -242,7 +275,7 @@ void ZygiskContext::plt_hook_process_regex() {
                 if (regexec(&reg.regex, map.path, 0, nullptr, 0) != 0) continue;
             }
             bool ignored = false;
-            for (size_t i = 0; i < ignore_info.size(); ++i) {
+            for (size_t i = 0; i < ignore_count; ++i) {
                 auto &ign = ignore_info[i];
                 if (ign.symbol[0] != '\0' && strcmp(ign.symbol, reg.symbol) != 0) continue;
                 if (ign_matches[i]) {
@@ -441,24 +474,10 @@ void ZygiskContext::run_modules_pre() {
     // Allocate raw array on the stack
     constexpr size_t MAX_MODULES = 256;
     zygiskd::Module ms[MAX_MODULES];
+    ModuleSecurityGuard guard;
 
     // Pass the array to be filled and get the total count
     size_t size = zygiskd::ReadModules(ms, MAX_MODULES);
-
-    void* altstack_mem = malloc(SIGSTKSZ);
-    stack_t ss = {};
-    ss.ss_sp = altstack_mem;
-    ss.ss_size = SIGSTKSZ;
-    ss.ss_flags = 0;
-    sigaltstack(&ss, nullptr);
-
-    struct sigaction sa = {};
-    sa.sa_sigaction = module_segv_handler;
-    sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
-
-    sigaction(SIGSEGV, &sa, &old_segv);
-    sigaction(SIGBUS, &sa, &old_bus);
 
     for (size_t i = 0; i < size; i++) {
         auto &m = ms[i];
@@ -534,13 +553,6 @@ void ZygiskContext::run_modules_pre() {
             ++it;
         }
     }
-
-    sigaction(SIGSEGV, &old_segv, nullptr);
-    sigaction(SIGBUS, &old_bus, nullptr);
-
-    ss.ss_flags = SS_DISABLE;
-    sigaltstack(&ss, nullptr);
-    free(altstack_mem);
 
     for (size_t i = 0; i < size; i++) {
         memzero(ms[i].name, sizeof(ms[i].name));
