@@ -91,6 +91,8 @@ void Init(const char *path, const char *mod_dir);
 const char* GetTmpPath();
 const char* GetModDir();
 
+int Connect(uint8_t retry);
+
 bool PingHeartbeat();
 
 size_t ReadModules(Module* out_modules, size_t max_modules);

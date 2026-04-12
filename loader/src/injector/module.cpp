@@ -567,10 +567,9 @@ void ZygiskContext::run_modules_post() {
 
 void ZygiskContext::app_specialize_pre() {
     uid_t uid = args.app->uid;
-    uid_t app_id = uid % 100000;  // Support for Work Profiles / Multi-User
 
-    // Total range: Standard Isolated Services (99000-99999) and AppZygote (90000-98999)
-    if (app_id >= 90000 && app_id <= 99999) {
+    bool is_isolated_aid = uid >= AID_ISOLATED_START && uid <= AID_ISOLATED_END;
+    if (is_isolated_aid && args.app->app_data_dir) {
         bool found_parent = false;
 
         // 1. Try to get the parent's UID using app_data_dir (If Android sends it)
@@ -618,7 +617,8 @@ void ZygiskContext::app_specialize_pre() {
         }
     }
 
-    if (info_flags == 0) info_flags = zygiskd::GetProcessFlags(uid);
+    bool skip_zygiskd = is_isolated_aid && zygiskd::Connect(1) == -1;
+    if (!skip_zygiskd && info_flags == 0) info_flags = zygiskd::GetProcessFlags(uid);
 
     if ((info_flags & UNMOUNT_MASK) == UNMOUNT_MASK) {
         LOGI("[%s] is on the denylist", process);
@@ -626,7 +626,7 @@ void ZygiskContext::app_specialize_pre() {
     }
 
     flags |= APP_SPECIALIZE;
-    run_modules_pre();
+    if (!skip_zygiskd) run_modules_pre();
 }
 
 void ZygiskContext::app_specialize_post() {
