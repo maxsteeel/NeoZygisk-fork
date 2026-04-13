@@ -11,4 +11,4 @@
 #endif
 #endif
 
-#include "../external/lsplt/lsplt/src/main/jni/logging.hpp"
+#include "../external/lsplt/src/logging.hpp"
