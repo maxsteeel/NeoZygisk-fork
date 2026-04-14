@@ -196,28 +196,17 @@ bool exec_command(std::initializer_list<const char*> args, char* out_buf, size_t
             if (fd_dir >= 0) {
                 alignas(struct linux_dirent64) char buf[1024];
                 int nread;
-                int fds_to_close[256]{};
-                int fd_count = 0;
                 while ((nread = syscall(__NR_getdents64, (int) fd_dir, buf, sizeof(buf))) > 0) {
                     for (int bpos = 0; bpos < nread;) {
                         auto d = reinterpret_cast<struct linux_dirent64*>(buf + bpos);
                         if (d->d_name[0] >= '0' && d->d_name[0] <= '9') {
                             int fd = fast_atoi(d->d_name);
                             if (fd > 2 && fd != (int) fd_dir) {
-                                fds_to_close[fd_count++] = fd;
-                                if (fd_count == 256) {
-                                    for (int i = 0; i < 256; i++) {
-                                        close(fds_to_close[i]);
-                                    }
-                                    fd_count = 0;
-                                }
+                                close(fd);
                             }
                         }
                         bpos += d->d_reclen;
                     }
-                }
-                for (int i = 0; i < fd_count; i++) {
-                    close(fds_to_close[i]);
                 }
             }
         }
