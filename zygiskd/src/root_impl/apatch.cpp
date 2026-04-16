@@ -90,16 +90,12 @@ static void parse_and_sort_config(int fd, size_t size, ConfigData* new_config) {
     }
     munmap(map, size);
 
-    auto cmp_apatch_pkg = [](const void* a, const void* b) -> int {
-        uint32_t v1 = *(static_cast<const uint32_t*>(a)) & 0x3FFFFFFF;
-        uint32_t v2 = *(static_cast<const uint32_t*>(b)) & 0x3FFFFFFF;
-        if (v1 < v2) return -1;
-        if (v1 > v2) return 1;
-        return 0;
-    };
-
     if (new_config->packages.size > 0) {
-        qsort(new_config->packages.data, new_config->packages.size, sizeof(uint32_t), cmp_apatch_pkg);
+        ::sort(new_config->packages.data, 
+             new_config->packages.data + new_config->packages.size, 
+             [](const auto& a, const auto& b) {
+                 return a < b;
+             });
     }
 }
 

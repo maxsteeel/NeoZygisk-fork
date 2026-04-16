@@ -5,9 +5,44 @@
 
 #include <string_view>
 #include <string>
+#include <utility>
 
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #define likely(x)   __builtin_expect(!!(x), 1)
+
+template<class It, class Compare>
+inline void sort(It first, It last, Compare comp) {
+    size_t n = last - first;
+    if (n <= 1) return;
+    
+    // Insertion sort is faster for very small arrays
+    if (n < 32) {
+        for (size_t i = 1; i < n; i += 1) {
+            auto temp = std::move(*(first + i));
+            size_t j;
+            for (j = i; j > 0 && comp(temp, *(first + (j - 1))); j -= 1) {
+                *(first + j) = std::move(*(first + (j - 1)));
+            }
+            *(first + j) = std::move(temp);
+        }
+        return;
+    }
+    
+    // Shell sort with dynamic gap sequence (Knuth's sequence: 1, 4, 13, 40...)
+    size_t gap = 1;
+    while (gap < n / 3) gap = 3 * gap + 1;
+    
+    for (; gap > 0; gap /= 3) {
+        for (size_t i = gap; i < n; i += 1) {
+            auto temp = std::move(*(first + i));
+            size_t j;
+            for (j = i; j >= gap && comp(temp, *(first + (j - gap))); j -= gap) {
+                *(first + j) = std::move(*(first + (j - gap)));
+            }
+            *(first + j) = std::move(temp);
+        }
+    }
+}
 
 // Force the compiler to execute the memory wiping code,
 // even if it thinks the memory is not used afterward.

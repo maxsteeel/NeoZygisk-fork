@@ -2,7 +2,6 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <cstdlib>          // For qsort
 #include <cstring>
 #include <vector>
 
@@ -111,12 +110,8 @@ std::vector<mount_info> check_zygote_traces(uint32_t info_flags) {
         return traces;
     }
 
-    qsort(traces.data(), traces.size(), sizeof(mount_info), +[](const void* a, const void* b) -> int {
-        const auto* m1 = static_cast<const mount_info*>(a);
-        const auto* m2 = static_cast<const mount_info*>(b);
-        if (m1->id > m2->id) return -1;
-        if (m1->id < m2->id) return 1;
-        return 0;
+    ::sort(traces.begin(), traces.end(), [](const auto& a, const auto& b) {
+        return a.id > b.id; 
     });
 
     LOGV("found %zu mounting traces in zygote.", traces.size());

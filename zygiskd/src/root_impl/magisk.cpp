@@ -248,7 +248,10 @@ static inline int cmp_str(const void* a, const void* b) {
 
 static void sort_pkgs(StringList& list) {
     if (list.size == 0) return;
-    qsort(list.data, list.size, sizeof(char*), cmp_str);
+
+    ::sort(list.data, list.data + list.size, [](const char* a, const char* b) {
+        return strcmp(a, b) < 0;
+    });
 
     size_t unique_count = 1;
     for (size_t i = 1; i < list.size; ++i) {
@@ -263,7 +266,10 @@ static void sort_pkgs(StringList& list) {
 
 static void sort_uids(IntList& list) {
     if (list.size == 0) return;
-    qsort(list.data, list.size, sizeof(int32_t), cmp_int);
+
+    ::sort(list.data, list.data + list.size, [](int32_t a, int32_t b) {
+        return a < b;
+    });
 
     size_t unique_count = 1;
     for (size_t i = 1; i < list.size; ++i) {

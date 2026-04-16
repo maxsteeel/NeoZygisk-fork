@@ -487,17 +487,9 @@ void HookContext::refresh_map_infos() {
 
     if (map_info_cache.empty()) return;
 
-    using CacheEntry = std::pair<std::string_view, const lsplt::MapInfo*>;
-    qsort(map_info_cache.data(), map_info_cache.size(), sizeof(CacheEntry),
-        +[](const void* a, const void* b) -> int {
-            const auto* p1 = static_cast<const CacheEntry*>(a);
-            const auto* p2 = static_cast<const CacheEntry*>(b);
-            int name_cmp = p1->first.compare(p2->first);
-            if (name_cmp != 0) return name_cmp;
-            if (p1->second->start < p2->second->start) return -1;
-            if (p1->second->start > p2->second->start) return 1;
-            return 0;
-        });
+    ::sort(map_info_cache.begin(), map_info_cache.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
 
     size_t write_idx = 1;
     for (size_t read_idx = 1; read_idx < map_info_cache.size(); ++read_idx) {
@@ -679,12 +671,8 @@ void hook_entry(void *start_addr, size_t block_size) {
     LoadPropConfig();
     InitRandomVbmeta();
 
-    qsort(g_spoof_props.data(), g_spoof_props.size(), sizeof(Property), +[](const void* a, const void* b) -> int {
-        const auto* p1 = static_cast<const Property*>(a);
-        const auto* p2 = static_cast<const Property*>(b);
-        if (p1->key < p2->key) return -1;
-        if (p1->key > p2->key) return 1;
-        return 0;
+    ::sort(g_spoof_props.begin(), g_spoof_props.end(), [](const auto& a, const auto& b) {
+        return a.key < b.key;
     });
 
     UniqueFd shm_fd = UniqueFd(zygiskd::GetZygiskSharedData());

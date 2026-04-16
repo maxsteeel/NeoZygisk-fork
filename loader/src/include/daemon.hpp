@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "misc.hpp"
 
 #if defined(__LP64__)
 #define LP_SELECT(lp32, lp64) lp64
