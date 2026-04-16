@@ -23,6 +23,7 @@
 #include <sys/auxv.h>
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <mutex>
 #include <functional>
@@ -812,32 +813,24 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
     return true;
 }
 
-// Helper function to check if a library is already mapped into the process memory
-struct LibCheckData {
-    const char* target_name;
-    bool found;
-};
-
-static int lib_check_cb(struct dl_phdr_info* info, [[maybe_unused]] size_t size, void* data) {
-    auto* check = reinterpret_cast<LibCheckData*>(data);
+static int build_cache_cb(struct dl_phdr_info* info, [[maybe_unused]] size_t size, void* data) {
+    auto* cache = reinterpret_cast<std::vector<std::string_view>*>(data);
     if (info->dlpi_name) {
         const char* name = strrchr(info->dlpi_name, '/');
         name = name ? name + 1 : info->dlpi_name;
-        if (strcmp(name, check->target_name) == 0) {
-            check->found = true;
-            return 1; // Stop iterating, we found it
+        if (name[0] != '\0') {
+            cache->push_back(name);
         }
     }
     return 0;
 }
 
-static bool is_library_loaded_in_memory(const char* soname) {
-    LibCheckData check = {soname, false};
-    dl_iterate_phdr(lib_check_cb, &check);
-    return check.found;
+static bool is_library_loaded_in_memory(const char* soname, const std::vector<std::string_view>& cache) {
+    std::string_view target(soname);
+    return std::find(cache.begin(), cache.end(), target) != cache.end();
 }
 
-static bool load_dependencies_recursive(const char *lib_path, int memfd, std::vector<LoadedModule>& loaded_modules) {
+static bool load_dependencies_recursive(const char *lib_path, int memfd, std::vector<LoadedModule>& loaded_modules, const std::vector<std::string_view>& loaded_libs_cache) {
     const char *soname = strrchr(lib_path, '/');
     soname = soname ? soname + 1 : lib_path;
 
@@ -850,7 +843,7 @@ static bool load_dependencies_recursive(const char *lib_path, int memfd, std::ve
     }
 
     // Check if library is already loaded into memory
-    if (is_library_loaded_in_memory(soname)) {
+    if (is_library_loaded_in_memory(soname, loaded_libs_cache)) {
         LOGV("Dependency `%s` is already present in memory. Skipping manual load.", soname);
         return true;
     }
@@ -869,7 +862,7 @@ static bool load_dependencies_recursive(const char *lib_path, int memfd, std::ve
         size_t off = loaded_modules[current_idx].dinfo.needed_str_offsets[i];
         if (off >= loaded_modules[current_idx].dinfo.strsz) continue;
         const char *dep_soname = &loaded_modules[current_idx].dinfo.strtab[off];
-        if (!is_library_loaded_in_memory(dep_soname)) {
+        if (!is_library_loaded_in_memory(dep_soname, loaded_libs_cache)) {
             LOGW("Warning: Module requires non-system dependency `%s` which is not in RAM.", dep_soname);
 
             // TODO: support multi-so module packages, maybe constructing
@@ -989,8 +982,12 @@ extern "C" void* custom_tls_get_addr(tls_index* ti) {
 extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_total_size, uintptr_t *out_entry, uintptr_t *out_init_array, size_t *out_init_count) {
     std::vector<LoadedModule> loaded_modules;
 
+    std::vector<std::string_view> loaded_libs_cache;
+    loaded_libs_cache.reserve(128); // Pre-allocate some space
+    dl_iterate_phdr(build_cache_cb, &loaded_libs_cache);
+
     // Give a dummy name for the main module
-    if (!load_dependencies_recursive("main_module", memfd, loaded_modules)) {
+    if (!load_dependencies_recursive("main_module", memfd, loaded_modules, loaded_libs_cache)) {
         LOGE("Failed to recursively load main module and its dependencies");
         cleanup_failed_load(loaded_modules);
         return false;
