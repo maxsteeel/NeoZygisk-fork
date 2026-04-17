@@ -27,7 +27,7 @@ val ccachePath by lazy {
 }
 
 val defaultCFlags = arrayOf(
-    "-Wall", "-Wextra",
+    "-Wall", "-Wextra", "-Oz",
     "-fno-rtti", "-fno-exceptions",
     "-fno-stack-protector", "-fomit-frame-pointer",
     "-ffunction-sections", "-fdata-sections",
@@ -39,7 +39,9 @@ val defaultCFlags = arrayOf(
 )
 
 val releaseFlags = arrayOf(
-    "-Oz", "-flto", "-fno-math-errno",
+    "-flto", "-g0", "-fno-math-errno", "-finline-functions", "-finline-hint-functions",
+    "-fno-assumptions", "-fno-assume-unique-vtables", "-fno-assume-sane-operator-new",
+    "-fvisibility-inlines-hidden-static-local-var",
     "-fno-use-cxa-atexit", "-fno-threadsafe-statics", "-fno-unroll-loops", 
     "-falign-functions=1", "-fno-jump-tables", "-fno-c++-static-destructors",
     "-fno-keep-static-consts", "-fno-keep-persistent-storage-variables",
@@ -88,6 +90,8 @@ android {
     buildTypes {
         debug {
             externalNativeBuild.cmake {
+                arguments += "-DCMAKE_SHARED_LINKER_FLAGS=-unwindlib=none"
+                arguments += "-DCMAKE_EXE_LINKER_FLAGS=-unwindlib=none"
                 arguments += "-DZKSU_VERSION=$verName-$verCode-$commitHash-debug"
             }
         }

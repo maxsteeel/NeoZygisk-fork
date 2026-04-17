@@ -15,16 +15,6 @@
 // common logging uses Android __android_log_print and PLOGE/LOGE macros.
 
 int main(int argc, char** argv) {
-#ifndef NDEBUG
-    const char* env_fd = getenv("ZYGISK_COMPANION_FD");
-    if (env_fd != nullptr) {
-        int fd = fast_atoi(env_fd);
-        unsetenv("ZYGISK_COMPANION_FD");
-        companion::entry(fd);
-        return 0;
-    }
-#endif
-
     if (argc >= 2) {
         if (strcmp(argv[1], "companion") == 0) {
             if (argc >= 3) {

@@ -216,14 +216,16 @@ inline int fast_atoi(const char *str) {
 }
 
 // Creates a detached background thread with a minimal 64KB stack 
-// instead of Android's default 1MB, drastically reducing RAM footprint.
+// instead of Android's default 1MB in Release build.
 static inline void spawn_thread(void* (*thread_func)(void*), void* arg) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    
+
+#ifdef NDEBUG
     // Set stack size to 64KB (minimum recommended for basic C/C++ logic)
     size_t stack_size = 64 * 1024; 
     pthread_attr_setstacksize(&attr, stack_size);
+#endif
     
     pthread_t thread;
     if (pthread_create(&thread, &attr, thread_func, arg) == 0) {
@@ -234,17 +236,17 @@ static inline void spawn_thread(void* (*thread_func)(void*), void* arg) {
     pthread_attr_destroy(&attr);
 }
 
-// Template wrapper to spawn a detached pthread with a minimal 64KB stack.
-// This allows passing C++ lambdas with captured variables while avoiding 
-// the massive 1MB default memory footprint of std::thread.
+// Template wrapper to spawn a detached pthread.
 template <typename F>
 static inline void spawn_thread(F&& lambda) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    
+
+#ifdef NDEBUG
     // Set stack size to 64KB (minimum recommended for basic C/C++ logic)
     size_t stack_size = 64 * 1024; 
     pthread_attr_setstacksize(&attr, stack_size);
+#endif
 
     // Heap-allocate the lambda so it survives the scope transition
     using LambdaType = std::decay_t<F>;

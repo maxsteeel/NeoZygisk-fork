@@ -22,17 +22,20 @@ val ccachePath by lazy {
 }
 
 val defaultCFlags = arrayOf(
-    "-Wall", "-Wextra",
+    "-Wall", "-Wextra", "-Oz",
     "-fno-rtti", "-fno-exceptions",
     "-fno-stack-protector", "-fomit-frame-pointer",
     "-ffunction-sections", "-fdata-sections",
     "-fno-ident", "-fmerge-all-constants",
     "-fno-semantic-interposition",
     "-Wno-builtin-macro-redefined", "-D__FILE__=__FILE_NAME__",
+    "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0",
 )
 
 val releaseFlags = arrayOf(
-    "-Oz", "-flto", "-g0", "-fno-math-errno",
+    "-flto", "-g0", "-fno-math-errno", "-finline-functions",
+    "-fno-assumptions", "-fno-assume-unique-vtables", "-fno-assume-sane-operator-new",
+    "-fvisibility-inlines-hidden-static-local-var",
     "-fno-use-cxa-atexit", "-fno-threadsafe-statics", "-fno-unroll-loops", 
     "-falign-functions=1", "-fno-jump-tables", "-fno-c++-static-destructors",
     "-fno-keep-static-consts", "-fno-keep-persistent-storage-variables",

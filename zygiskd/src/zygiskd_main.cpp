@@ -417,10 +417,6 @@ static int spawn_companion(const char* name) {
 
         // exec
         const char* argv[] = {arg0, "companion", fd_str, nullptr};
-#ifndef NDEBUG
-        // set env for child process
-        setenv("ZYGISK_COMPANION_FD", fd_str, 1);
-#endif
 
         execv(self_exe, const_cast<char**>(argv));
         PLOGE("execv");
@@ -679,8 +675,10 @@ int main() {
     // actively proxying signals for the main process.
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    // Use an extremely small 16KB stack size to save RAM since every byte counts.
+#ifdef NDEBUG
+    // Use an extremely small 16KB stack size to save RAM only in Release builds.
     pthread_attr_setstacksize(&attr, 16384);
+#endif
     pthread_t guard_thread;
     pthread_create(&guard_thread, &attr, [](void*) -> void* {
         prctl(PR_SET_NAME, "zygiskd-guard");

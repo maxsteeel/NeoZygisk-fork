@@ -51,12 +51,7 @@ bool is_kernel_5_9_or_newer() {
  * mangling parser used by libunwind and libc++.
  */
 
-/*
- * visibility("hidden") is strictly required to prevent these stubs
- * from poisoning the dynamic symbol table, avoiding ABI collisions
- * when modules invoke dlopen() in the companion process.
- */
-#define KEEP __attribute__((used, visibility("hidden")))
+#define KEEP __attribute__((used, visibility("default")))
 
 // ABI guards MUST always be compiled (both Debug and Release) to prevent 
 // fatal 0x8 crashes during global static variable initialization.
@@ -68,8 +63,6 @@ extern "C" {
     KEEP int __gxx_personality_v0(...) { return 0; }
 }
 
-// The massive demangler is only stripped in Release to save binary size.
-#ifdef NDEBUG
 namespace __cxxabiv1 {
     extern "C" {
         // This is the main entry point for demangling. 
@@ -91,7 +84,7 @@ extern "C" {
     KEEP void _ZNSt6__ndk117__assoc_sub_state12__make_readyEv() {}
     KEEP void _Unwind_Resume(void*) {}
     KEEP int _Unwind_RaiseException(void*) { return 0; }
+    KEEP int _Unwind_DeleteException(void*) { return 0; }
     KEEP void __stub_atexit(void (*func)()) {}
     __attribute__((weak, alias("__stub_atexit"))) void atexit(void (*func)());
 }
-#endif // NDEBUG
