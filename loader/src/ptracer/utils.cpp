@@ -136,99 +136,26 @@ bool set_regs(int pid, struct user_regs_struct &regs) {
 /**
  * @brief Finds the base address of a loaded module (the first mapping with zero offset).
  */
-void *find_module_base(int pid, std::string_view suffix) {
+static void *find_module_base(int pid, const char* suffix) {
     void* result = nullptr;
+    size_t suffix_len = strlen(suffix);
+
     MapInfo::Scan(pid, [&](const MapInfo& map) {
-        if (map.offset == 0 && std::string_view(map.path).ends_with(suffix)) {
-            result = (void*)map.start;
-            return true; // We find the module, stop scanning
+        if (map.offset == 0 && map.path[0] != '\0') {
+            size_t path_len = strlen(map.path);
+            if (path_len >= suffix_len) {
+                const char* path_suffix = map.path + (path_len - suffix_len);
+                if (strcmp(path_suffix, suffix) == 0) {
+                    if (path_len == suffix_len || *(path_suffix - 1) == '/') {
+                        result = (void*)map.start;
+                        return true; // We find the module, stop scanning
+                    }
+                }
+            }
         }
         return false; // Continue scanning
     });
     return result;
-}
-
-/**
- * @brief Calculates the address of a function in a remote process.
- *
- * This works by finding the function's address in our own process (avoiding `dlopen`/`dlsym`),
- * then finding the base address of its containing library in both our process and the
- * remote process. The remote address is then calculated using the offset from the base.
- * remote_sym = remote_base + (local_sym - local_base)
- */
-void *find_func_addr(int pid, std::string_view module, std::string_view func) {
-    std::string module_str(module);
-    std::string func_str(func);
-    char absolute_path[512] = {0};
-    void *remote_base = nullptr;
-
-    // Find the local address of the function.
-    MapInfo::Scan(pid, [&](const MapInfo& m) {
-        if (m.offset == 0 && std::string_view(m.path).ends_with(module)) {
-            remote_base = (void *) m.start;
-            // Capture the absolute path (e.g., /system/lib64/libc.so)
-            strlcpy(absolute_path, m.path, sizeof(absolute_path));
-            return true; // Found, stop scanning
-        }
-        return false;
-    });
-
-    if (remote_base == nullptr || absolute_path[0] == '\0') {
-        LOGE("failed to find remote base or path for module %s", module_str.c_str());
-        return nullptr;
-    }
-
-    // Open the file on disk
-    UniqueFd fd(open(absolute_path, O_RDONLY | O_CLOEXEC));
-    if (fd < 0) {
-        LOGE("failed to open lib %s for offline parsing", absolute_path);
-        return nullptr;
-    }
-
-    // Parse the ELF headers to find the symbol's offset (st_value)
-    struct stat st;
-    if (fstat(fd, &st) < 0) return nullptr;
-
-    void* file_map = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (file_map == MAP_FAILED) return nullptr;
-
-    ElfW(Ehdr) eh;
-    std::unique_ptr<ElfW(Phdr)[]> phdr;
-    ElfW(Addr) min_vaddr = 0;
-    size_t map_size = 0;
-    long page_size = sysconf(_SC_PAGESIZE);
-
-    if (!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size)) {
-        LOGE("failed to compute layout for %s", absolute_path);
-        munmap(file_map, st.st_size);
-        return nullptr;
-    }
-
-    elf_dyn_info dinfo;
-    if (!elf_load_dyn_info(file_map, true, &eh, phdr, &dinfo)) {
-        LOGE("failed to load dynamic info for %s", absolute_path);
-        munmap(file_map, st.st_size);
-        return nullptr;
-    }
-
-    // Extract the raw offset (st_value) from the symbol table
-    ElfW(Addr) sym_offset = 0;
-    if (!find_dynsym_value(&dinfo, func_str.c_str(), &sym_offset) || sym_offset == 0) {
-        LOGE("failed to find sym %s in offline ELF file %s", func_str.c_str(), absolute_path);
-        munmap(file_map, st.st_size);
-        return nullptr;
-    }
-    
-    munmap(file_map, st.st_size);
-
-    // Calculate the absolute remote address
-    // remote_sym = remote_base + raw_offset
-    uintptr_t remote_addr = (uintptr_t)remote_base + (uintptr_t)sym_offset;
-
-    LOGV("found remote %s!%s at 0x%" PRIxPTR " (remote base 0x%" PRIxPTR ", offset 0x%" PRIxPTR ")",
-         absolute_path, func_str.c_str(), remote_addr, (uintptr_t)remote_base, (uintptr_t)sym_offset);
-
-    return (void *) remote_addr;
 }
 
 // --- Remote Call Implementation ---

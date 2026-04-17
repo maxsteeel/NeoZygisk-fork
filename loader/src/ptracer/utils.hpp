@@ -112,10 +112,6 @@ bool get_regs(int pid, struct user_regs_struct &regs);
 
 bool set_regs(int pid, struct user_regs_struct &regs);
 
-void *find_module_base(int pid, std::string_view suffix);
-
-void *find_func_addr(int pid, std::string_view module, std::string_view func);
-
 void align_stack(struct user_regs_struct &regs, long preserve = 0);
 
 uintptr_t push_string(int pid, struct user_regs_struct &regs, const char *str);

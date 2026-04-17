@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstdint>
 #include <memory>
+#include <sys/mman.h>
 
 #ifndef ALIGN_DOWN
 #define ALIGN_DOWN(x, a) ((x) & ~((a)-1))
@@ -31,6 +32,12 @@ static inline constexpr uint32_t calc_gnu_hash(const char* str) {
     }
     return h;
 }
+
+struct MmapGuard {
+    void* addr;
+    size_t size;
+    ~MmapGuard() { if (addr && addr != MAP_FAILED) munmap(addr, size); }
+};
 
 struct elf_dyn_info {
     ElfW(Addr) rel_vaddr = 0; size_t rel_sz = 0;

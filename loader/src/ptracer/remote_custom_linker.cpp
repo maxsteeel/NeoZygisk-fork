@@ -40,96 +40,61 @@
 #define ELF_R_SYM ELF32_R_SYM
 #endif
 
-static uintptr_t smart_resolve_symbol(const char* sym_name, int local_pid, int remote_pid) {
+static uintptr_t smart_resolve_symbol(const char* sym_name,
+                                      const std::vector<MapInfo>& local_maps,
+                                      const std::vector<MapInfo>& remote_maps) {
     void* local_addr = dlsym(RTLD_DEFAULT, sym_name);
     if (!local_addr) return 0;
-
-    static thread_local uintptr_t cached_local_start = 0;
-    static thread_local uintptr_t cached_local_end = 0;
-    static thread_local uintptr_t cached_local_base = 0;
-    static thread_local uintptr_t cached_remote_start = 0;
     uintptr_t l_addr = (uintptr_t)local_addr;
 
-    if (cached_local_start != 0 && l_addr >= cached_local_start && l_addr < cached_local_end) {
-        uintptr_t offset = l_addr - cached_local_base;
-        return cached_remote_start + offset;
-    }
-
+    // Linear search
     uintptr_t local_base = 0;
-    uintptr_t map_start = 0, map_end = 0;
-    char actual_path[256] = {0};
+    const char* actual_path = nullptr;
 
-    uintptr_t last_base = 0;
-    char last_path[256] = {0};
-
-    // Find the local memory section
-    MapInfo::Scan(local_pid, [&](const MapInfo& m) {
-        if (m.offset == 0) {
-            last_base = m.start;
-            strlcpy(last_path, m.path, sizeof(last_path));
+    // We look forward
+    auto it = local_maps.begin();
+    for (; it != local_maps.end(); ++it) {
+        if (l_addr >= it->start && l_addr < it->end) {
+            actual_path = it->path;
+            break;
         }
-        if (l_addr >= m.start && l_addr < m.end) {
-            map_start = m.start;
-            map_end = m.end;
-            strlcpy(actual_path, m.path, sizeof(actual_path));
-            if (last_path[0] != '\0' && strcmp(last_path, m.path) == 0) {
-                local_base = last_base;
-            }
-            return true; // Stop scanning
+    }
+    
+    if (!actual_path || actual_path[0] == '\0') return 0;
+
+    // We search backwards from where we are, because offset 0 is right up in memory
+    while (true) {
+        if (it->offset == 0 && strcmp(it->path, actual_path) == 0) {
+            local_base = it->start;
+            break;
         }
-        return false;
-    });
-
-    if (actual_path[0] == '\0') return 0;
-
-    // If the base was 0, we look for offset 0 explicitly
-    if (local_base == 0) {
-        MapInfo::Scan(local_pid, [&](const MapInfo& m) {
-            if (m.offset == 0 && strcmp(actual_path, m.path) == 0) {
-                local_base = m.start;
-                return true; // Stop scanning
-            }
-            return false;
-        });
+        if (it == local_maps.begin()) break;
+        --it;
     }
     if (local_base == 0) return 0;
 
-    uintptr_t offset = l_addr - local_base;
+    // Search the remote base (offset 0)
     uintptr_t remote_base = 0;
-
-    // Find the corresponding base in the remote process
-    MapInfo::Scan(remote_pid, [&](const MapInfo& m) {
-        if (m.offset == 0 && strcmp(actual_path, m.path) == 0) {
+    for (const auto& m : remote_maps) {
+        // Fast integer check AND fast char check before the expensive string comparison
+        if (m.offset == 0 && m.path[0] == actual_path[0] && strcmp(m.path, actual_path) == 0) {
             remote_base = m.start;
-            return true; // Stop scanning
+            break;
         }
-        return false;
-    });
-
-    if (remote_base != 0) {
-        cached_local_start = map_start;
-        cached_local_end = map_end;
-        cached_local_base = local_base;
-        cached_remote_start = remote_base;
-        return remote_base + offset;
     }
 
-    return 0;
+    return remote_base != 0 ? (remote_base + (l_addr - local_base)) : 0;
 }
 
-static bool resolve_symbol_addr(const elf_dyn_info *info,
-                                int local_pid, int remote_pid,
-                                const char** needed_paths, size_t needed_count,
-                                uintptr_t load_bias, size_t sym_idx, uintptr_t *out_addr) {
+static bool resolve_symbol_addr(const elf_dyn_info *info, uintptr_t load_bias, size_t sym_idx, uintptr_t *out_addr,
+                                const std::vector<MapInfo>& local_maps, const std::vector<MapInfo>& remote_maps) {
     
     if (sym_idx >= info->nsyms) return false;
     const ElfW(Sym)& sym = info->symtab[sym_idx];
 
     if (sym.st_shndx != SHN_UNDEF) { *out_addr = (uintptr_t)load_bias + (uintptr_t)sym.st_value; return true; }
     if (sym.st_name == 0 || sym.st_name >= info->strsz) return false;
-
     const char *name = &info->strtab[sym.st_name];
-    if (!name || !*name) return false;
 
     ElfW(Addr) local_val = 0;
     if (find_dynsym_value(info, name, &local_val) && local_val != 0) {
@@ -141,18 +106,8 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
         *out_addr = 0; return true; 
     }
 
-    uintptr_t smart_addr = smart_resolve_symbol(name, local_pid, remote_pid);
-    if (smart_addr != 0) {
-        *out_addr = smart_addr;
-        return true;
-    }
-
-    for (size_t k = 0; k < needed_count; k++) {
-        const char* mod_path = needed_paths[k];
-        if (!mod_path || !*mod_path) continue;
-        void *addr = find_func_addr(remote_pid, mod_path, name);
-        if (addr) { *out_addr = (uintptr_t)addr; return true; }
-    }
+    uintptr_t smart_addr = smart_resolve_symbol(name, local_maps, remote_maps);
+    if (smart_addr != 0) *out_addr = smart_addr; return true;
     
     return false;
 }
@@ -160,37 +115,36 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
 static bool write_remote_addr(int pid, uintptr_t addr, ElfW(Addr) value) { return write_proc(pid, addr, &value, sizeof(value)); }
 [[maybe_unused]] static bool read_remote_addr(int pid, uintptr_t addr, ElfW(Addr) *out) { return read_proc(pid, addr, out, sizeof(*out)); }
 
-static inline bool process_remote_relocation(
-    int pid, uintptr_t load_bias, const elf_dyn_info* info, int local_pid, int remote_pid,
-    const char** needed_paths, size_t needed_count,
-    uintptr_t target, unsigned current_type, unsigned current_sym_idx,
-    ElfW(Addr) current_addend, bool is_rela
-) {
+__attribute__((always_inline))
+static inline bool process_remote_relocation(int pid, uintptr_t load_bias, const elf_dyn_info* info, uintptr_t target, unsigned current_type,
+                                            unsigned current_sym_idx, ElfW(Addr) current_addend, [[maybe_unused]] bool is_rela,
+                                            const std::vector<MapInfo>& local_maps, const std::vector<MapInfo>& remote_maps) {
+    
     ElfW(Addr) value = 0;
 
 #if defined(__aarch64__)
     if (current_type == R_AARCH64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
     else if (current_type == R_AARCH64_GLOB_DAT || current_type == R_AARCH64_JUMP_SLOT || current_type == R_AARCH64_ABS64) {
         uintptr_t sym_addr = 0;
-        if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, current_sym_idx, &sym_addr)) return false;
+        if (unlikely(!resolve_symbol_addr(info, load_bias, current_sym_idx, &sym_addr, local_maps, remote_maps))) return false;
         value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
     } else return false;
 #elif defined(__x86_64__)
     if (current_type == R_X86_64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
     else if (current_type == R_X86_64_GLOB_DAT || current_type == R_X86_64_JUMP_SLOT || current_type == R_X86_64_64) {
         uintptr_t sym_addr = 0;
-        if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, current_sym_idx, &sym_addr)) return false;
+        if (unlikely(!resolve_symbol_addr(info, load_bias, current_sym_idx, &sym_addr, local_maps, remote_maps))) return false;
         value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
     } else return false;
 #elif defined(__arm__)
     if (current_type == R_ARM_RELATIVE) {
         ElfW(Addr) addend_rel = 0;
         if (is_rela) addend_rel = current_addend;
-        else if (!read_remote_addr(pid, target, &addend_rel)) return false;
+        else if (unlikely(!read_remote_addr(pid, target, &addend_rel))) return false;
         value = (ElfW(Addr))load_bias + addend_rel;
     } else if (current_type == R_ARM_GLOB_DAT || current_type == R_ARM_JUMP_SLOT || current_type == R_ARM_ABS32) {
         uintptr_t sym_addr = 0;
-        if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, current_sym_idx, &sym_addr)) return false;
+        if (unlikely(!resolve_symbol_addr(info, load_bias, current_sym_idx, &sym_addr, local_maps, remote_maps))) return false;
         if (sym_addr == 0) value = 0;
         else if (current_type == R_ARM_ABS32) {
             ElfW(Addr) addend_rel = 0;
@@ -203,11 +157,11 @@ static inline bool process_remote_relocation(
     if (current_type == R_386_RELATIVE) {
         ElfW(Addr) addend_rel = 0;
         if (is_rela) addend_rel = current_addend;
-        else if (!read_remote_addr(pid, target, &addend_rel)) return false;
+        else if (unlikely(!read_remote_addr(pid, target, &addend_rel))) return false;
         value = (ElfW(Addr))load_bias + addend_rel;
     } else if (current_type == R_386_GLOB_DAT || current_type == R_386_JMP_SLOT || current_type == R_386_32) {
         uintptr_t sym_addr = 0;
-        if (!resolve_symbol_addr(info, local_pid, remote_pid, needed_paths, needed_count, load_bias, current_sym_idx, &sym_addr)) return false;
+        if (unlikely(!resolve_symbol_addr(info, load_bias, current_sym_idx, &sym_addr, local_maps, remote_maps))) return false;
         if (sym_addr == 0) value = 0;
         else if (current_type == R_386_32) {
             ElfW(Addr) addend_rel = 0;
@@ -226,9 +180,9 @@ static inline bool process_remote_relocation(
 
 
 static bool apply_rela_section(int pid, void* file_map, [[maybe_unused]] const std::unique_ptr<ElfW(Phdr)[]>& phdr, size_t phnum,
-                               const elf_dyn_info *info, int local_pid, 
-                               int remote_pid, const char** needed_paths, 
-                               size_t needed_count, uintptr_t load_bias, ElfW(Addr) rela_vaddr, size_t rela_sz) {
+                               const elf_dyn_info *info, uintptr_t load_bias, ElfW(Addr) rela_vaddr, size_t rela_sz,
+                               const std::vector<MapInfo>& local_maps, const std::vector<MapInfo>& remote_maps) {
+    
     off_t rela_off = 0;
     if (!vaddr_to_offset(phdr, phnum, rela_vaddr, &rela_off)) return false;
 
@@ -237,8 +191,8 @@ static bool apply_rela_section(int pid, void* file_map, [[maybe_unused]] const s
 
     for (size_t i = 0; i < count; i++) {
         const ElfW(Rela)& r = rels[i];
-        if (!process_remote_relocation(pid, load_bias, info, local_pid, remote_pid, needed_paths, needed_count,
-            (uintptr_t)load_bias + (uintptr_t)r.r_offset, ELF_R_TYPE(r.r_info), ELF_R_SYM(r.r_info), r.r_addend, true)) {
+        if (!process_remote_relocation(pid, load_bias, info, (uintptr_t)load_bias + (uintptr_t)r.r_offset, ELF_R_TYPE(r.r_info),
+                                        ELF_R_SYM(r.r_info), r.r_addend, true, local_maps, remote_maps)) {
             return false;
         }
     }
@@ -246,9 +200,9 @@ static bool apply_rela_section(int pid, void* file_map, [[maybe_unused]] const s
 }
 
 static bool apply_rel_section(int pid, void* file_map, [[maybe_unused]] const std::unique_ptr<ElfW(Phdr)[]>& phdr, size_t phnum,
-                              const elf_dyn_info *info, int local_pid, 
-                              int remote_pid, const char** needed_paths,
-                              size_t needed_count, uintptr_t load_bias, ElfW(Addr) rel_vaddr, size_t rel_sz) {
+                              const elf_dyn_info *info, uintptr_t load_bias, ElfW(Addr) rel_vaddr, size_t rel_sz,
+                              const std::vector<MapInfo>& local_maps, const std::vector<MapInfo>& remote_maps) {
+    
     off_t rel_off = 0;
     if (!vaddr_to_offset(phdr, phnum, rel_vaddr, &rel_off)) return false;
 
@@ -257,8 +211,8 @@ static bool apply_rel_section(int pid, void* file_map, [[maybe_unused]] const st
 
     for (size_t i = 0; i < count; i++) {
         const ElfW(Rel)& r = rels[i];
-        if (!process_remote_relocation(pid, load_bias, info, local_pid, remote_pid, needed_paths, needed_count,
-            (uintptr_t)load_bias + (uintptr_t)r.r_offset, ELF_R_TYPE(r.r_info), ELF_R_SYM(r.r_info), 0, false)) {
+        if (!process_remote_relocation(pid, load_bias, info, (uintptr_t)load_bias + (uintptr_t)r.r_offset, ELF_R_TYPE(r.r_info),
+                                        ELF_R_SYM(r.r_info), 0, false, local_maps, remote_maps)) {
             return false;
         }
     }
@@ -270,30 +224,16 @@ static bool is_memfd_supported_by_kernel() {
     if (supported != -1) return supported == 1;
 
     struct utsname uts;
-    if (uname(&uts) != 0) {
-        supported = 1; // Default to true if uname fails
-        return true;
-    }
+    if (uname(&uts) != 0) return true;
 
     int major = 0, minor = 0;
     const char *p = uts.release;
-    while (*p >= '0' && *p <= '9') {
-        major = major * 10 + (*p - '0');
-        p++;
-    }
-    if (*p == '.') {
-        p++;
-        while (*p >= '0' && *p <= '9') {
-            minor = minor * 10 + (*p - '0');
-            p++;
-        }
-    }
+    while (*p >= '0' && *p <= '9') major = major * 10 + (*p - '0'); p++;
+    if (*p == '.') p++; while (*p >= '0' && *p <= '9') minor = minor * 10 + (*p - '0'); p++;
 
-    if (major > 3 || (major == 3 && minor >= 17)) {
-        supported = 1;
-    } else {
-        supported = 0;
-    }
+    if (major > 3 || (major == 3 && minor >= 17)) supported = 1;
+    else supported = 0;
+
     return supported == 1;
 }
 
@@ -316,30 +256,30 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
 
     long page_size_long = sysconf(_SC_PAGESIZE);
     size_t page_size = (size_t)page_size_long;
+    std::vector<MapInfo> local_maps; std::vector<MapInfo> remote_maps;
+    MapInfo::Scan(local_pid, [&](const MapInfo& m) { local_maps.push_back(m); return false; });
+    MapInfo::Scan(remote_pid, [&](const MapInfo& m) { remote_maps.push_back(m); return false; });
 
     UniqueFd fd(open(lib_path, O_RDONLY | O_CLOEXEC));
-    if (fd < 0) return false;
+    if (unlikely(fd < 0)) return false;
 
     // Map the file locally
     struct stat st;
-    if (fstat(fd, &st) != 0) return false;
+    if (unlikely(fstat(fd, &st) != 0)) return false;
     void* file_map = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (file_map == MAP_FAILED) return false;
+    if (unlikely(file_map == MAP_FAILED)) return false;
+    MmapGuard map_guard{file_map, (size_t)st.st_size};
 
     ElfW(Ehdr) eh;
     std::unique_ptr<ElfW(Phdr)[]> phdr;
     ElfW(Addr) min_vaddr = 0;
     size_t map_size = 0;
 
-    if (!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size)) { 
-        munmap(file_map, st.st_size);
-        return false; 
-    }
+    if (unlikely(!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size))) return false;
 
     uintptr_t syscall_gadget = find_syscall_gadget(local_pid, remote_pid);
     if (!syscall_gadget) {
         LOGE("Failed to find syscall gadget for Remote-Custom Linker");
-        munmap(file_map, st.st_size);
         return false;
     }
 
@@ -364,7 +304,6 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
 
     if (remote_fd < 0) {
         LOGE("Failed to open remote file via raw syscall");
-        munmap(file_map, st.st_size);
         return false;
     }
 
@@ -393,7 +332,6 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
     if (!remote_base || remote_base == (uintptr_t)MAP_FAILED) {
         long args_close_fd[] = {remote_fd};
         remote_syscall(pid, call_regs, syscall_gadget, SYS_close, args_close_fd, 1);
-        munmap(file_map, st.st_size);
         return false;
     }
 
@@ -421,7 +359,7 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
             long offset_arg = remote_mmap_offset_arg(file_page_offset, page_size);
             long args_mmap_seg[] = {(long)seg_page, (long)(file_page_end - seg_page), PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, remote_fd, offset_arg};
             uintptr_t seg_map = remote_syscall(pid, call_regs, syscall_gadget, SYS_mmap, args_mmap_seg, 6);
-            if (!seg_map || seg_map == (uintptr_t)MAP_FAILED) { munmap(file_map, st.st_size); return false; }
+            if (!seg_map || seg_map == (uintptr_t)MAP_FAILED) return false;
 
             if (is_writable && file_page_end > file_end) {
                 size_t tail_len = (size_t)(file_page_end - file_end);
@@ -436,7 +374,7 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
         if (seg_page_end > file_page_end) {
             long args_mmap_bss[] = {(long)file_page_end, (long)(seg_page_end - file_page_end), PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0};
             uintptr_t bss_map = remote_syscall(pid, call_regs, syscall_gadget, SYS_mmap, args_mmap_bss, 6);
-            if (!bss_map || bss_map == (uintptr_t)MAP_FAILED) { munmap(file_map, st.st_size); return false; }
+            if (!bss_map || bss_map == (uintptr_t)MAP_FAILED) return false;
         }
         int prot = 0;
         if (phdr[i].p_flags & PF_R) prot |= PROT_READ;
@@ -452,27 +390,14 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
 
     elf_dyn_info dinfo;
     // Pass the local memory map directly.
-    if (!elf_load_dyn_info(file_map, true, &eh, phdr, &dinfo)) {
-        munmap(file_map, st.st_size);
-        return false;
-    }
-
-    size_t needed_count = dinfo.needed_count;
-    const char** needed_paths = (const char**)alloca(needed_count * sizeof(const char*));
-
-    // Only store the sonames directly from the string table.
-    // find_func_addr resolves sonames dynamically via MapInfo::Scan. No need for find_remote_module_path.
-    for (size_t i = 0; i < needed_count; i++) {
-        size_t off = dinfo.needed_str_offsets[i];
-        needed_paths[i] = (off < dinfo.strsz) ? &dinfo.strtab[off] : "";
-    }
+    if (!elf_load_dyn_info(file_map, true, &eh, phdr, &dinfo)) return false;
 
     // Apply relocations passing the local file_map
-    if (dinfo.rela_sz && dinfo.rela_vaddr) apply_rela_section(pid, file_map, phdr, eh.e_phnum, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.rela_vaddr, dinfo.rela_sz);
-    if (dinfo.rel_sz && dinfo.rel_vaddr) apply_rel_section(pid, file_map, phdr, eh.e_phnum, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.rel_vaddr, dinfo.rel_sz);
+    if (dinfo.rela_sz && dinfo.rela_vaddr) apply_rela_section(pid, file_map, phdr, eh.e_phnum, &dinfo, load_bias, dinfo.rela_vaddr, dinfo.rela_sz, local_maps, remote_maps);
+    if (dinfo.rel_sz && dinfo.rel_vaddr) apply_rel_section(pid, file_map, phdr, eh.e_phnum, &dinfo, load_bias, dinfo.rel_vaddr, dinfo.rel_sz, local_maps, remote_maps);
     if (dinfo.jmprel_sz && dinfo.jmprel_vaddr) {
-        if (dinfo.pltrel_type == DT_RELA) apply_rela_section(pid, file_map, phdr, eh.e_phnum, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.jmprel_vaddr, dinfo.jmprel_sz);
-        else apply_rel_section(pid, file_map, phdr, eh.e_phnum, &dinfo, local_pid, remote_pid, needed_paths, needed_count, load_bias, dinfo.jmprel_vaddr, dinfo.jmprel_sz);
+        if (dinfo.pltrel_type == DT_RELA) apply_rela_section(pid, file_map, phdr, eh.e_phnum, &dinfo, load_bias, dinfo.jmprel_vaddr, dinfo.jmprel_sz, local_maps, remote_maps);
+        else apply_rel_section(pid, file_map, phdr, eh.e_phnum, &dinfo, load_bias, dinfo.jmprel_vaddr, dinfo.jmprel_sz, local_maps, remote_maps);
     }
 
     for (size_t k = 0; k < seg_count; k++) {
@@ -483,19 +408,13 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
     }
 
     ElfW(Addr) entry_value = 0;
-    if (!find_dynsym_value(&dinfo, "entry", &entry_value)) {
-        munmap(file_map, st.st_size);
-        return false; 
-    }
+    if (!find_dynsym_value(&dinfo, "entry", &entry_value)) return false;
 
     *out_base = remote_base;
     *out_total_size = map_size;
     *out_entry = (uintptr_t)load_bias + (uintptr_t)entry_value;
     *out_init_array = dinfo.init_array_vaddr ? ((uintptr_t)load_bias + dinfo.init_array_vaddr) : 0;
     *out_init_count = dinfo.init_arraysz ? (dinfo.init_arraysz / sizeof(ElfW(Addr))) : 0;
-
-    // We no longer need the local file mapping. Clean it up.
-    munmap(file_map, st.st_size);
 
     return true;
 }
