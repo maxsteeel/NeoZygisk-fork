@@ -5,9 +5,7 @@
 #include <sys/mount.h>
 #include <sys/wait.h>
 #include <cstring>
-#include <vector>
-#include <string_view>
-#include <algorithm>
+#include <cstdlib>
 
 #include "daemon.hpp"
 #include "logging.hpp"
@@ -20,29 +18,17 @@ namespace zygisk_mount {
 
 bool switch_mount_namespace(pid_t pid) {
     char cwd[4096];
-    if (getcwd(cwd, sizeof(cwd)) == nullptr) {
-        PLOGE("switch_mount_namespace: getcwd");
-        return false;
-    }
+    if (getcwd(cwd, sizeof(cwd)) == nullptr) return false;
 
     char ns_path[64];
     snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", pid);
 
     UniqueFd fd(open(ns_path, O_RDONLY | O_CLOEXEC));
-    if (fd < 0) {
-        PLOGE("switch_mount_namespace: open %s", ns_path);
-        return false;
-    }
+    if (fd < 0) return false;
 
-    if (setns(fd, CLONE_NEWNS) != 0) {
-        PLOGE("switch_mount_namespace: setns");
-        return false;
-    }
+    if (setns(fd, CLONE_NEWNS) != 0) return false;
 
-    if (chdir(cwd) != 0) {
-        PLOGE("switch_mount_namespace: chdir");
-        return false;
-    }
+    if (chdir(cwd) != 0) return false;
 
     return true;
 }
@@ -58,52 +44,33 @@ int MountNamespaceManager::save_mount_namespace(pid_t pid, zygiskd::MountNamespa
     std::lock_guard<std::mutex> lock(mtx_);
 
     int& fd_ref = (namespace_type == zygiskd::MountNamespace::Clean) ? clean_mnt_ns_fd_ : root_mnt_ns_fd_;
-    if (fd_ref >= 0) {
-        return fd_ref;
-    }
+    if (fd_ref >= 0) return fd_ref;
 
     int pipefd[2];
-    if (pipe2(pipefd, O_CLOEXEC) != 0) {
-        PLOGE("pipe2");
-        return -1;
-    }
+    if (pipe2(pipefd, O_CLOEXEC) != 0) return -1;
 
     UniqueFd pipe_read(pipefd[0]);
     UniqueFd pipe_write(pipefd[1]);
 
     pid_t child_pid = fork();
-    if (child_pid < 0) {
-        PLOGE("fork");
-        return -1;
-    }
+    if (child_pid < 0) return -1;
 
     if (child_pid == 0) {
         // --- Child Process ---
         pipe_read = UniqueFd();
 
-        if (!switch_mount_namespace(pid)) {
-            _exit(1);
-        }
+        if (!switch_mount_namespace(pid)) _exit(1);
 
         if (namespace_type == zygiskd::MountNamespace::Clean) {
-            if (unshare(CLONE_NEWNS) != 0) {
-                PLOGE("unshare");
-                _exit(1);
-            }
-            if (!clean_mount_namespace()) {
-                LOGE("clean_mount_namespace failed");
-            }
+            if (unshare(CLONE_NEWNS) != 0) _exit(1);
+            if (!clean_mount_namespace()) LOGE("clean_mount_namespace failed");
         }
 
         uint8_t sig = 0;
-        if (socket_utils::xwrite(pipe_write, &sig, sizeof(sig)) != sizeof(sig)) {
-            PLOGE("child: write pipe");
-        }
-        pipe_write = UniqueFd();
+        socket_utils::xwrite(pipe_write, &sig, sizeof(sig));
 
-        while (true) {
-            sleep(60);
-        }
+        char dummy;
+        read(0, &dummy, 1); 
         _exit(0);
     }
 
@@ -112,7 +79,6 @@ int MountNamespaceManager::save_mount_namespace(pid_t pid, zygiskd::MountNamespa
 
     uint8_t buf = 0;
     if (socket_utils::xread(pipe_read, &buf, sizeof(buf)) != sizeof(buf)) {
-        PLOGE("parent: read pipe");
         kill(child_pid, SIGKILL);
         waitpid(child_pid, nullptr, 0);
         return -1;
@@ -124,15 +90,10 @@ int MountNamespaceManager::save_mount_namespace(pid_t pid, zygiskd::MountNamespa
     snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", child_pid);
 
     UniqueFd ns_fd(open(ns_path, O_RDONLY | O_CLOEXEC));
-    if (ns_fd < 0) {
-        PLOGE("open %s", ns_path);
-        kill(child_pid, SIGKILL);
-        waitpid(child_pid, nullptr, 0);
-        return -1;
-    }
-
     kill(child_pid, SIGKILL);
     waitpid(child_pid, nullptr, 0);
+
+    if (ns_fd < 0) return -1;
 
     fd_ref = ns_fd.release();
     return fd_ref;
@@ -143,15 +104,50 @@ struct MountInfo {
     char path[256];
 };
 
+struct MountTargetList {
+    MountInfo* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+
+    ~MountTargetList() { free(data); }
+
+    void push_back(int id, const char* p) {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 32 : capacity * 2;
+            MountInfo* new_data = (MountInfo*)realloc(data, capacity * sizeof(MountInfo));
+            if (!new_data) return; // Prevent segfault on OOM
+            data = new_data;
+        }
+        data[size].mnt_id = id;
+        strlcpy(data[size].path, p, sizeof(data[size].path));
+        size++;
+    }
+};
+
+static inline char* tokenize_word(char* str, char** next_word) {
+    char* word_start = str;
+    // Move forward to the end of the word
+    while (*str > ' ') ++str;
+
+    // If a delimiter is found, it is destroyed and set to Null
+    if (*str != '\0') {
+        *str = '\0';
+        ++str;
+        // Excess spaces are cleared for the next word
+        while (*str > '\0' && *str <= ' ') ++str;
+    }
+    *next_word = str; // It saves where the next starts
+    return word_start;
+}
+
 bool MountNamespaceManager::clean_mount_namespace() {
-    UniqueFile file(fopen("/proc/self/mountinfo",  "re"));
-    if (!file) [[unlikely]] {
-        PLOGE("fopen /proc/self/mountinfo");
+    UniqueFd fd(open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC));
+    if (fd < 0) [[unlikely]] {
+        PLOGE("open /proc/self/mountinfo");
         return false;
     }
 
-    std::vector<MountInfo> unmount_targets;
-    unmount_targets.reserve(256);
+    MountTargetList unmount_targets;
 
     const char* root_source = nullptr;
     auto root = root_impl::get();
@@ -162,50 +158,70 @@ bool MountNamespaceManager::clean_mount_namespace() {
     bool is_ksu = (root == root_impl::RootImpl::KernelSU);
     char ksu_module_source[256] = {0};
 
+    char buf[4096];
     char line[1024];
-    while (fgets(line, sizeof(line), file)) {
-        int mnt_id;
-        char root_path[256] = {0};
-        char mount_point[256] = {0};
-        char fstype[256] = {0};
-        char mount_source[256] = {0};
+    size_t line_pos = 0;
+    ssize_t bytes_read;
 
-        int ret = sscanf(line, "%d %*d %*s %255s %255s %*s %*s - %255s %255s",
-                         &mnt_id, root_path, mount_point, fstype, mount_source);
+    while ((bytes_read = read(fd, buf, sizeof(buf))) > 0) {
+        for (ssize_t i = 0; i < bytes_read; ++i) {
+            char c = buf[i];
+            
+            if (c == '\n' || line_pos >= sizeof(line) - 1) {
+                line[line_pos] = '\0';
+                
+                if (line_pos > 0) {
+                    char* ptr = line;
+                    char* next;
 
-        if (ret < 5) continue;
+                    // Se extrae mnt_id
+                    int mnt_id = fast_atoi(ptr);
+                    if (mnt_id != 0) {
+                        ptr = tokenize_word(ptr, &next); // skip mnt_id
+                        ptr = tokenize_word(next, &next); // skip parent_id
+                        ptr = tokenize_word(next, &next); // skip major:minor
+                        char* root_path = tokenize_word(next, &next);
+                        char* mount_point = tokenize_word(next, &next);
+                        ptr = tokenize_word(next, &next); // skip mount options
+                        ptr = tokenize_word(next, &next); // skip optional fields
+                        if (*ptr == '-') ptr = tokenize_word(next, &next); // skip separator
+                        ptr = tokenize_word(next, &next); // skip filesystem type
+                        char* mount_source = tokenize_word(next, &next);
 
-        if (is_ksu && std::string_view(mount_point) == "/data/adb/modules") {
-            if (std::string_view(mount_source).starts_with("/dev/block/loop")) {
-                strlcpy(ksu_module_source, mount_source, sizeof(ksu_module_source));
+                        if (is_ksu && strncmp(mount_point, "/data/adb/modules", 17) == 0) {
+                            if (strncmp(mount_source, "/dev/block/loop", 15) == 0) {
+                                strlcpy(ksu_module_source, mount_source, sizeof(ksu_module_source));
+                            }
+                        }
+
+                        bool should_unmount = false;
+                        if (strncmp(root_path, "/adb/modules", 12) == 0) should_unmount = true;
+                        else if (strncmp(mount_point, "/data/adb/modules", 17) == 0) should_unmount = true;
+                        else if (root_source && strcmp(mount_source, root_source) == 0) should_unmount = true;
+                        else if (ksu_module_source[0] != '\0' && strcmp(mount_source, ksu_module_source) == 0) should_unmount = true;
+
+                        if (should_unmount) {
+                            unmount_targets.push_back(mnt_id, mount_point);
+                        }
+                    }
+                }
+                line_pos = 0;
+            } else {
+                line[line_pos++] = c;
             }
-        }
-
-        bool should_unmount = false;
-        std::string_view root_view(root_path);
-        std::string_view mp_view(mount_point);
-        std::string_view src_view(mount_source);
-
-        if (root_view.starts_with("/adb/modules")) should_unmount = true;
-        else if (mp_view.starts_with("/data/adb/modules")) should_unmount = true;
-        else if (root_source && src_view == root_source) should_unmount = true;
-        else if (ksu_module_source[0] != '\0' && src_view == ksu_module_source) should_unmount = true;
-
-        if (should_unmount) {
-            MountInfo info;
-            info.mnt_id = mnt_id;
-            strlcpy(info.path, mount_point, sizeof(info.path));
-            unmount_targets.push_back(info);
         }
     }
 
-    ::sort(unmount_targets.begin(), unmount_targets.end(), [](const auto& a, const auto& b) {
-        return a.mnt_id > b.mnt_id;
-    });
+    if (unmount_targets.size > 1) {
+        ::sort(unmount_targets.data, unmount_targets.data + unmount_targets.size, 
+            [](const MountInfo& a, const MountInfo& b) {
+                return a.mnt_id > b.mnt_id; // Deepest first
+            });
+    }
 
-    for (const auto& target : unmount_targets) {
-        if (umount2(target.path, MNT_DETACH) == -1) {
-            PLOGE("umount2 %s", target.path);
+    for (size_t i = 0; i < unmount_targets.size; i++) {
+        if (umount2(unmount_targets.data[i].path, MNT_DETACH) == -1) {
+            PLOGE("umount2 %s", unmount_targets.data[i].path);
         }
     }
 

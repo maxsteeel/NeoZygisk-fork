@@ -25,15 +25,6 @@
 #include "custom_linker.hpp"
 #include "utils.hpp"
 
-// Structure for the getdents64 syscall
-struct linux_dirent64 {
-    uint64_t d_ino [[maybe_unused]];
-    int64_t d_off [[maybe_unused]];
-    unsigned short d_reclen;
-    unsigned char d_type [[maybe_unused]];
-    char d_name[];
-};
-
 static __thread sigjmp_buf g_segv_jmp_buf;
 static __thread volatile sig_atomic_t g_in_module_load = 0;
 static struct sigaction old_segv, old_bus;

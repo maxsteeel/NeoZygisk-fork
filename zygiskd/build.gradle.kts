@@ -35,7 +35,7 @@ val defaultCFlags = arrayOf(
 val releaseFlags = arrayOf(
     "-flto", "-g0", "-fno-math-errno", "-finline-functions",
     "-fno-assumptions", "-fno-assume-unique-vtables", "-fno-assume-sane-operator-new",
-    "-fvisibility-inlines-hidden-static-local-var",
+    "-fvisibility-inlines-hidden-static-local-var", "-fno-pie",
     "-fno-use-cxa-atexit", "-fno-threadsafe-statics", "-fno-unroll-loops", 
     "-falign-functions=1", "-fno-jump-tables", "-fno-c++-static-destructors",
     "-fno-keep-static-consts", "-fno-keep-persistent-storage-variables",

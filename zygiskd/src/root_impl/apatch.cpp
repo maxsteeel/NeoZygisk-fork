@@ -1,4 +1,3 @@
-#include "apatch.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -6,31 +5,33 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <vector>
 #include <mutex>
-#include <memory>
+#include <shared_mutex>
 #include <atomic>
-#include <algorithm>
 
+#include "root_impl.hpp"
 #include "constants.hpp"
 #include "logging.hpp"
 #include "utils.hpp"
-#include "daemon.hpp" // For UniqueFd
+#include "daemon.hpp"
 
 namespace apatch {
 
 struct ConfigData {
-    struct timespec mtim;
+    struct timespec mtim = {0, -1};
     IntList packages; // bit-packed: 0-29 uid, 30 allow, 31 exclude
 };
 
 static const char* CONFIG_FILE = "/data/adb/ap/package_config";
 
-static std::mutex writer_mutex;
-static std::atomic<const ConfigData*> config_cache_rcu{nullptr};
+static ConfigData g_config;
+static std::shared_mutex g_config_mutex;
 static std::atomic<int64_t> last_stat_time_ms{0};
 
-static void parse_and_sort_config(int fd, size_t size, ConfigData* new_config) {
+// Macro to extract only the UID from the packed integer
+#define GET_UID(packed) ((packed) & 0x3FFFFFFF)
+
+static void parse_and_sort_config(int fd, size_t size, ConfigData& config) {
     if (size == 0) return;
 
     void* map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -39,50 +40,48 @@ static void parse_and_sort_config(int fd, size_t size, ConfigData* new_config) {
     const char* start = static_cast<const char*>(map);
     const char* end = start + size;
 
-    // Count newlines to preallocate vector and avoid reallocations
-    [[maybe_unused]] size_t lines = 0;
-    const char* p_count = start;
-    while ((p_count = static_cast<const char*>(memchr(p_count, '\n', end - p_count)))) {
-        lines++;
-        p_count++;
-    }
-
     // Skip header: find first newline
     const char* p = static_cast<const char*>(memchr(start, '\n', end - start));
     if (p) {
         p++; // move past header newline
 
-        // Parse backwards from each newline for zero-allocation performance
         while (p < end) {
             const char* line_end = static_cast<const char*>(memchr(p, '\n', end - p));
             if (!line_end) line_end = end;
 
             if (line_end > p) {
                 const char* cursor = line_end - 1;
+                
+                // Safe Reverse Parsing
+                int commas_found = 0;
+                const char* exclude_start = nullptr;
+                const char* allow_start = nullptr;
+                const char* uid_start = nullptr;
 
-                // Extract uid (last component)
-                while (cursor >= p && *cursor != ',') cursor--;
-                if (cursor >= p) {
-                    int uid_val = fast_atoi(cursor + 1);
-
-                    // Extract allow
-                    cursor--;
-                    while (cursor >= p && *cursor != ',') cursor--;
-                    if (cursor >= p) {
-                        int allow_val = fast_atoi(cursor + 1);
-
-                        // Extract exclude
-                        cursor--;
-                        while (cursor >= p && *cursor != ',') cursor--;
-                        if (cursor >= p) {
-                            int exclude_val = fast_atoi(cursor + 1);
-
-                            uint32_t packed = (static_cast<uint32_t>(uid_val) & 0x3FFFFFFF);
-                            if (allow_val == 1) packed |= (1U << 30);
-                            if (exclude_val == 1) packed |= (1U << 31);
-                            new_config->packages.push_back(packed);
+                while (cursor >= p) {
+                    if (*cursor == ',') {
+                        commas_found++;
+                        if (commas_found == 1) uid_start = cursor + 1;
+                        else if (commas_found == 2) allow_start = cursor + 1;
+                        else if (commas_found == 3) {
+                            exclude_start = cursor + 1;
+                            break; // Stop looking, we have our 3 values
                         }
                     }
+                    cursor--;
+                }
+
+                // Only process if we found all exactly 3 fields (pkg, uid, allow, exclude)
+                if (commas_found >= 3 && uid_start && allow_start && exclude_start) {
+                    int uid_val = fast_atoi(uid_start);
+                    int allow_val = fast_atoi(allow_start);
+                    int exclude_val = fast_atoi(exclude_start);
+
+                    uint32_t packed = (static_cast<uint32_t>(uid_val) & 0x3FFFFFFF);
+                    if (allow_val == 1) packed |= (1U << 30);
+                    if (exclude_val == 1) packed |= (1U << 31);
+                    
+                    config.packages.push_back(packed);
                 }
             }
             p = line_end + 1;
@@ -90,12 +89,22 @@ static void parse_and_sort_config(int fd, size_t size, ConfigData* new_config) {
     }
     munmap(map, size);
 
-    if (new_config->packages.size > 0) {
-        ::sort(new_config->packages.data, 
-             new_config->packages.data + new_config->packages.size, 
-             [](const auto& a, const auto& b) {
-                 return a < b;
+    if (config.packages.size > 0) {
+        // Sort purely by UID, ignoring the higher flag bits
+        ::sort(config.packages.data, 
+             config.packages.data + config.packages.size, 
+             [](const uint32_t a, const uint32_t b) {
+                 return GET_UID(a) < GET_UID(b);
              });
+        
+        // Remove duplicates (keep highest priority if needed, or simply unique)
+        size_t unique_count = 1;
+        for (size_t i = 1; i < config.packages.size; ++i) {
+            if (GET_UID(config.packages.data[i]) != GET_UID(config.packages.data[unique_count - 1])) {
+                config.packages.data[unique_count++] = config.packages.data[i];
+            }
+        }
+        config.packages.size = unique_count;
     }
 }
 
@@ -105,7 +114,8 @@ std::optional<Version> detect_version() {
 
     std::call_once(flag, []() {
         char buf[256];
-        auto output = utils::exec_command({"apd", "-V"}, buf, sizeof(buf));
+        const char* args[] = {"apd", "-V", nullptr};
+        auto output = utils::exec_command(args, buf, sizeof(buf));
         if (!output) return;
 
         const char* p = buf;
@@ -125,63 +135,60 @@ std::optional<Version> detect_version() {
 }
 
 void refresh_cache() {
-    struct timespec now_ts;
-    clock_gettime(CLOCK_MONOTONIC, &now_ts);
-    int64_t now_ms = now_ts.tv_sec * 1000LL + now_ts.tv_nsec / 1000000LL;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now_ms = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 
-    auto cached_data = config_cache_rcu.load(std::memory_order_acquire);
-    if (cached_data && now_ms - last_stat_time_ms.load(std::memory_order_relaxed) < 2000) return;
+    // Prevent excessive disk stats
+    if (now_ms - last_stat_time_ms.load(std::memory_order_relaxed) < 2000) return;
 
     struct stat st;
     if (stat(CONFIG_FILE, &st) != 0) return;
 
     last_stat_time_ms.store(now_ms, std::memory_order_relaxed);
 
-    if (cached_data) {
-        if (cached_data->mtim.tv_sec == st.st_mtim.tv_sec &&
-            cached_data->mtim.tv_nsec == st.st_mtim.tv_nsec) return;
+    // Fast Check (Read Lock)
+    {
+        std::shared_lock<std::shared_mutex> read_lock(g_config_mutex);
+        if (g_config.mtim.tv_sec == st.st_mtim.tv_sec &&
+            g_config.mtim.tv_nsec == st.st_mtim.tv_nsec) {
+            return;
+        }
     }
 
-    std::lock_guard<std::mutex> lock(writer_mutex);
+    // Slow Update (Write Lock)
+    std::unique_lock<std::shared_mutex> write_lock(g_config_mutex);
 
-    // Double check after acquiring the lock
-    cached_data = config_cache_rcu.load(std::memory_order_acquire);
-    if (cached_data && cached_data->mtim.tv_sec == st.st_mtim.tv_sec &&
-        cached_data->mtim.tv_nsec == st.st_mtim.tv_nsec) return;
+    // Double-check to prevent concurrent rebuilds
+    if (g_config.mtim.tv_sec == st.st_mtim.tv_sec &&
+        g_config.mtim.tv_nsec == st.st_mtim.tv_nsec) {
+        return;
+    }
 
     UniqueFd fd(open(CONFIG_FILE, O_RDONLY | O_CLOEXEC));
     if (fd < 0) return;
 
-    // Allocate raw pointer to avoid NDK shared_ptr atomic limitation
-    ConfigData* new_config = new ConfigData();
-    new_config->mtim = st.st_mtim;
+    // Safe in-place rebuild. Reusing the old vector buffer is memory efficient
+    g_config.packages.clear(); 
+    g_config.mtim = st.st_mtim;
 
-    parse_and_sort_config(fd, st.st_size, new_config);
-
-    // Store new configuration
-    (void)config_cache_rcu.exchange(new_config, std::memory_order_release);
-
-    // Defer deletion of old_config. In a strict daemon environment with extremely
-    // rare updates, leaking a few KB is safer than risking a Use-After-Free.
-    // However, if we know threads finish quickly, we could theoretically delete old_config here.
-    // For maximum safety without a hazard pointer framework, we leave it orphaned.
-
-    return;
+    parse_and_sort_config(fd, st.st_size, g_config);
 }
 
-static uint32_t find_package(const ConfigData* config, int32_t uid) {
-    if (!config || config->packages.size == 0) return 0;
+static uint32_t find_package(const ConfigData& config, int32_t uid) {
+    if (config.packages.size == 0) return 0;
 
     uint32_t target = static_cast<uint32_t>(uid) & 0x3FFFFFFF;
+    
     auto cmp_apatch_search = [](const void* key, const void* element) -> int {
         uint32_t k = *(static_cast<const uint32_t*>(key));
-        uint32_t e = *(static_cast<const uint32_t*>(element)) & 0x3FFFFFFF;
+        uint32_t e = GET_UID(*(static_cast<const uint32_t*>(element)));
         if (k < e) return -1;
         if (k > e) return 1;
         return 0;
     };
 
-    void* result = bsearch(&target, config->packages.data, config->packages.size, sizeof(uint32_t), cmp_apatch_search);
+    void* result = bsearch(&target, config.packages.data, config.packages.size, sizeof(uint32_t), cmp_apatch_search);
 
     if (result) {
         return *(static_cast<uint32_t*>(result));
@@ -190,16 +197,14 @@ static uint32_t find_package(const ConfigData* config, int32_t uid) {
 }
 
 bool uid_granted_root(int32_t uid) {
-    auto config = config_cache_rcu.load(std::memory_order_acquire);
-    if (!config) return false;
-    uint32_t pkg = find_package(config, uid);
+    std::shared_lock<std::shared_mutex> lock(g_config_mutex);
+    uint32_t pkg = find_package(g_config, uid);
     return (pkg & (1U << 30)) != 0;
 }
 
 bool uid_should_umount(int32_t uid) {
-    auto config = config_cache_rcu.load(std::memory_order_acquire);
-    if (!config) return false;
-    uint32_t pkg = find_package(config, uid);
+    std::shared_lock<std::shared_mutex> lock(g_config_mutex);
+    uint32_t pkg = find_package(g_config, uid);
     return (pkg & (1U << 31)) != 0;
 }
 

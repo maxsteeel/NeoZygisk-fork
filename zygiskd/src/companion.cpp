@@ -1,4 +1,4 @@
-#include "companion.hpp"
+#include "main.hpp"
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -6,68 +6,88 @@
 #include <sys/stat.h>
 #include <dlfcn.h>
 #include <cstring>
-#include <thread>
+#include <cstdlib>
 
 #include "logging.hpp"
 #include "socket_utils.hpp"
 #include "utils.hpp"
-#include "daemon.hpp" // For UniqueFd
+#include "daemon.hpp" 
 
 namespace companion {
 
-// The function signature for a module's companion entry point.
 typedef void (*ZygiskCompanionEntryFn)(int);
 
-static void handle_client(UniqueFd stream, ZygiskCompanionEntryFn entry) {
-    // Stat the socket before handing it off to the module.
-    struct stat st0;
-    bool pre_stat_ok = (fstat(stream, &st0) == 0);
+struct alignas(void*) ClientData {
+    int fd;
+    ZygiskCompanionEntryFn entry;
+};
 
-    // Call into the module's code.
-    entry(stream);
+static char* build_proc_fd_path(char* buf_end, int fd) {
+    char* ptr = buf_end - 1;
+    *ptr = '\0'; // Null terminator
 
-    // After the module code returns, check if the file descriptor is still valid
-    // and points to the same underlying file. This prevents us from accidentally
-    // closing a new file descriptor if the module closed the original one and
-    // the OS reused the FD number.
-    if (pre_stat_ok) {
-        struct stat st1;
-        if (fstat(stream, &st1) == 0) {
-            // If the device and inode numbers don't match, the FD has been reused.
-            if (st0.st_dev != st1.st_dev || st0.st_ino != st1.st_ino) {
-                stream.release(); // The FD was reused. Release the control to not close it.
-                return;
-            }
-        } else {
-            stream.release(); // The FD was already closed. Release so as not to do a double close().
-            return;
-        }
-    }
-    // If the function terminates normally without doing 'release()',
-    // the UniqueFd does automatic and safe close().
+    // We write the number from back to front
+    do {
+        *(--ptr) = '0' + (fd % 10);
+        fd /= 10;
+    } while (fd > 0);
+
+    // We write the prefix before the number.
+    ptr -= 14;
+    __builtin_memcpy(ptr, "/proc/self/fd/", 14);
+
+    return ptr; // We return the exact start of the chain
 }
 
-static ZygiskCompanionEntryFn load_module_entry(UniqueFd fd) {
-    char path[256];
-    snprintf(path, sizeof(path), "/proc/self/fd/%d", (int)fd);
+static void* handle_client_thread(void* arg) {
+    ClientData data = *static_cast<ClientData*>(arg);
+    free(arg);
+
+    int raw_fd = data.fd;
+    struct stat st0, st1;
+    bool pre_stat_ok = (fstat(raw_fd, &st0) == 0);
+
+    // Call into the module's code.
+    data.entry(raw_fd);
+    bool should_close = true;
+
+    if (pre_stat_ok) {
+        if (fstat(raw_fd, &st1) == 0) {
+            // If device/inode changed, the module closed it and the OS reused the FD number.
+            if (st0.st_dev != st1.st_dev || st0.st_ino != st1.st_ino) {
+                should_close = false; 
+            }
+        } else {
+            // fstat failed, meaning the FD is already closed.
+            should_close = false;
+        }
+    }
+
+    if (should_close) close(raw_fd);
+
+    mallopt(M_PURGE, 0);
+
+    return nullptr;
+}
+
+static ZygiskCompanionEntryFn load_module_entry(UniqueFd library_fd) {
+    char path_buf[64];
+    const char* path = build_proc_fd_path(path_buf + sizeof(path_buf), (int)library_fd);
 
     void* handle = dlopen(path, RTLD_NOW);
     if (!handle) {
-        LOGE("load_module_entry: dlopen failed: %s", dlerror());
+        const char* err = dlerror();
+        LOGE("load_module_entry: dlopen failed: %s", err ? err : "Unknown error");
         return nullptr;
     }
 
     void* entry_ptr = dlsym(handle, "zygisk_companion_entry");
-    if (!entry_ptr) {
-        // Module has no companion entry point
-        return nullptr;
-    }
+    if (!entry_ptr) return nullptr;
 
     return reinterpret_cast<ZygiskCompanionEntryFn>(entry_ptr);
 }
 
 static void run_companion(int fd) {
-    // 1. Receive module name and library FD from the main daemon.
     char name[256];
     socket_utils::read_string(fd, name, sizeof(name));
     UniqueFd library_fd(socket_utils::recv_fd(fd));
@@ -78,58 +98,45 @@ static void run_companion(int fd) {
         return;
     }
 
-    // 2. Dynamically load the module library and find its companion entry point.
     ZygiskCompanionEntryFn entry_fn = load_module_entry(std::move(library_fd));
 
     if (entry_fn) {
         LOGD("Companion entry point found for module `%s`", name);
-        // Signal success back to the daemon.
         socket_utils::write_u8(fd, 1);
     } else {
         LOGD("Module `%s` has no companion entry point or failed to load.", name);
-        // Signal failure and exit.
         socket_utils::write_u8(fd, 0);
         return;
     }
 
-    // 3. Main loop: wait for requests from the module code injected in apps.
+    // Main loop
     while (true) {
-        // Block until the daemon socket is readable or closed.
-        if (!utils::is_socket_alive(fd)) {
-            LOGI("Daemon socket closed, terminating companion for `%s`.", name);
-            break;
-        }
-
-        // Receive a client socket FD from the daemon.
         UniqueFd client_fd(socket_utils::recv_fd(fd));
         if (client_fd < 0) {
-            LOGE("Failed to receive client FD for module `%s`", name);
+            LOGI("Daemon socket closed or error, terminating companion for `%s`.", name);
             break;
         }
 
         LOGV("New companion request for module `%s` on fd=`%d`", name, (int)client_fd);
+        socket_utils::write_u8((int)client_fd, 1);
 
-        // Let the client know we've received the request.
-        socket_utils::write_u8(client_fd, 1);
-
-        // Spawn a new thread to handle this client.
-        int raw_client = client_fd.release();
-        spawn_thread([raw_client, entry_fn]() {
-            handle_client(UniqueFd(raw_client), entry_fn);
-            
-    #ifdef M_PURGE
-            // Force the allocator to release cached free memory back to the OS
-            // after the companion client disconnects and the thread finishes.
-            mallopt(M_PURGE, 0);
-    #endif
-        });
+        // malloc is fast, but aligning the struct to pointer boundaries guarantees single-cycle memory fetches
+        ClientData* data = static_cast<ClientData*>(malloc(sizeof(ClientData)));
+        if (data) {
+            data->fd = client_fd.release();
+            data->entry = entry_fn;
+            spawn_thread(handle_client_thread, data);
+        } else {
+            LOGE("Companion: Failed to allocate memory for thread data.");
+            // UniqueFd will auto-close client_fd if malloc fails.
+        }
     }
 }
 
 void entry(int raw_fd) {
     UniqueFd fd(raw_fd);
     LOGI("Companion process started with fd=%d", (int)fd);
-    run_companion(fd);
+    run_companion((int)fd);
     LOGI("Companion process exiting.");
 }
 

@@ -1,22 +1,18 @@
-#include "magisk.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
-#include <vector>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <mutex>
 #include <shared_mutex>
-#include <algorithm>
 #include <dlfcn.h>
 
+#include "root_impl.hpp"
 #include "constants.hpp"
 #include "logging.hpp"
-#include "daemon.hpp" // UniqueFd
-#include "utils.hpp" // UniquePipe, StringList, IntList
+#include "daemon.hpp" 
+#include "utils.hpp" 
 
 namespace magisk {
 
@@ -45,12 +41,8 @@ static std::once_flag variant_flag;
 static char magisk_variant_pkg[128] = {0};
 
 // --- Native SQLite Implementation ---
-
-// Function pointer types for dynamically loading SQLite
 typedef int (*sqlite3_open_t)(const char*, void**);
 typedef int (*sqlite3_prepare_v2_t)(void*, const char*, int, void**, const char**);
-typedef int (*sqlite3_bind_text_t)(void*, int, const char*, int, void (*)(void*));
-typedef int (*sqlite3_bind_int_t)(void*, int, int);
 typedef int (*sqlite3_step_t)(void*);
 typedef int (*sqlite3_finalize_t)(void*);
 typedef int (*sqlite3_close_t)(void*);
@@ -58,31 +50,22 @@ typedef const unsigned char* (*sqlite3_column_text_t)(void*, int);
 
 #define SQLITE_OK 0
 #define SQLITE_ROW 100
-#define SQLITE_TRANSIENT ((void (*)(void*)) - 1)
 
-// Caches the loaded library handle and resolved function pointers
 struct SQLiteLibrary {
     void* handle = nullptr;
     sqlite3_open_t fn_open = nullptr;
     sqlite3_prepare_v2_t fn_prepare = nullptr;
-    sqlite3_bind_text_t fn_bind_text = nullptr;
-    sqlite3_bind_int_t fn_bind_int = nullptr;
     sqlite3_step_t fn_step = nullptr;
     sqlite3_finalize_t fn_finalize = nullptr;
     sqlite3_close_t fn_close = nullptr;
     sqlite3_column_text_t fn_column_text = nullptr;
 
     SQLiteLibrary() {
-        // Load Android's native SQLite library dynamically to avoid bloating the binary
         handle = dlopen("libsqlite.so", RTLD_NOW);
-        if (!handle) {
-            LOGW("Failed to dlopen libsqlite.so");
-            return;
-        }
+        if (!handle) return;
+        
         fn_open = (sqlite3_open_t)dlsym(handle, "sqlite3_open");
         fn_prepare = (sqlite3_prepare_v2_t)dlsym(handle, "sqlite3_prepare_v2");
-        fn_bind_text = (sqlite3_bind_text_t)dlsym(handle, "sqlite3_bind_text");
-        fn_bind_int = (sqlite3_bind_int_t)dlsym(handle, "sqlite3_bind_int");
         fn_step = (sqlite3_step_t)dlsym(handle, "sqlite3_step");
         fn_finalize = (sqlite3_finalize_t)dlsym(handle, "sqlite3_finalize");
         fn_close = (sqlite3_close_t)dlsym(handle, "sqlite3_close");
@@ -95,160 +78,70 @@ struct SQLiteLibrary {
     }
 };
 
-// Lightweight wrapper to interact with Android's native libsqlite.so
 class MagiskDB {
 private:
     void* db = nullptr;
-
-    sqlite3_open_t fn_open = nullptr;
-    sqlite3_prepare_v2_t fn_prepare = nullptr;
-    sqlite3_bind_text_t fn_bind_text = nullptr;
-    sqlite3_bind_int_t fn_bind_int = nullptr;
-    sqlite3_step_t fn_step = nullptr;
-    sqlite3_finalize_t fn_finalize = nullptr;
-    sqlite3_close_t fn_close = nullptr;
-    sqlite3_column_text_t fn_column_text = nullptr;
+    const SQLiteLibrary& lib;
 
 public:
-    MagiskDB() {
-        const auto& lib = SQLiteLibrary::get();
-        if (!lib.handle) return;
-
-        fn_open = lib.fn_open;
-        fn_prepare = lib.fn_prepare;
-        fn_bind_text = lib.fn_bind_text;
-        fn_bind_int = lib.fn_bind_int;
-        fn_step = lib.fn_step;
-        fn_finalize = lib.fn_finalize;
-        fn_close = lib.fn_close;
-        fn_column_text = lib.fn_column_text;
-
-        if (fn_open && fn_close) {
-            // Open the Magisk database in read-only mode if possible
-            if (fn_open("/data/adb/magisk.db", &db) != SQLITE_OK) {
-                LOGW("Failed to open /data/adb/magisk.db natively");
-                db = nullptr;
-            }
+    MagiskDB() : lib(SQLiteLibrary::get()) {
+        if (lib.fn_open && lib.fn_close) {
+            if (lib.fn_open("/data/adb/magisk.db", &db) != SQLITE_OK) db = nullptr;
         }
     }
 
     ~MagiskDB() {
-        if (db && fn_close) fn_close(db);
+        if (db && lib.fn_close) lib.fn_close(db);
     }
 
     bool is_valid() const { return db != nullptr; }
 
-    // Executes a query and returns true if at least one row is found
-    bool check_exists(const char* query) {
-        if (!is_valid() || !fn_prepare || !fn_step || !fn_finalize) return false;
+    void load_policies(IntList& uids) {
+        if (!is_valid() || !lib.fn_prepare || !lib.fn_step || !lib.fn_column_text || !lib.fn_finalize) return;
         void* stmt = nullptr;
-        bool result = false;
-
-        if (fn_prepare(db, query, -1, &stmt, nullptr) == SQLITE_OK) {
-            if (fn_step(stmt) == SQLITE_ROW) {
-                result = true;
+        if (lib.fn_prepare(db, "SELECT uid FROM policies WHERE policy=2", -1, &stmt, nullptr) == SQLITE_OK) {
+            while (lib.fn_step(stmt) == SQLITE_ROW) {
+                const char* text = (const char*)lib.fn_column_text(stmt, 0);
+                if (text) uids.push_back(fast_atoi(text));
             }
-            fn_finalize(stmt);
+            lib.fn_finalize(stmt);
         }
-        return result;
     }
 
-    bool check_exists(const char* query, int arg) {
-        if (!is_valid() || !fn_prepare || !fn_bind_int || !fn_step || !fn_finalize) return false;
+    void load_denylist(StringList& pkgs) {
+        if (!is_valid() || !lib.fn_prepare || !lib.fn_step || !lib.fn_column_text || !lib.fn_finalize) return;
+        void* stmt = nullptr;
+        if (lib.fn_prepare(db, "SELECT package_name FROM denylist", -1, &stmt, nullptr) == SQLITE_OK) {
+            while (lib.fn_step(stmt) == SQLITE_ROW) {
+                const char* text = (const char*)lib.fn_column_text(stmt, 0);
+                if (text) pkgs.push_back(text); 
+            }
+            lib.fn_finalize(stmt);
+        }
+    }
+
+    bool get_requester(char* out_buf, size_t max_len) {
+        if (!is_valid() || !lib.fn_prepare || !lib.fn_step || !lib.fn_column_text || !lib.fn_finalize) return false;
         void* stmt = nullptr;
         bool result = false;
-
-        if (fn_prepare(db, query, -1, &stmt, nullptr) == SQLITE_OK) {
-            if (fn_bind_int(stmt, 1, arg) == SQLITE_OK) {
-                if (fn_step(stmt) == SQLITE_ROW) {
+        if (lib.fn_prepare(db, "SELECT value FROM strings WHERE key='requester' LIMIT 1", -1, &stmt, nullptr) == SQLITE_OK) {
+            if (lib.fn_step(stmt) == SQLITE_ROW) {
+                const char* text = (const char*)lib.fn_column_text(stmt, 0);
+                if (text) {
+                    strlcpy(out_buf, text, max_len);
                     result = true;
                 }
             }
-            fn_finalize(stmt);
-        }
-        return result;
-    }
-
-    bool check_exists(const char* query, const char* arg) {
-        if (!is_valid() || !fn_prepare || !fn_bind_text || !fn_step || !fn_finalize) return false;
-        void* stmt = nullptr;
-        bool result = false;
-
-        if (fn_prepare(db, query, -1, &stmt, nullptr) == SQLITE_OK) {
-            fn_bind_text(stmt, 1, arg, -1, SQLITE_TRANSIENT);
-            if (fn_step(stmt) == SQLITE_ROW) {
-                result = true;
-            }
-            fn_finalize(stmt);
-        }
-        return result;
-    }
-
-    // Executes a query and copies the first column of the first row into out_buf
-    bool get_string(const char* query, char* out_buf, size_t max_len) {
-        if (!is_valid() || !fn_prepare || !fn_step || !fn_column_text || !fn_finalize) return false;
-        void* stmt = nullptr;
-        bool result = false;
-
-        if (fn_prepare(db, query, -1, &stmt, nullptr) == SQLITE_OK) {
-            if (fn_step(stmt) == SQLITE_ROW) {
-                const unsigned char* text = fn_column_text(stmt, 0);
-                if (text) {
-                    strlcpy(out_buf, (const char*)text, max_len);
-                    result = true;
-                }
-            }
-            fn_finalize(stmt);
-        }
-        return result;
-    }
-
-    IntList get_int_list(const char* query) {
-        IntList result;
-        if (!is_valid() || !fn_prepare || !fn_step || !fn_column_text || !fn_finalize) return result;
-        void* stmt = nullptr;
-
-        if (fn_prepare(db, query, -1, &stmt, nullptr) == SQLITE_OK) {
-            while (fn_step(stmt) == SQLITE_ROW) {
-                const char* text = (const char*)fn_column_text(stmt, 0);
-                if (text) {
-                    result.push_back(fast_atoi(text));
-                }
-            }
-            fn_finalize(stmt);
-        }
-        return result;
-    }
-
-    StringList get_string_list(const char* query) {
-        StringList result;
-        if (!is_valid() || !fn_prepare || !fn_step || !fn_column_text || !fn_finalize) return result;
-        void* stmt = nullptr;
-
-        if (fn_prepare(db, query, -1, &stmt, nullptr) == SQLITE_OK) {
-            while (fn_step(stmt) == SQLITE_ROW) {
-                const char* text = (const char*)fn_column_text(stmt, 0);
-                if (text) {
-                    result.push_back(text);
-                }
-            }
-            fn_finalize(stmt);
+            lib.fn_finalize(stmt);
         }
         return result;
     }
 };
 
-static inline int cmp_int(const void* a, const void* b) {
-    return (*(int32_t*)a - *(int32_t*)b);
-}
-
-static inline int cmp_str(const void* a, const void* b) {
-    return strcmp(*(const char**)a, *(const char**)b);
-}
+// --- Lightweight Sorting & Deduplication ---
 
 static void sort_pkgs(StringList& list) {
-    if (list.size == 0) return;
-
+    if (list.size <= 1) return;
     ::sort(list.data, list.data + list.size, [](const char* a, const char* b) {
         return strcmp(a, b) < 0;
     });
@@ -265,8 +158,7 @@ static void sort_pkgs(StringList& list) {
 }
 
 static void sort_uids(IntList& list) {
-    if (list.size == 0) return;
-
+    if (list.size <= 1) return;
     ::sort(list.data, list.data + list.size, [](int32_t a, int32_t b) {
         return a < b;
     });
@@ -280,22 +172,30 @@ static void sort_uids(IntList& list) {
     list.size = unique_count;
 }
 
-static bool list_contains_uid(auto& list, int32_t value) {
+static inline int cmp_int(const void* a, const void* b) {
+    return (*(int32_t*)a - *(int32_t*)b);
+}
+
+static inline int cmp_str(const void* a, const void* b) {
+    return strcmp(*(const char**)a, *(const char**)b);
+}
+
+static bool list_contains_uid(const IntList& list, int32_t value) {
     if (list.size == 0) return false;
     return bsearch(&value, list.data, list.size, sizeof(int32_t), cmp_int) != nullptr;
 }
 
-static bool list_contains_pkg(auto& list, auto value) {
+static bool list_contains_pkg(const StringList& list, const char* value) {
     if (list.size == 0) return false;
     return bsearch(&value, list.data, list.size, sizeof(char*), cmp_str) != nullptr;
 }
 
 // --- General Magisk Detection ---
-
 static void detect_variant() {
     std::call_once(variant_flag, []() {
         char buf[256];
-        if (utils::exec_command({"magisk", "-v"}, buf, sizeof(buf))) {
+        const char* args[] = {"magisk", "-v", nullptr};
+        if (utils::exec_command(args, buf, sizeof(buf))) {
             for (const auto& pair : MAGISK_THIRD_PARTIES) {
                 if (strstr(buf, pair.first) != nullptr) {
                     LOGI("Detected Magisk variant: %s", pair.first);
@@ -304,164 +204,96 @@ static void detect_variant() {
                 }
             }
         }
-        LOGI("Detected official Magisk variant.");
         strlcpy(magisk_variant_pkg, MAGISK_OFFICIAL_PKG, sizeof(magisk_variant_pkg));
     });
 }
 
 std::optional<Version> detect_version() {
     char buf[256];
-    if (!utils::exec_command({"magisk", "-V"}, buf, sizeof(buf))) {
-        return std::nullopt;
-    }
+    const char* args[] = {"magisk", "-V", nullptr};
+    if (!utils::exec_command(args, buf, sizeof(buf))) return std::nullopt;
 
     int version = fast_atoi(buf);
     detect_variant();
 
-    if (version >= MIN_MAGISK_VERSION) {
-        return Version::Supported;
-    } else {
-        return Version::TooOld;
+    return (version >= MIN_MAGISK_VERSION) ? Version::Supported : Version::TooOld;
+}
+
+// --- Hyper-Fast Path Builder ---
+static void build_manager_path(char* out_buf, const char* pkg_name) {
+    // "/data/user_de/0/" is exactly 16 bytes
+    __builtin_memcpy(out_buf, "/data/user_de/0/", 16);
+    char* ptr = out_buf + 16;
+    while (*pkg_name) *ptr++ = *pkg_name++;
+    *ptr = '\0';
+}
+
+// --- Zero-Copy Fast Parser (Replaces fgets) ---
+static void parse_packages_list() {
+    UniqueFd fd(open("/data/system/packages.list", O_RDONLY | O_CLOEXEC));
+    if (fd < 0) return;
+
+    char buf[4096];
+    char line[512];
+    size_t line_pos = 0;
+    ssize_t bytes_read;
+
+    while ((bytes_read = read(fd, buf, sizeof(buf))) > 0) {
+        for (ssize_t i = 0; i < bytes_read; ++i) {
+            char c = buf[i];
+            if (c == '\n' || line_pos >= sizeof(line) - 1) {
+                line[line_pos] = '\0';
+                if (line_pos > 0) {
+                    char* ptr = line;
+                    while (*ptr > ' ') ++ptr; // Find end of package name
+                    if (*ptr != '\0') {
+                        *ptr = '\0'; // Null-terminate pkg name natively
+                        ++ptr;
+                        while (*ptr == ' ') ++ptr; // Skip spaces to UID
+                        
+                        int32_t parsed_uid = fast_atoi(ptr);
+                        if (parsed_uid > 0) {
+                            g_cache.all_known_uids.push_back(parsed_uid);
+                            if (list_contains_pkg(g_cache.denylist_pkgs, line)) {
+                                g_cache.denylist_uids.push_back(parsed_uid);
+                            }
+                        }
+                    }
+                }
+                line_pos = 0;
+            } else {
+                line[line_pos++] = c;
+            }
+        }
     }
+    sort_uids(g_cache.all_known_uids);
+    sort_uids(g_cache.denylist_uids);
 }
 
 // --- High-Performance Database Queries ---
-
-static bool cache_update_required(struct stat* db_st, struct stat* pkg_st) {
-    bool db_ok = (stat("/data/adb/magisk.db", db_st) == 0);
-    bool pkg_ok = (stat("/data/system/packages.list", pkg_st) == 0);
-
-    if (!db_ok) db_st->st_mtim = {0, -1};
-    if (!pkg_ok) pkg_st->st_mtim = {0, -1};
-
-    std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
-    return g_cache.db_mtime.tv_sec != db_st->st_mtim.tv_sec ||
-           g_cache.db_mtime.tv_nsec != db_st->st_mtim.tv_nsec ||
-           g_cache.pkg_mtime.tv_sec != pkg_st->st_mtim.tv_sec ||
-           g_cache.pkg_mtime.tv_nsec != pkg_st->st_mtim.tv_nsec ||
-           (db_ok && g_cache.db_mtime.tv_nsec == -1) ||
-           (pkg_ok && g_cache.pkg_mtime.tv_nsec == -1) ||
-           !g_cache.manager_resolved; // We will set this to true after attempting to resolve once
-}
-
-static void fetch_from_magisk_db(MagiskDB& db, StringList& denylist_pkgs) {
-    g_cache.granted_uids = db.get_int_list("SELECT uid FROM policies WHERE policy=2");
-    sort_uids(g_cache.granted_uids);
-
-    denylist_pkgs = db.get_string_list("SELECT package_name FROM denylist");
-
-    char val[128];
-    if (db.get_string("SELECT value FROM strings WHERE key='requester' LIMIT 1", val, sizeof(val))) {
-        char path[256];
-        snprintf(path, sizeof(path), "/data/user_de/0/%s", val);
-        struct stat st;
-        if (stat(path, &st) == 0) {
-            g_cache.manager_uid = st.st_uid;
-        }
-    }
-}
-
-static void fetch_from_magisk_sqlite_fallback(StringList& denylist_pkgs) {
-    char buf[256];
-    if (utils::exec_command({"magisk", "--sqlite", "SELECT uid FROM policies WHERE policy=2"}, buf, sizeof(buf))) {
-        const char* out = buf;
-        while ((out = strstr(out, "uid=")) != nullptr) {
-            out += 4;
-            int32_t parsed_uid = fast_atoi(out);
-            if (parsed_uid > 0) g_cache.granted_uids.push_back(parsed_uid);
-            const char* next_line = strchr(out, '\n');
-            if (!next_line) break;
-            out = next_line + 1;
-        }
-        sort_uids(g_cache.granted_uids);
-    }
-
-    if (utils::exec_command({"magisk", "--sqlite", "SELECT package_name FROM denylist"}, buf, sizeof(buf))) {
-        char* line = buf;
-        while (line && *line) {
-            char* name_start = strstr(line, "package_name=");
-            if (name_start) {
-                name_start += 13;
-                char* name_end = strchr(name_start, '\n');
-                if (name_end) {
-                    *name_end = '\0';
-                    denylist_pkgs.push_back(name_start);
-                    line = name_end + 1;
-                } else {
-                    denylist_pkgs.push_back(name_start);
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    if (utils::exec_command({"magisk", "--sqlite", "SELECT value FROM strings WHERE key='requester' LIMIT 1"}, buf, sizeof(buf))) {
-        char* val_start = strstr(buf, "value=");
-        if (val_start) {
-            val_start += 6;
-            char* val_end = strchr(val_start, '\n');
-            if (val_end) {
-                *val_end = '\0';
-            }
-            if (*val_start != '\0') {
-                char path[256];
-                snprintf(path, sizeof(path), "/data/user_de/0/%s", val_start);
-                struct stat st;
-                if (stat(path, &st) == 0) {
-                    g_cache.manager_uid = st.st_uid;
-                }
-            }
-        }
-    }
-}
-
-static void resolve_manager_uid() {
-    if (g_cache.manager_uid == -1 && magisk_variant_pkg[0] != '\0') {
-        char path[256];
-        snprintf(path, sizeof(path), "/data/user_de/0/%s", magisk_variant_pkg);
-        struct stat st;
-        if (stat(path, &st) == 0) {
-            g_cache.manager_uid = st.st_uid;
-        }
-    }
-}
-
-static void parse_packages_list() {
-    UniqueFile fp(fopen("/data/system/packages.list", "re"));
-    if (fp) {
-        char line[1024];
-        while (fgets(line, sizeof(line), fp)) {
-            char* space1 = strchr(line, ' ');
-            if (!space1) continue;
-
-            std::string_view pkg_name(line, space1 - line);
-
-            char* uid_str = space1 + 1;
-            char* space2 = strchr(uid_str, ' ');
-            if (space2) *space2 = '\0';
-
-            int32_t parsed_uid = fast_atoi(uid_str);
-            g_cache.all_known_uids.push_back(parsed_uid);
-
-            if (bsearch(&pkg_name, g_cache.denylist_pkgs.data, g_cache.denylist_pkgs.size, sizeof(char*), cmp_str) != nullptr) {
-                g_cache.denylist_uids.push_back(parsed_uid);
-            }
-        }
-        sort_uids(g_cache.all_known_uids); 
-        sort_uids(g_cache.denylist_uids);
-    }
-}
-
 void refresh_cache() {
     struct stat db_st, pkg_st;
-    if (!cache_update_required(&db_st, &pkg_st)) {
-        return;
+    bool db_ok = (stat("/data/adb/magisk.db", &db_st) == 0);
+    bool pkg_ok = (stat("/data/system/packages.list", &pkg_st) == 0);
+
+    if (!db_ok) db_st.st_mtim = {0, -1};
+    if (!pkg_ok) pkg_st.st_mtim = {0, -1};
+
+    // Fast check (Shared lock)
+    {
+        std::shared_lock<std::shared_mutex> read_lock(g_cache_mutex);
+        if (g_cache.db_mtime.tv_sec == db_st.st_mtim.tv_sec &&
+            g_cache.db_mtime.tv_nsec == db_st.st_mtim.tv_nsec &&
+            g_cache.pkg_mtime.tv_sec == pkg_st.st_mtim.tv_sec &&
+            g_cache.pkg_mtime.tv_nsec == pkg_st.st_mtim.tv_nsec &&
+            g_cache.manager_resolved) {
+            return;
+        }
     }
 
-    std::unique_lock<std::shared_mutex> lock(g_cache_mutex);
-    // Double-check after acquiring write lock
+    // Heavy update (Unique lock)
+    std::unique_lock<std::shared_mutex> write_lock(g_cache_mutex);
+    
     if (g_cache.db_mtime.tv_sec == db_st.st_mtim.tv_sec &&
         g_cache.db_mtime.tv_nsec == db_st.st_mtim.tv_nsec &&
         g_cache.pkg_mtime.tv_sec == pkg_st.st_mtim.tv_sec &&
@@ -472,30 +304,36 @@ void refresh_cache() {
 
     g_cache.granted_uids.clear();
     g_cache.denylist_uids.clear();
-    g_cache.denylist_pkgs.clear();
+    g_cache.denylist_pkgs.clear(); // StringList destructor calls free on elements
     g_cache.all_known_uids.clear();
     g_cache.manager_uid = -1;
-    g_cache.manager_resolved = false;
 
     MagiskDB db;
-    StringList denylist_pkgs;
-
     if (db.is_valid()) {
-        fetch_from_magisk_db(db, denylist_pkgs);
+        db.load_policies(g_cache.granted_uids);
+        db.load_denylist(g_cache.denylist_pkgs);
+
+        char requester[128];
+        if (db.get_requester(requester, sizeof(requester))) {
+            char path[256];
+            build_manager_path(path, requester);
+            struct stat st;
+            if (stat(path, &st) == 0) g_cache.manager_uid = st.st_uid;
+        }
     } else {
-        // Fallback for libsqlite.so failure using magisk --sqlite
-        fetch_from_magisk_sqlite_fallback(denylist_pkgs);
+        LOGE("NATIVE SQLITE FAILED. Fallback disabled for stability.");
     }
 
-    resolve_manager_uid();
+    sort_uids(g_cache.granted_uids);
+    sort_pkgs(g_cache.denylist_pkgs);
 
-    // Mark manager resolution as attempted to prevent infinite cache thrashing
+    if (g_cache.manager_uid == -1 && magisk_variant_pkg[0] != '\0') {
+        char path[256];
+        build_manager_path(path, magisk_variant_pkg);
+        struct stat st;
+        if (stat(path, &st) == 0) g_cache.manager_uid = st.st_uid;
+    }
     g_cache.manager_resolved = true;
-
-    // Resolve denylist packages to UIDs via packages.list once
-    // and track all known UIDs to prevent fallback N+1 executions
-    sort_pkgs(denylist_pkgs);
-    g_cache.denylist_pkgs = std::move(denylist_pkgs);
 
     parse_packages_list();
 
@@ -503,9 +341,66 @@ void refresh_cache() {
     g_cache.pkg_mtime = pkg_st.st_mtim;
 }
 
-static bool is_valid_pkg_name(const std::string_view& pkg_name) {
-    if (pkg_name.empty() || pkg_name.length() > 255) return false;
-    for (char c : pkg_name) {
+// Fixed fast XML parser
+static bool get_package_by_uid_from_xml(int32_t uid, char* out_pkg_name, size_t max_len) {
+    UniqueFd fd(open("/data/system/packages.xml", O_RDONLY | O_CLOEXEC));
+    if (fd < 0) return false;
+
+    char target_uid[32];
+    int32_t app_id = uid % 100000;
+    
+    // Reverse integer build for extreme speed
+    char* ptr = target_uid + sizeof(target_uid) - 1;
+    *ptr = '\0';
+    *(--ptr) = '"';
+    do {
+        *(--ptr) = '0' + (app_id % 10);
+        app_id /= 10;
+    } while (app_id > 0);
+    const char* prefix = "userId=\"";
+    ptr -= 8;
+    __builtin_memcpy(ptr, prefix, 8);
+    size_t target_len = (target_uid + sizeof(target_uid) - 1) - ptr;
+
+    // Buffer read to avoid SIGBUS from mmap
+    char buf[8192];
+    ssize_t bytes_read;
+    bool found = false;
+
+    while (!found && (bytes_read = read(fd, buf, sizeof(buf) - 1)) > 0) {
+        buf[bytes_read] = '\0'; 
+        
+        const char* pos = (const char*)memmem(buf, bytes_read, ptr, target_len);
+        if (pos) {
+            const char* cur = pos;
+            while (cur > buf && *cur != '<') cur--;
+
+            const char* name_pos = (const char*)memmem(cur, pos - cur, "name=\"", 6);
+            if (name_pos) {
+                name_pos += 6;
+                const char* end_pos = (const char*)memchr(name_pos, '\"', pos - name_pos);
+                if (end_pos) {
+                    size_t name_len = end_pos - name_pos;
+                    if (name_len < max_len) {
+                        __builtin_memcpy(out_pkg_name, name_pos, name_len);
+                        out_pkg_name[name_len] = '\0';
+                        found = true;
+                    }
+                }
+            }
+        }
+        // If not found in this chunk, rewind slightly to prevent cutting words in half
+        if (!found && bytes_read == sizeof(buf) - 1) {
+            lseek(fd, -256, SEEK_CUR); 
+        }
+    }
+    return found;
+}
+
+static bool is_valid_pkg_name(const char* pkg_name) {
+    if (!pkg_name || pkg_name[0] == '\0') return false;
+    for (int i = 0; pkg_name[i]; i++) {
+        char c = pkg_name[i];
         if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
              c == '.' || c == '_' || c == '-')) {
             return false;
@@ -514,72 +409,23 @@ static bool is_valid_pkg_name(const std::string_view& pkg_name) {
     return true;
 }
 
-
-static bool get_package_by_uid_from_xml(int32_t uid, auto& pkg_name) {
-    UniqueFd fd(open("/data/system/packages.xml", O_RDONLY | O_CLOEXEC));
-    if (fd < 0) return false;
-
-    struct stat st;
-    if (fstat(fd, &st) < 0) return false;
-
-    const char* map = (const char*)mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-
-    if (map == MAP_FAILED) return false;
-
-    int32_t app_id = uid % 100000;
-
-    char uid_str[32];
-    int len = snprintf(uid_str, sizeof(uid_str), "userId=\"%d\"", app_id);
-
-    char shared_uid_str[32];
-    int shared_len = snprintf(shared_uid_str, sizeof(shared_uid_str), "sharedUserId=\"%d\"", app_id);
-
-    const char* pos = (const char*)memmem(map, st.st_size, uid_str, len);
-    if (!pos) {
-        pos = (const char*)memmem(map, st.st_size, shared_uid_str, shared_len);
-    }
-
-    bool found = false;
-    if (pos) {
-        const char* cur = pos;
-        while (cur > map && *cur != '<') cur--;
-
-        const char* name_attr = "name=\"";
-        const char* name_pos = (const char*)memmem(cur, pos - cur, name_attr, 6);
-        if (name_pos) {
-            name_pos += 6;
-            const char* end_pos = (const char*)memchr(name_pos, '\"', pos - name_pos);
-            if (end_pos) {
-                pkg_name = std::string_view(name_pos, end_pos - name_pos);
-                found = true;
-            }
-        }
-    }
-
-    munmap((void*)map, st.st_size);
-    return found;
-}
-
 bool uid_granted_root(int32_t uid) {
     std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
     return list_contains_uid(g_cache.granted_uids, uid);
 }
 
 bool uid_should_umount(int32_t uid) {
-    std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
-    if (list_contains_uid(g_cache.denylist_uids, uid)) return true;
-    if (list_contains_uid(g_cache.all_known_uids, uid)) return false;
-    lock.unlock(); // Release lock before executing external command
-
-    // Fallback for missing packages in packages.list (e.g. freshly installed or system apps)
-    std::string_view pkg_name;
-    if (!get_package_by_uid_from_xml(uid, pkg_name)) {
-        return false;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
+        if (list_contains_uid(g_cache.denylist_uids, uid)) return true;
+        if (list_contains_uid(g_cache.all_known_uids, uid)) return false;
     }
 
-    if (pkg_name.empty() || !is_valid_pkg_name(pkg_name)) return false;
+    char pkg_name[128];
+    if (!get_package_by_uid_from_xml(uid, pkg_name, sizeof(pkg_name))) return false;
+    if (!is_valid_pkg_name(pkg_name)) return false;
 
-    lock.lock();
+    std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
     return list_contains_pkg(g_cache.denylist_pkgs, pkg_name);
 }
 
