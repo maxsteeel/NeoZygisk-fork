@@ -22,11 +22,8 @@
 #include <stdlib.h>
 #include <sys/auxv.h>
 
-#include <string>
 #include <string_view>
-#include <vector>
 #include <mutex>
-#include <functional>
 
 #include "logging.hpp"
 #include "files.hpp"
@@ -123,25 +120,36 @@ __asm__ (
 extern "C" ptrdiff_t custom_tlsdesc_resolver_stub(void*);
 #endif
 
-struct deferred_ifunc {
-    uintptr_t target;
-    uintptr_t resolver;
+struct deferred_ifunc { uintptr_t target; uintptr_t resolver; };
+struct IfuncList {
+    deferred_ifunc* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+    ~IfuncList() { free(data); }
+    void push_back(uintptr_t target, uintptr_t resolver) {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 8 : capacity * 2;
+            data = (deferred_ifunc*)realloc(data, capacity * sizeof(deferred_ifunc));
+        }
+        data[size++] = {target, resolver};
+    }
 };
 
-struct tlsdesc {
-    void* resolver;
-    uint64_t arg;
-};
-
-struct CustomTlsInfo {
-    size_t module_id;
-    pthread_key_t key;
-    size_t size;
-};
-
-struct tls_index {
-    size_t module_id;
-    size_t offset;
+struct tlsdesc { void* resolver; uint64_t arg; };
+struct CustomTlsInfo { size_t module_id; pthread_key_t key; size_t size; };
+struct tls_index { size_t module_id; size_t offset; };
+struct TlsIndexList {
+    tls_index** data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+    ~TlsIndexList() { free(data); }
+    void push_back(tls_index* val) {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 4 : capacity * 2;
+            data = (tls_index**)realloc(data, capacity * sizeof(tls_index*));
+        }
+        data[size++] = val;
+    }
 };
 
 struct DestructorAction {
@@ -154,26 +162,111 @@ struct DestructorAction {
     };
 };
 
-struct MemMap {
+struct DestructorList {
+    DestructorAction* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+    ~DestructorList() { free(data); }
+    void push_back(DestructorAction action) {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 8 : capacity * 2;
+            data = (DestructorAction*)realloc(data, capacity * sizeof(DestructorAction));
+        }
+        data[size++] = action;
+    }
+};
+
+struct MemMap { uintptr_t base; size_t size; };
+struct MemMapList {
+    MemMap* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+    ~MemMapList() { free(data); }
+    void push_back(MemMap map) {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 4 : capacity * 2;
+            data = (MemMap*)realloc(data, capacity * sizeof(MemMap));
+        }
+        data[size++] = map;
+    }
+};
+
+struct LoadedModule {
+    char path[256];
+    uint16_t basename_offset;
+    uint32_t name_hash;
+    uintptr_t load_bias;
     uintptr_t base;
     size_t size;
+    elf_dyn_info dinfo;
+    TlsIndexList tlsdesc_args;
 };
 
-struct CustomRegion {
-    uintptr_t handle; // Main module identifier (for unload)
-    std::vector<MemMap> maps; // List of all mapped memories (main + deps)
-    std::vector<DestructorAction> destructors;
+struct LoadedModuleList {
+    LoadedModule* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+    ~LoadedModuleList() { free(data); }
+    LoadedModule& push_back() {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 4 : capacity * 2;
+            data = (LoadedModule*)realloc(data, capacity * sizeof(LoadedModule));
+            // Initialize the newly allocated structure cleanly
+            memset((void*)&data[size], 0, sizeof(LoadedModule));
+        }
+        return data[size++];
+    }
 };
 
-// Pointers and thread-safe initialization flag
+struct CachedLib { const char* name; uint32_t hash; };
+struct CachedLibList {
+    CachedLib* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+    ~CachedLibList() { free(data); }
+    void push_back(const char* n) {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 128 : capacity * 2;
+            data = (CachedLib*)realloc(data, capacity * sizeof(CachedLib));
+        }
+        data[size++] = {n, calc_gnu_hash(n)};
+    }
+};
+
+struct CustomRegion { uintptr_t handle; MemMapList maps; DestructorList destructors; };
+struct CustomRegionList {
+    CustomRegion* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+    // We intentionally don't free in destructor because this is a global state
+    CustomRegion& push_back() {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 4 : capacity * 2;
+            data = (CustomRegion*)realloc(data, capacity * sizeof(CustomRegion));
+            memset((void*)&data[size], 0, sizeof(CustomRegion)); // Clean initialization
+        }
+        return data[size++];
+    }
+    void erase(size_t index) {
+        if (index >= size) return;
+        // Call destructors for the internal lists before shifting memory
+        data[index].maps.~MemMapList();
+        data[index].destructors.~DestructorList();
+        if (index < size - 1) {
+            memmove((void*)&data[index], (void*)&data[index + 1], (size - index - 1) * sizeof(CustomRegion));
+        }
+        size--;
+    }
+};
+
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 static std::mutex* g_custom_regions_lock = nullptr;
-static std::vector<CustomRegion>* g_custom_regions = nullptr;
+static CustomRegionList* g_custom_regions = nullptr;
 
 /* Actual allocator function called only once */
 static void do_init_tracking() {
     g_custom_regions_lock = new std::mutex();
-    g_custom_regions = new std::vector<CustomRegion>();
+    g_custom_regions = new CustomRegionList();
 }
 
 static void init_region_tracking() {
@@ -186,8 +279,10 @@ bool is_custom_linker_address(const void* addr) {
     init_region_tracking();
     uintptr_t ptr = reinterpret_cast<uintptr_t>(addr);
     std::lock_guard<std::mutex> lock(*g_custom_regions_lock);
-    for (const auto& reg : *g_custom_regions) {
-        for (const auto& map : reg.maps) {
+    for (size_t i = 0; i < g_custom_regions->size; i++) {
+        const auto& reg = g_custom_regions->data[i];
+        for (size_t j = 0; j < reg.maps.size; j++) {
+            const auto& map = reg.maps.data[j];
             if (ptr >= map.base && ptr < map.base + map.size) return true;
         }
     }
@@ -198,9 +293,11 @@ void custom_linker_unload(void* handle) {
     init_region_tracking();
     uintptr_t base = reinterpret_cast<uintptr_t>(handle);
     std::lock_guard<std::mutex> lock(*g_custom_regions_lock);
-    for (auto it = g_custom_regions->begin(); it != g_custom_regions->end(); ++it) {
-        if (it->handle == base) {
-            for (const auto& d : it->destructors) {
+    for (size_t i = 0; i < g_custom_regions->size; i++) {
+        auto& reg = g_custom_regions->data[i];
+        if (reg.handle == base) {
+            for (size_t j = 0; j < reg.destructors.size; j++) {
+                const auto& d = reg.destructors.data[j];
                 if (d.type == DestructorAction::FUNC_PTR && d.func_ptr) {
                     d.func_ptr();
                 } else if (d.type == DestructorAction::TLS_CLEANUP) {
@@ -212,29 +309,20 @@ void custom_linker_unload(void* handle) {
                 }
             }
 
-            for (const auto& map : it->maps) {
+            for (size_t j = 0; j < reg.maps.size; j++) {
+                const auto& map = reg.maps.data[j];
                 if (map.base != 0 && map.size != 0) {
                     munmap(reinterpret_cast<void*>(map.base), map.size);
                 }
             }
-
-            g_custom_regions->erase(it);
+            g_custom_regions->erase(i);
             return;
         }
     }
 }
 
-struct LoadedModule {
-    char path[256];
-    uintptr_t load_bias;
-    uintptr_t base;
-    size_t size;
-    elf_dyn_info dinfo;
-    std::vector<tls_index*> tlsdesc_args;
-};
-
 static bool resolve_symbol_addr(const elf_dyn_info *info,
-                                const std::vector<LoadedModule>& loaded_modules,
+                                const LoadedModuleList& loaded_modules,
                                 uintptr_t load_bias, size_t sym_idx, uintptr_t *out_addr) {
 
     if (sym_idx >= info->nsyms) return false;
@@ -246,7 +334,6 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
         if (ELF_ST_TYPE(sym.st_info) == STT_GNU_IFUNC) {
             typedef void* (*ifunc_resolver_t)(uint64_t);
             auto ifunc = reinterpret_cast<ifunc_resolver_t>(addr);
-            // IFUNC resolvers can return PAC-signed pointers
             addr = PAC_STRIP(reinterpret_cast<uintptr_t>(ifunc(hwcap)));
         }
         *out_addr = PAC_STRIP(addr); 
@@ -270,7 +357,8 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
         return true;
     }
 
-    for (const auto& mod : loaded_modules) {
+    for (size_t i = 0; i < loaded_modules.size; i++) {
+        const auto& mod = loaded_modules.data[i];
         if (&mod.dinfo == info) continue; // Skip self
         
         ElfW(Addr) mod_val = 0;
@@ -299,198 +387,233 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
     return false;
 }
 
-struct sleb128_decoder {
-    const uint8_t *current;
-    const uint8_t *end;
-};
-
-static void sleb128_decoder_init(sleb128_decoder *decoder, const uint8_t *buffer, size_t count) {
+struct sleb128_decoder { const uint8_t *current; };
+static inline void sleb128_decoder_init(sleb128_decoder *decoder, const uint8_t *buffer) {
     decoder->current = buffer;
-    decoder->end = buffer + count;
 }
 
-static int64_t sleb128_decode(sleb128_decoder *decoder) {
+static inline int64_t sleb128_decode(sleb128_decoder *decoder) {
     int64_t value = 0;
     size_t shift = 0;
     uint8_t byte;
-    const size_t size = sizeof(int64_t) * CHAR_BIT;
 
     do {
-        if (decoder->current >= decoder->end) {
-            LOGE("Failed to decode SLEB128: buffer overrun");
-            return 0; // Better than aborting the whole daemon
-        }
-
         byte = *decoder->current++;
         value |= ((int64_t)(byte & 0x7F)) << shift;
         shift += 7;
     } while (byte & 0x80);
 
-    if (shift < size && (byte & 0x40)) {
+    if (shift < 64 && (byte & 0x40)) {
         value |= -((int64_t)1 << shift);
     }
-
     return value;
 }
 
-
-static inline bool process_relocation(
-    [[maybe_unused]] LoadedModule& mod, const std::vector<LoadedModule>& loaded_modules,
-    uintptr_t load_bias, const elf_dyn_info* info,
-    uintptr_t target, unsigned current_type, unsigned current_sym_idx,
-    ElfW(Addr) current_addend, [[maybe_unused]] bool is_rela,
-    std::vector<deferred_ifunc>& ifuncs
-) {
+__attribute__((always_inline))
+static inline bool process_relocation([[maybe_unused]] LoadedModule& mod, 
+                                        const LoadedModuleList& loaded_modules,
+                                        uintptr_t load_bias, const elf_dyn_info* info,
+                                        uintptr_t target, unsigned current_type, 
+                                        unsigned current_sym_idx, ElfW(Addr) current_addend,
+                                        [[maybe_unused]] bool is_rela, IfuncList& ifuncs) {
+    
     ElfW(Addr) value = 0;
 
 #if defined(__aarch64__)
-    if (current_type == R_AARCH64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
-    else if (current_type == R_AARCH64_IRELATIVE) {
-        ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)current_addend});
-        return true;
-    } else if (current_type == R_AARCH64_GLOB_DAT || current_type == R_AARCH64_JUMP_SLOT || current_type == R_AARCH64_ABS64) {
-        uintptr_t sym_addr = 0;
-        if (!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-            if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
-                LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
-                return false;
+    switch (current_type) {
+        case R_AARCH64_RELATIVE: 
+            value = (ElfW(Addr))load_bias + current_addend; 
+            break;
+        case R_AARCH64_IRELATIVE: 
+            ifuncs.push_back(target, (uintptr_t)load_bias + current_addend); 
+            return true;
+        case R_AARCH64_GLOB_DAT:
+        case R_AARCH64_JUMP_SLOT:
+        case R_AARCH64_ABS64: {
+            uintptr_t sym_addr = 0;
+            if (unlikely(!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr))) {
+                if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
+                    LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                    return false;
+                }
+                sym_addr = 0;
             }
-            sym_addr = 0;
+            value = sym_addr ? (ElfW(Addr))sym_addr + current_addend : 0;
+            break;
         }
-        value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
-    } else if (current_type == R_AARCH64_TLS_DTPMOD) {
-        value = info->tls_mod_id;
-    } else if (current_type == R_AARCH64_TLS_DTPREL) {
-        const ElfW(Sym)& sym = info->symtab[current_sym_idx];
-        value = (ElfW(Addr))sym.st_value + current_addend;
-    } else if (current_type == R_AARCH64_TLS_TPREL) {
-        uintptr_t sym_addr = 0;
-        if (current_sym_idx == 0) {
-            value = info->tls_segment_vaddr + current_addend;
-        } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-            value = sym_addr - load_bias + info->tls_segment_vaddr;
+        case R_AARCH64_TLS_DTPMOD: 
+            value = info->tls_mod_id; 
+            break;
+        case R_AARCH64_TLS_DTPREL: {
+            const ElfW(Sym)& sym = info->symtab[current_sym_idx];
+            value = (ElfW(Addr))sym.st_value + current_addend;
+            break;
         }
-    } else if (current_type == R_AARCH64_TLSDESC) {
-        tlsdesc* td = reinterpret_cast<tlsdesc*>(target);
-        tls_index* ti = new tls_index;
-        ti->module_id = info->tls_mod_id;
-        uintptr_t sym_addr = 0;
-        if (current_sym_idx == 0) {
-            ti->offset = current_addend;
-        } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-            ti->offset = (sym_addr - load_bias) + current_addend;
-        } else {
-            ti->offset = current_addend;
+        case R_AARCH64_TLS_TPREL: {
+            uintptr_t sym_addr = 0;
+            if (current_sym_idx == 0) {
+                value = info->tls_segment_vaddr + current_addend;
+            } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+                value = sym_addr - load_bias + info->tls_segment_vaddr;
+            }
+            break;
         }
-        td->resolver = reinterpret_cast<void*>(custom_tlsdesc_resolver_stub);
-        td->arg = reinterpret_cast<uint64_t>(ti);
-        mod.tlsdesc_args.push_back(ti);
-        return true;
-    } else return false;
+        case R_AARCH64_TLSDESC: {
+            tlsdesc* td = reinterpret_cast<tlsdesc*>(target);
+            tls_index* ti = new tls_index;
+            ti->module_id = info->tls_mod_id;
+            uintptr_t sym_addr = 0;
+            if (current_sym_idx == 0) {
+                ti->offset = current_addend;
+            } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+                ti->offset = (sym_addr - load_bias) + current_addend;
+            } else {
+                ti->offset = current_addend;
+            }
+            td->resolver = reinterpret_cast<void*>(custom_tlsdesc_resolver_stub);
+            td->arg = reinterpret_cast<uint64_t>(ti);
+            mod.tlsdesc_args.push_back(ti);
+            return true;
+        }
+        default: return false;
+    }
 
 #elif defined(__x86_64__)
-    if (current_type == R_X86_64_RELATIVE) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
-    else if (current_type == R_X86_64_IRELATIVE) {
-        ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)current_addend});
-        return true;
-    } else if (current_type == R_X86_64_GLOB_DAT || current_type == R_X86_64_JUMP_SLOT || current_type == R_X86_64_64) {
-        uintptr_t sym_addr = 0;
-        if (!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-            if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
-                LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
-                return false;
+    switch (current_type) {
+        case R_X86_64_RELATIVE: 
+            value = (ElfW(Addr))load_bias + current_addend; 
+            break;
+        case R_X86_64_IRELATIVE: 
+            ifuncs.push_back(target, (uintptr_t)load_bias + current_addend); 
+            return true;
+        case R_X86_64_GLOB_DAT:
+        case R_X86_64_JUMP_SLOT:
+        case R_X86_64_64: {
+            uintptr_t sym_addr = 0;
+            if (unlikely(!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr))) {
+                if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
+                    LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                    return false;
+                }
+                sym_addr = 0;
             }
-            sym_addr = 0;
+            value = sym_addr ? (ElfW(Addr))sym_addr + current_addend : 0;
+            break;
         }
-        value = sym_addr ? (ElfW(Addr))sym_addr + (ElfW(Addr))current_addend : 0;
-    } else if (current_type == R_X86_64_DTPMOD64) {
-        value = info->tls_mod_id;
-    } else if (current_type == R_X86_64_DTPOFF64) {
-        const ElfW(Sym)& sym = info->symtab[current_sym_idx];
-        value = (ElfW(Addr))sym.st_value + current_addend;
-    } else if (current_type == R_X86_64_TPOFF64) {
-        uintptr_t sym_addr = 0;
-        if (current_sym_idx == 0) {
-            value = info->tls_segment_vaddr + current_addend;
-        } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-            value = sym_addr - load_bias + info->tls_segment_vaddr;
+        case R_X86_64_DTPMOD64: 
+            value = info->tls_mod_id; 
+            break;
+        case R_X86_64_DTPOFF64: {
+            const ElfW(Sym)& sym = info->symtab[current_sym_idx];
+            value = (ElfW(Addr))sym.st_value + current_addend;
+            break;
         }
-    } else return false;
+        case R_X86_64_TPOFF64: {
+            uintptr_t sym_addr = 0;
+            if (current_sym_idx == 0) {
+                value = info->tls_segment_vaddr + current_addend;
+            } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+                value = sym_addr - load_bias + info->tls_segment_vaddr;
+            }
+            break;
+        }
+        default: return false;
+    }
 
 #elif defined(__arm__)
-    if (current_type == R_ARM_RELATIVE) {
-        ElfW(Addr) addend_rel = is_rela ? current_addend : *reinterpret_cast<ElfW(Addr)*>(target);
-        value = (ElfW(Addr))load_bias + addend_rel;
-    } else if (current_type == R_ARM_IRELATIVE) {
-        ElfW(Addr) addend_rel = is_rela ? current_addend : *reinterpret_cast<ElfW(Addr)*>(target);
-        ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)addend_rel});
-        return true;
-    } else if (current_type == R_ARM_GLOB_DAT || current_type == R_ARM_JUMP_SLOT || current_type == R_ARM_ABS32) {
-        uintptr_t sym_addr = 0;
-        if (!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-            if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
-                LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
-                return false;
+    ElfW(Addr) addend_rel = is_rela ? current_addend : *reinterpret_cast<ElfW(Addr)*>(target);
+
+    switch (current_type) {
+        case R_ARM_RELATIVE: 
+            value = (ElfW(Addr))load_bias + addend_rel; 
+            break;
+        case R_ARM_IRELATIVE: 
+            ifuncs.push_back(target, (uintptr_t)load_bias + addend_rel); 
+            return true;
+        case R_ARM_GLOB_DAT:
+        case R_ARM_JUMP_SLOT:
+        case R_ARM_ABS32: {
+            uintptr_t sym_addr = 0;
+            if (unlikely(!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr))) {
+                if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
+                    LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                    return false;
+                }
+                sym_addr = 0;
             }
-            sym_addr = 0;
+            if (sym_addr == 0) value = 0;
+            else if (current_type == R_ARM_ABS32) value = (ElfW(Addr))sym_addr + addend_rel;
+            else value = (ElfW(Addr))sym_addr;
+            break;
         }
-        if (sym_addr == 0) value = 0;
-        else if (current_type == R_ARM_ABS32) {
-            ElfW(Addr) addend_rel = is_rela ? current_addend : *reinterpret_cast<ElfW(Addr)*>(target);
-            value = (ElfW(Addr))sym_addr + addend_rel;
-        } else value = (ElfW(Addr))sym_addr;
-    } else if (current_type == R_ARM_TLS_DTPMOD32) {
-        value = info->tls_mod_id;
-    } else if (current_type == R_ARM_TLS_DTPOFF32) {
-        const ElfW(Sym)& sym = info->symtab[current_sym_idx];
-        value = (ElfW(Addr))sym.st_value + current_addend;
-    } else if (current_type == R_ARM_TLS_TPOFF32) {
-        uintptr_t sym_addr = 0;
-        if (current_sym_idx == 0) {
-            value = info->tls_segment_vaddr + current_addend;
-        } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-            value = sym_addr - load_bias + info->tls_segment_vaddr;
+        case R_ARM_TLS_DTPMOD32: 
+            value = info->tls_mod_id; 
+            break;
+        case R_ARM_TLS_DTPOFF32: {
+            const ElfW(Sym)& sym = info->symtab[current_sym_idx];
+            value = (ElfW(Addr))sym.st_value + current_addend;
+            break;
         }
-    } else return false;
+        case R_ARM_TLS_TPOFF32: {
+            uintptr_t sym_addr = 0;
+            if (current_sym_idx == 0) {
+                value = info->tls_segment_vaddr + current_addend;
+            } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+                value = sym_addr - load_bias + info->tls_segment_vaddr;
+            }
+            break;
+        }
+        default: return false;
+    }
 
 #elif defined(__i386__)
-    if (current_type == R_386_RELATIVE) {
-        ElfW(Addr) addend_rel = is_rela ? current_addend : *reinterpret_cast<ElfW(Addr)*>(target);
-        value = (ElfW(Addr))load_bias + addend_rel;
-    } else if (current_type == R_386_IRELATIVE) {
-        ElfW(Addr) addend_rel = is_rela ? current_addend : *reinterpret_cast<ElfW(Addr)*>(target);
-        ifuncs.push_back({target, (uintptr_t)load_bias + (uintptr_t)addend_rel});
-        return true;
-    } else if (current_type == R_386_GLOB_DAT || current_type == R_386_JMP_SLOT || current_type == R_386_32) {
-        uintptr_t sym_addr = 0;
-        if (!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-            if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
-                LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
-                return false;
+    ElfW(Addr) addend_rel = is_rela ? current_addend : *reinterpret_cast<ElfW(Addr)*>(target);
+
+    switch (current_type) {
+        case R_386_RELATIVE: 
+            value = (ElfW(Addr))load_bias + addend_rel; 
+            break;
+        case R_386_IRELATIVE: 
+            ifuncs.push_back(target, (uintptr_t)load_bias + addend_rel); 
+            return true;
+        case R_386_GLOB_DAT:
+        case R_386_JMP_SLOT:
+        case R_386_32: {
+            uintptr_t sym_addr = 0;
+            if (unlikely(!resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr))) {
+                if (ELF_ST_BIND(info->symtab[current_sym_idx].st_info) != STB_WEAK) {
+                    LOGE("CANNOT LINK EXECUTABLE: missing strong symbol");
+                    return false;
+                }
+                sym_addr = 0;
             }
-            sym_addr = 0;
+            if (sym_addr == 0) value = 0;
+            else if (current_type == R_386_32) value = (ElfW(Addr))sym_addr + addend_rel;
+            else value = (ElfW(Addr))sym_addr;
+            break;
         }
-        if (sym_addr == 0) value = 0;
-        else if (current_type == R_386_32) {
-            ElfW(Addr) addend_rel = is_rela ? current_addend : *reinterpret_cast<ElfW(Addr)*>(target);
-            value = (ElfW(Addr))sym_addr + addend_rel;
-        } else value = (ElfW(Addr))sym_addr;
-    } else if (current_type == R_386_TLS_DTPMOD32) {
-        value = info->tls_mod_id;
-    } else if (current_type == R_386_TLS_DTPOFF32) {
-        const ElfW(Sym)& sym = info->symtab[current_sym_idx];
-        value = (ElfW(Addr))sym.st_value + current_addend;
-    } else if (current_type == R_386_TLS_TPOFF) {
-        uintptr_t sym_addr = 0;
-        if (current_sym_idx == 0) {
-            value = info->tls_segment_vaddr + current_addend;
-        } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
-            value = sym_addr - load_bias + info->tls_segment_vaddr;
+        case R_386_TLS_DTPMOD32: 
+            value = info->tls_mod_id; 
+            break;
+        case R_386_TLS_DTPOFF32: {
+            const ElfW(Sym)& sym = info->symtab[current_sym_idx];
+            value = (ElfW(Addr))sym.st_value + current_addend;
+            break;
         }
-    } else return false;
+        case R_386_TLS_TPOFF: {
+            uintptr_t sym_addr = 0;
+            if (current_sym_idx == 0) {
+                value = info->tls_segment_vaddr + current_addend;
+            } else if (resolve_symbol_addr(info, loaded_modules, load_bias, current_sym_idx, &sym_addr)) {
+                value = sym_addr - load_bias + info->tls_segment_vaddr;
+            }
+            break;
+        }
+        default: return false;
+    }
 
 #else
-    if (current_type == 0) value = (ElfW(Addr))load_bias + (ElfW(Addr))current_addend;
+    if (current_type == 0) value = (ElfW(Addr))load_bias + current_addend;
     else return false;
 #endif
 
@@ -498,62 +621,46 @@ static inline bool process_relocation(
     return true;
 }
 
-static bool apply_rela_section(LoadedModule& mod, [[maybe_unused]] const std::vector<LoadedModule>& loaded_modules,
-                               off_t rela_vaddr, size_t rela_sz, [[maybe_unused]] std::vector<deferred_ifunc>& ifuncs) {
-    [[maybe_unused]] const elf_dyn_info* info = &mod.dinfo;
+template <typename RelType, bool IsRela>
+static inline bool apply_relocations(LoadedModule& mod, const LoadedModuleList& loaded_modules,
+                                      off_t rel_vaddr, size_t rel_sz, IfuncList& ifuncs) {
+    const elf_dyn_info* info = &mod.dinfo;
     uintptr_t load_bias = mod.load_bias;
-    size_t count = rela_sz / sizeof(ElfW(Rela));
-    ElfW(Rela)* rels = reinterpret_cast<ElfW(Rela)*>(load_bias + rela_vaddr);
+    size_t count = rel_sz / sizeof(RelType);
+
+    RelType* rels = reinterpret_cast<RelType*>(load_bias + rel_vaddr);
 
     for (size_t i = 0; i < count; i++) {
-        const ElfW(Rela)& r = rels[i];
+        const RelType& r = rels[i];
 
-        [[maybe_unused]] unsigned type = (unsigned)ELF_R_TYPE(r.r_info);
-        [[maybe_unused]] unsigned sym = (unsigned)ELF_R_SYM(r.r_info);
+        unsigned type = (unsigned)ELF_R_TYPE(r.r_info);
+        unsigned sym = (unsigned)ELF_R_SYM(r.r_info);
         uintptr_t target = (uintptr_t)load_bias + (uintptr_t)r.r_offset;
 
-        if (!process_relocation(mod, loaded_modules, load_bias, info, target, type, sym, r.r_addend, true, ifuncs)) {
+        ElfW(Addr) addend = 0;
+        if constexpr (IsRela) addend = r.r_addend;
+
+        if (unlikely(!process_relocation(mod, loaded_modules, load_bias, info, target, type, sym, addend, IsRela, ifuncs))) {
             return false;
         }
     }
     return true;
 }
 
-static bool apply_rel_section(LoadedModule& mod, [[maybe_unused]] const std::vector<LoadedModule>& loaded_modules,
-                              off_t rel_vaddr, size_t rel_sz, [[maybe_unused]] std::vector<deferred_ifunc>& ifuncs) {
-    [[maybe_unused]] const elf_dyn_info* info = &mod.dinfo;
-    uintptr_t load_bias = mod.load_bias;
-    size_t count = rel_sz / sizeof(ElfW(Rel));
-    ElfW(Rel)* rels = reinterpret_cast<ElfW(Rel)*>(load_bias + rel_vaddr);
-
-    for (size_t i = 0; i < count; i++) {
-        const ElfW(Rel)& r = rels[i];
-
-        [[maybe_unused]] unsigned type = (unsigned)ELF_R_TYPE(r.r_info);
-        [[maybe_unused]] unsigned sym = (unsigned)ELF_R_SYM(r.r_info);
-        uintptr_t target = (uintptr_t)load_bias + (uintptr_t)r.r_offset;
-
-        if (!process_relocation(mod, loaded_modules, load_bias, info, target, type, sym, 0, false, ifuncs)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool apply_android_relocations([[maybe_unused]] LoadedModule& mod, const std::vector<LoadedModule>& loaded_modules,
+static bool apply_android_relocations(LoadedModule& mod, const LoadedModuleList& loaded_modules,
                                       off_t reloc_vaddr, size_t reloc_sz,
-                                      std::vector<deferred_ifunc>& ifuncs, bool is_rela) {
+                                      IfuncList& ifuncs, bool is_rela) {
     const elf_dyn_info* info = &mod.dinfo;
     uintptr_t load_bias = mod.load_bias;
     uint8_t* reloc_data = reinterpret_cast<uint8_t*>(load_bias + reloc_vaddr);
 
-    if (reloc_sz < 4 || memcmp(reloc_data, "APS2", 4) != 0) {
+    if (reloc_sz < 4 || *reinterpret_cast<uint32_t*>(reloc_data) != *reinterpret_cast<const uint32_t*>("APS2")) {
         LOGE("Invalid Android REL/RELA magic");
         return false;
     }
 
     sleb128_decoder decoder;
-    sleb128_decoder_init(&decoder, reloc_data + 4, reloc_sz - 4);
+    sleb128_decoder_init(&decoder, reloc_data + 4);
 
     uint64_t num_relocs = sleb128_decode(&decoder);
     ElfW(Addr) current_offset = sleb128_decode(&decoder);
@@ -593,10 +700,7 @@ static bool apply_android_relocations([[maybe_unused]] LoadedModule& mod, const 
                 current_addend = 0;
             }
         } else {
-            if (group_flags & RELOCATION_GROUP_HAS_ADDEND_FLAG) {
-                LOGE("REL relocations should not have addends");
-                return false;
-            }
+            if (group_flags & RELOCATION_GROUP_HAS_ADDEND_FLAG) return false;
         }
 
         for (size_t j = 0; j < group_size; ++j) {
@@ -614,8 +718,8 @@ static bool apply_android_relocations([[maybe_unused]] LoadedModule& mod, const 
                 current_addend += sleb128_decode(&decoder);
             }
 
-            uintptr_t target = (uintptr_t)load_bias + (uintptr_t)current_offset;
-            if (!process_relocation(mod, loaded_modules, load_bias, info, target, current_type, current_sym_idx, current_addend, is_rela, ifuncs)) {
+            uintptr_t target = load_bias + current_offset;
+            if (unlikely(!process_relocation(mod, loaded_modules, load_bias, info, target, current_type, current_sym_idx, current_addend, is_rela, ifuncs))) {
                 return false;
             }
         }
@@ -636,28 +740,20 @@ static bool apply_relr_section(LoadedModule& mod, off_t relr_vaddr, size_t relr_
     for (size_t i = 0; i < count; i++) {
         ElfW(Addr) entry = relr[i];
 
-        if ((entry & 1) == 0) {
-            // Even entries encode an explicit address
+        if (unlikely((entry & 1) == 0)) {
             ElfW(Addr) reloc_offset = entry;
-            uintptr_t target = (uintptr_t)load_bias + reloc_offset;
-            ElfW(Addr) value = *reinterpret_cast<ElfW(Addr)*>(target);
-            value += load_bias;
-            *reinterpret_cast<ElfW(Addr)*>(target) = value;
-
+            uintptr_t target = load_bias + reloc_offset;
+            *reinterpret_cast<ElfW(Addr)*>(target) += load_bias;
             base_offset = reloc_offset + sizeof(ElfW(Addr));
             continue;
         }
 
-        // Odd entries encode a bitmap of up to (bits_per_entry - 1) following words
         ElfW(Addr) bitmap = entry >> 1;
 
         for (size_t bit = 0; bitmap != 0 && bit < bits_per_entry - 1; bit++, bitmap >>= 1) {
             if ((bitmap & 1) == 0) continue;
-
-            uintptr_t target = (uintptr_t)load_bias + base_offset + (bit * sizeof(ElfW(Addr)));
-            ElfW(Addr) value = *reinterpret_cast<ElfW(Addr)*>(target);
-            value += load_bias;
-            *reinterpret_cast<ElfW(Addr)*>(target) = value;
+            uintptr_t target = load_bias + base_offset + (bit * sizeof(ElfW(Addr)));
+            *reinterpret_cast<ElfW(Addr)*>(target) += load_bias;
         }
 
         base_offset += sizeof(ElfW(Addr)) * (bits_per_entry - 1);
@@ -666,20 +762,20 @@ static bool apply_relr_section(LoadedModule& mod, off_t relr_vaddr, size_t relr_
     return true;
 }
 
-static bool apply_module_relocations(LoadedModule& mod, const std::vector<LoadedModule>& loaded_modules) {
-    std::vector<deferred_ifunc> ifuncs;
+static bool apply_module_relocations(LoadedModule& mod, const LoadedModuleList& loaded_modules) {
+    IfuncList ifuncs;
 
     if (mod.dinfo.rela_sz && mod.dinfo.rela_vaddr) {
-        if (!apply_rela_section(mod, loaded_modules, mod.dinfo.rela_vaddr, mod.dinfo.rela_sz, ifuncs)) return false;
+        if (!apply_relocations<ElfW(Rela), true>(mod, loaded_modules, mod.dinfo.rela_vaddr, mod.dinfo.rela_sz, ifuncs)) return false;
     }
     if (mod.dinfo.rel_sz && mod.dinfo.rel_vaddr) {
-        if (!apply_rel_section(mod, loaded_modules, mod.dinfo.rel_vaddr, mod.dinfo.rel_sz, ifuncs)) return false;
+        if (!apply_relocations<ElfW(Rel), false>(mod, loaded_modules, mod.dinfo.rel_vaddr, mod.dinfo.rel_sz, ifuncs)) return false;
     }
     if (mod.dinfo.jmprel_sz && mod.dinfo.jmprel_vaddr) {
         if (mod.dinfo.pltrel_type == DT_RELA) {
-            if (!apply_rela_section(mod, loaded_modules, mod.dinfo.jmprel_vaddr, mod.dinfo.jmprel_sz, ifuncs)) return false;
+            if (!apply_relocations<ElfW(Rela), true>(mod, loaded_modules, mod.dinfo.jmprel_vaddr, mod.dinfo.jmprel_sz, ifuncs)) return false;
         } else {
-            if (!apply_rel_section(mod, loaded_modules, mod.dinfo.jmprel_vaddr, mod.dinfo.jmprel_sz, ifuncs)) return false;
+            if (!apply_relocations<ElfW(Rel), false>(mod, loaded_modules, mod.dinfo.jmprel_vaddr, mod.dinfo.jmprel_sz, ifuncs)) return false;
         }
     }
 
@@ -690,10 +786,9 @@ static bool apply_module_relocations(LoadedModule& mod, const std::vector<Loaded
         if (!apply_relr_section(mod, mod.dinfo.relr_vaddr, mod.dinfo.relr_sz)) return false;
     }
 
-    // At this point all global tables (GOT, BSS, etc) are initialized.
-    // It is safe to call executable code from the module.
     uint64_t hwcap = getauxval(AT_HWCAP);
-    for (const auto& ifunc : ifuncs) {
+    for (size_t i = 0; i < ifuncs.size; i++) {
+        const auto& ifunc = ifuncs.data[i];
         typedef void* (*ifunc_resolver_t)(uint64_t);
         auto resolver = reinterpret_cast<ifunc_resolver_t>(ifunc.resolver);
         uintptr_t value = PAC_STRIP(reinterpret_cast<uintptr_t>(resolver(hwcap)));
@@ -707,41 +802,36 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
     long page_size_long = sysconf(_SC_PAGESIZE);
     size_t page_size = (size_t)page_size_long;
 
-    UniqueFd fd;
-    if (memfd >= 0) {
-        fd = UniqueFd(dup(memfd));
-    } else {
-        fd = UniqueFd(open(lib_path, O_RDONLY | O_CLOEXEC));
-    }
+    UniqueFd fd(memfd >= 0 ? dup(memfd) : open(lib_path, O_RDONLY | O_CLOEXEC));
     if (fd < 0) return false;
 
     ElfW(Ehdr) eh;
-    std::unique_ptr<ElfW(Phdr)[]> phdr;
+    ElfW(Phdr) phdr[64];
     ElfW(Addr) min_vaddr = 0;
     size_t map_size = 0;
 
-    if (!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size)) { return false; }
+    if (!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size)) return false;
 
     void* remote_base_ptr = mmap(nullptr, map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (remote_base_ptr == MAP_FAILED) return false;
     uintptr_t remote_base = reinterpret_cast<uintptr_t>(remote_base_ptr);
 
-    uintptr_t load_bias = remote_base - (uintptr_t)min_vaddr;
+    uintptr_t load_bias = remote_base - min_vaddr;
     struct SegInfo { uintptr_t addr; size_t len; int prot; };
     SegInfo segs[64];
     size_t seg_count = 0;
 
     for (int i = 0; i < eh.e_phnum; i++) {
         if (phdr[i].p_type != PT_LOAD) continue;
-        uintptr_t seg_start = (uintptr_t)phdr[i].p_vaddr + load_bias;
+        uintptr_t seg_start = phdr[i].p_vaddr + load_bias;
         uintptr_t seg_page = page_start(seg_start, page_size);
-        uintptr_t seg_end = (uintptr_t)phdr[i].p_vaddr + (uintptr_t)phdr[i].p_memsz + load_bias;
+        uintptr_t seg_end = phdr[i].p_vaddr + phdr[i].p_memsz + load_bias;
         uintptr_t seg_page_end = page_end(seg_end, page_size);
-        size_t seg_page_len = (size_t)(seg_page_end - seg_page);
+        size_t seg_page_len = seg_page_end - seg_page;
 
         bool is_writable = (phdr[i].p_flags & PF_W) != 0;
-        off_t file_page_offset = (off_t)page_start((uintptr_t)phdr[i].p_offset, page_size);
-        uintptr_t file_end = (uintptr_t)phdr[i].p_vaddr + (uintptr_t)phdr[i].p_filesz + load_bias;
+        off_t file_page_offset = page_start(phdr[i].p_offset, page_size);
+        uintptr_t file_end = phdr[i].p_vaddr + phdr[i].p_filesz + load_bias;
         uintptr_t file_page_end = page_end(file_end, page_size);
 
         if (phdr[i].p_filesz > 0) {
@@ -759,9 +849,6 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
             // We map it as anonymous memory so that it doesn't stay in PROT_NONE.
             void* seg_map = mmap(reinterpret_cast<void*>(seg_page), seg_page_len, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (seg_map == MAP_FAILED) return false;
-
-            // The MAP_ANONYMOUS memory is already initialized with zeros by the Linux kernel.
-            // We don't need to do memset.
         }
 
         // Handling BSS expansion for hybrid segments (.data + .bss)
@@ -780,11 +867,7 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
         if (phdr[i].p_flags & PF_R) prot |= PROT_READ;
         if (phdr[i].p_flags & PF_W) prot |= PROT_WRITE;
         if (phdr[i].p_flags & PF_X) prot |= PROT_EXEC;
-        if (seg_count < 64) {
-            segs[seg_count++] = {seg_page, seg_page_len, prot};
-        } else {
-            LOGW("Too many segments in the ELF, some may not have correct permissions set");
-        }
+        if (seg_count < 64) segs[seg_count++] = {seg_page, seg_page_len, prot};
     }
 
     elf_dyn_info dinfo;
@@ -804,65 +887,76 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
         dinfo.tls_mod_id = tls_info->module_id;
     }
 
-    strlcpy(out_module->path, lib_path, sizeof(out_module->path));
+    const char* src = lib_path;
+    char* dst = out_module->path;
+    size_t i = 0;
+    uint16_t last_slash = 0;
+    while (*src && i < sizeof(out_module->path) - 1) {
+        if (*src == '/') last_slash = i + 1;
+        dst[i++] = *src++;
+    }
+    dst[i] = '\0';
+    
+    out_module->basename_offset = last_slash;
+    out_module->name_hash = calc_gnu_hash(&out_module->path[last_slash]);
     out_module->load_bias = load_bias;
     out_module->base = remote_base;
     out_module->size = map_size;
-    out_module->dinfo = std::move(dinfo);
+    out_module->dinfo = dinfo;
 
     return true;
 }
 
-static int build_cache_cb(struct dl_phdr_info* info, [[maybe_unused]] size_t size, void* data) {
-    auto* cache = reinterpret_cast<std::vector<std::string_view>*>(data);
+static int build_cache_cb(struct dl_phdr_info* info, size_t, void* data) {
+    auto* cache = reinterpret_cast<CachedLibList*>(data);
     if (info->dlpi_name) {
-        const char* name = strrchr(info->dlpi_name, '/');
+        const char* name = __builtin_strrchr(info->dlpi_name, '/');
         name = name ? name + 1 : info->dlpi_name;
-        if (name[0] != '\0') {
-            cache->push_back(name);
-        }
+        if (name[0] != '\0') cache->push_back(name);
     }
     return 0;
 }
 
-static bool is_library_loaded_in_memory(const char* soname, const std::vector<std::string_view>& cache) {
-    std::string_view target(soname);
-    return std::find(cache.begin(), cache.end(), target) != cache.end();
+static inline bool is_library_loaded_in_memory(const char* soname, uint32_t hash, const CachedLibList& cache) {
+    for (size_t i = 0; i < cache.size; i++) {
+        if (cache.data[i].hash == hash) {
+            if (__builtin_strcmp(cache.data[i].name, soname) == 0) return true;
+        }
+    }
+    return false;
 }
 
-static bool load_dependencies_recursive(const char *lib_path, int memfd, std::vector<LoadedModule>& loaded_modules, const std::vector<std::string_view>& loaded_libs_cache) {
-    const char *soname = strrchr(lib_path, '/');
+static bool load_dependencies_recursive(const char *lib_path, int memfd, LoadedModuleList& loaded_modules, const CachedLibList& loaded_libs_cache) {
+    const char *soname = __builtin_strrchr(lib_path, '/');
     soname = soname ? soname + 1 : lib_path;
+    uint32_t soname_hash = calc_gnu_hash(soname);
 
-    for (const auto& m : loaded_modules) {
-        const char *m_name = strrchr(m.path, '/');
-        m_name = m_name ? m_name + 1 : m.path;
-        if (strcmp(m_name, soname) == 0) {
-            return true; // Already loaded
+    for (size_t i = 0; i < loaded_modules.size; i++) {
+        const auto& m = loaded_modules.data[i];
+
+        if (m.name_hash == soname_hash) {
+            if (__builtin_strcmp(&m.path[m.basename_offset], soname) == 0) return true;
         }
     }
 
-    // Check if library is already loaded into memory
-    if (is_library_loaded_in_memory(soname, loaded_libs_cache)) {
-        LOGV("Dependency `%s` is already present in memory. Skipping manual load.", soname);
-        return true;
-    }
+    if (is_library_loaded_in_memory(soname, soname_hash, loaded_libs_cache)) return true;
 
-    LoadedModule mod;
+    LoadedModule& mod = loaded_modules.push_back();
     if (!load_single_library(lib_path, memfd, &mod)) {
-        LOGE("Failed to load dependency: %s", lib_path);
+        // Revert push_back if failed
+        loaded_modules.size--;
         return false;
     }
 
-    loaded_modules.push_back(std::move(mod));
-    size_t current_idx = loaded_modules.size() - 1;
-    size_t offsets_count = loaded_modules[current_idx].dinfo.needed_count;
+    size_t current_idx = loaded_modules.size - 1;
+    size_t offsets_count = loaded_modules.data[current_idx].dinfo.needed_count;
 
     for (size_t i = 0; i < offsets_count; i++) {
-        size_t off = loaded_modules[current_idx].dinfo.needed_str_offsets[i];
-        if (off >= loaded_modules[current_idx].dinfo.strsz) continue;
-        const char *dep_soname = &loaded_modules[current_idx].dinfo.strtab[off];
-        if (!is_library_loaded_in_memory(dep_soname, loaded_libs_cache)) {
+        size_t off = loaded_modules.data[current_idx].dinfo.needed_str_offsets[i];
+        if (off >= loaded_modules.data[current_idx].dinfo.strsz) continue;
+        const char *dep_soname = &loaded_modules.data[current_idx].dinfo.strtab[off];
+        uint32_t dep_hash = calc_gnu_hash(dep_soname);
+        if (!is_library_loaded_in_memory(dep_soname, dep_hash, loaded_libs_cache)) {
             LOGW("Warning: Module requires non-system dependency `%s` which is not in RAM.", dep_soname);
 
             // TODO: support multi-so module packages, maybe constructing
@@ -874,41 +968,37 @@ static bool load_dependencies_recursive(const char *lib_path, int memfd, std::ve
     return true;
 }
 
-static std::vector<LoadedModule>* g_currently_loading_modules = nullptr;
+static LoadedModuleList* g_currently_loading_modules = nullptr;
 
-static void register_loaded_modules(const std::vector<LoadedModule>& loaded_modules) {
-    if (loaded_modules.empty()) return;
+static void register_loaded_modules(const LoadedModuleList& loaded_modules) {
+    if (loaded_modules.size == 0) return;
 
     init_region_tracking();
     std::lock_guard<std::mutex> lock(*g_custom_regions_lock);
-    const LoadedModule& main_mod = loaded_modules[0];
+    const LoadedModule& main_mod = loaded_modules.data[0];
+    
+    CustomRegion& region = g_custom_regions->push_back();
+    region.handle = main_mod.base;
     DestructorAction action;
-    CustomRegion region;
-    MemMap map;
-    region.handle = main_mod.base; // Use this as primary ID
 
-    // We save the memory addresses of all modules (Main + Dependencies)
-    for (const auto& mod : loaded_modules) {
+    for (size_t i = 0; i < loaded_modules.size; i++) {
+        const auto& mod = loaded_modules.data[i];
         if (mod.base != 0 && mod.size != 0) {
-            map.base = mod.base;
-            map.size = mod.size;
-            region.maps.push_back(map);
+            region.maps.push_back({mod.base, mod.size});
         }
     }
 
-    // We collect all destroyers in reverse order of loading
-    for (auto it = loaded_modules.rbegin(); it != loaded_modules.rend(); ++it) {
-        const auto& mod = *it;
+    for (size_t i = loaded_modules.size; i > 0; --i) {
+        const auto& mod = loaded_modules.data[i - 1];
 
         // 1. FINI_ARRAY is executed in reverse order
         if (mod.dinfo.fini_array_vaddr && mod.dinfo.fini_arraysz) {
             size_t count = mod.dinfo.fini_arraysz / sizeof(ElfW(Addr));
             ElfW(Addr)* array_addr = reinterpret_cast<ElfW(Addr)*>(mod.load_bias + mod.dinfo.fini_array_vaddr);
-            for (size_t i = 0; i < count; ++i) {
-                if (array_addr[count - 1 - i]) {
-                    auto func = reinterpret_cast<void (*)()>(array_addr[count - 1 - i]);
+            for (size_t j = 0; j < count; ++j) {
+                if (array_addr[count - 1 - j]) {
                     action.type = DestructorAction::FUNC_PTR;
-                    action.func_ptr = func;
+                    action.func_ptr = reinterpret_cast<void (*)()>(array_addr[count - 1 - j]);
                     region.destructors.push_back(action);
                 }
             }
@@ -916,9 +1006,8 @@ static void register_loaded_modules(const std::vector<LoadedModule>& loaded_modu
 
         // 2. DT_FINI is executed after FINI_ARRAY
         if (mod.dinfo.fini_vaddr) {
-            auto func = reinterpret_cast<void (*)()>(mod.load_bias + mod.dinfo.fini_vaddr);
             action.type = DestructorAction::FUNC_PTR;
-            action.func_ptr = func;
+            action.func_ptr = reinterpret_cast<void (*)()>(mod.load_bias + mod.dinfo.fini_vaddr);
             region.destructors.push_back(action);
         }
 
@@ -929,19 +1018,17 @@ static void register_loaded_modules(const std::vector<LoadedModule>& loaded_modu
             region.destructors.push_back(action);
         }
 
-        for (tls_index* ti : mod.tlsdesc_args) {
+        for (size_t j = 0; j < mod.tlsdesc_args.size; j++) {
             action.type = DestructorAction::TLSDESC_CLEANUP;
-            action.tlsdesc_arg = ti;
+            action.tlsdesc_arg = mod.tlsdesc_args.data[j];
             region.destructors.push_back(action);
         }
     }
-
-    g_custom_regions->push_back(std::move(region));
 }
 
-static inline void cleanup_failed_load(const std::vector<LoadedModule>& loaded_modules) {
-    for (auto it = loaded_modules.rbegin(); it != loaded_modules.rend(); ++it) {
-        const auto& mod = *it;
+static inline void cleanup_failed_load(const LoadedModuleList& loaded_modules) {
+    for (size_t i = loaded_modules.size; i > 0; --i) {
+        const auto& mod = loaded_modules.data[i - 1];
         if (mod.dinfo.tls_mod_id) {
             CustomTlsInfo* tls_info = reinterpret_cast<CustomTlsInfo*>(mod.dinfo.tls_mod_id);
             pthread_key_delete(tls_info->key);
@@ -980,10 +1067,7 @@ extern "C" void* custom_tls_get_addr(tls_index* ti) {
 
 // ---------------- MAIN ----------------
 extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_total_size, uintptr_t *out_entry, uintptr_t *out_init_array, size_t *out_init_count) {
-    std::vector<LoadedModule> loaded_modules;
-
-    std::vector<std::string_view> loaded_libs_cache;
-    loaded_libs_cache.reserve(128); // Pre-allocate some space
+    LoadedModuleList loaded_modules; CachedLibList loaded_libs_cache;
     dl_iterate_phdr(build_cache_cb, &loaded_libs_cache);
 
     // Give a dummy name for the main module
@@ -993,14 +1077,17 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
         return false;
     }
 
-    if (loaded_modules.empty()) return false;
+    if (loaded_modules.size == 0) return false;
     g_currently_loading_modules = &loaded_modules;
 
     // Step 1: Hook TLS for all modules first
     constexpr const char* target_tls = "__tls_get_addr";
     constexpr uint32_t target_hash = calc_gnu_hash(target_tls);
+    constexpr uint32_t ADDR_BITS = sizeof(ElfW(Addr)) * 8;
+    constexpr uint32_t ADDR_MASK = ADDR_BITS - 1;
 
-    for (auto& mod : loaded_modules) {
+    for (size_t k = 0; k < loaded_modules.size; k++) {
+        auto& mod = loaded_modules.data[k];
         const elf_dyn_info* info = &mod.dinfo;
         if (info->nsyms == 0 || info->symtab == nullptr) continue;
 
@@ -1012,7 +1099,7 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
             ElfW(Sym)& sym = info->symtab[i];
             if (sym.st_name != 0 && sym.st_name < info->strsz) {
                 const char *name = &info->strtab[sym.st_name];
-                if (strcmp(name, target_tls) == 0) {
+                if (__builtin_strcmp(name, target_tls) == 0) {
                     sym.st_value = PAC_STRIP(reinterpret_cast<uintptr_t>(&custom_tls_get_addr)) - mod.load_bias;
                     sym.st_shndx = 1;
                     found = true;
@@ -1025,10 +1112,10 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
 
         if (info->gnu_buckets != nullptr && info->gnu_bloom_filter != nullptr) {
             uint32_t h2 = target_hash >> info->gnu_shift2;
-            uint32_t word_num = (target_hash / (sizeof(ElfW(Addr)) * 8)) & (info->gnu_bloom_filter_size - 1);
+            uint32_t word_num = (target_hash / ADDR_BITS) & (info->gnu_bloom_filter_size - 1);
 
-            ElfW(Addr) mask = (((ElfW(Addr))1) << (target_hash % (sizeof(ElfW(Addr)) * 8))) |
-                              (((ElfW(Addr))1) << (h2 % (sizeof(ElfW(Addr)) * 8)));
+            ElfW(Addr) mask = (((ElfW(Addr))1) << (target_hash & ADDR_MASK)) |
+                              (((ElfW(Addr))1) << (h2 & ADDR_MASK));
 
             if ((info->gnu_bloom_filter[word_num] & mask) == mask) {
                 uint32_t sym_idx = info->gnu_buckets[target_hash % info->gnu_buckets_size];
@@ -1041,8 +1128,7 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
                             ElfW(Sym)& sym = info->symtab[sym_idx];
                             if (sym.st_name != 0 && sym.st_name < info->strsz) {
                                 const char *name = &info->strtab[sym.st_name];
-                                if (strcmp(name, target_tls) == 0) {
-                                    // PAC Strip local function pointer before writing
+                                if (__builtin_strcmp(name, target_tls) == 0) {
                                     sym.st_value = PAC_STRIP(reinterpret_cast<uintptr_t>(&custom_tls_get_addr)) - mod.load_bias;
                                     sym.st_shndx = 1;
                                     break;
@@ -1058,9 +1144,10 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
         }
     }
 
-    // Step 2: Relocate and Initialize in REVERSE order (dependencies first)
-    for (auto it = loaded_modules.rbegin(); it != loaded_modules.rend(); ++it) {
-        auto& mod = *it;
+    const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+
+    for (size_t k = loaded_modules.size; k > 0; --k) {
+        auto& mod = loaded_modules.data[k - 1];
 
         if (!apply_module_relocations(mod, loaded_modules)) {
             LOGE("Failed to apply relocations for module %s", mod.path);
@@ -1069,13 +1156,8 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
         }
 
         if (mod.dinfo.relro_vaddr && mod.dinfo.relro_sz) {
-            size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
             uintptr_t relro_start = mod.load_bias + mod.dinfo.relro_vaddr;
             uintptr_t relro_end = relro_start + mod.dinfo.relro_sz;
-
-            // We align the end down (page_start instead of page_end).
-            // This avoids making the adjacent page read-only if the compiler 
-            // it didn't zero-padded it perfectly, protecting neighboring global variables.
             uintptr_t commit_start = page_start(relro_start, page_size);
             uintptr_t commit_end = page_start(relro_end, page_size);
 
@@ -1102,7 +1184,7 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
         }
     }
 
-    LoadedModule& main_mod = loaded_modules[0];
+    LoadedModule& main_mod = loaded_modules.data[0];
 
     ElfW(Addr) entry_value = 0;
     // Look for the normal Zygote entry
@@ -1114,7 +1196,7 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
 
         // If it has NEITHER of the two, then it is an invalid module
         if (!has_companion_entry) {
-            LOGE("Module %s exports neither 'zygisk_module_entry' nor 'zygisk_companion_entry'. Invalid module.", main_mod.path);
+            LOGE("Module exports neither 'zygisk_module_entry' nor 'zygisk_companion_entry'. Invalid module.");
             cleanup_failed_load(loaded_modules);
             return false;
         }
@@ -1122,8 +1204,8 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
 
     *out_base = main_mod.base;
     *out_total_size = main_mod.size;
-    *out_entry = (uintptr_t)main_mod.load_bias + (uintptr_t)entry_value;
-    *out_init_array = main_mod.dinfo.init_array_vaddr ? ((uintptr_t)main_mod.load_bias + main_mod.dinfo.init_array_vaddr) : 0;
+    *out_entry = main_mod.load_bias + entry_value;
+    *out_init_array = main_mod.dinfo.init_array_vaddr ? (main_mod.load_bias + main_mod.dinfo.init_array_vaddr) : 0;
     *out_init_count = main_mod.dinfo.init_arraysz ? (main_mod.dinfo.init_arraysz / sizeof(ElfW(Addr))) : 0;
 
     register_loaded_modules(loaded_modules);

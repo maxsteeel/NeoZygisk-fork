@@ -3,9 +3,7 @@
 #include <elf.h>
 #include <link.h>
 #include <sys/types.h>
-#include <vector>
 #include <cstdint>
-#include <memory>
 #include <sys/mman.h>
 
 #ifndef ALIGN_DOWN
@@ -79,12 +77,12 @@ struct elf_dyn_info {
 bool read_loop_offset(int fd, void *buf, size_t count, off_t offset);
 
 bool compute_load_layout(int fd, size_t page_size, ElfW(Ehdr) *eh,
-                         std::unique_ptr<ElfW(Phdr)[]>& out_phdr, ElfW(Addr) *out_min_vaddr,
+                         ElfW(Phdr) *out_phdr_buf, ElfW(Addr) *out_min_vaddr,
                          size_t *out_map_size);
 
-bool vaddr_to_offset(const std::unique_ptr<ElfW(Phdr)[]>& phdr, size_t phnum, ElfW(Addr) vaddr, off_t *out_off);
+bool vaddr_to_offset(const ElfW(Phdr)* phdr, size_t phnum, ElfW(Addr) vaddr, off_t *out_off);
 
-bool elf_load_dyn_info(void* memory_map, bool is_raw_file, const ElfW(Ehdr) *eh, const std::unique_ptr<ElfW(Phdr)[]>& phdr, elf_dyn_info *out);
+bool elf_load_dyn_info(void* memory_map, bool is_raw_file, const ElfW(Ehdr) *eh, const ElfW(Phdr)* phdr, elf_dyn_info *out);
 
 bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr) *out_value, uint8_t *out_type = nullptr);
 

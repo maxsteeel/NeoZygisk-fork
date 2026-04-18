@@ -1,6 +1,5 @@
 #include "elf_utils.hpp"
 #include <unistd.h>
-#include <string.h>
 #include <errno.h>
 
 bool read_loop_offset(int fd, void *buf, size_t count, off_t offset) {
@@ -16,23 +15,24 @@ bool read_loop_offset(int fd, void *buf, size_t count, off_t offset) {
 }
 
 bool compute_load_layout(int fd, size_t page_size, ElfW(Ehdr) *eh,
-                         std::unique_ptr<ElfW(Phdr)[]>& out_phdr, ElfW(Addr) *out_min_vaddr,
+                         ElfW(Phdr) *out_phdr_buf, ElfW(Addr) *out_min_vaddr,
                          size_t *out_map_size) {
+    
     if (!read_loop_offset(fd, eh, sizeof(*eh), 0)) return false;
-    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) return false;
-
+    if (*reinterpret_cast<uint32_t*>(eh->e_ident) != *reinterpret_cast<const uint32_t*>(ELFMAG)) return false;
     size_t phdr_sz = (size_t)eh->e_phnum * sizeof(ElfW(Phdr));
-    out_phdr = std::make_unique<ElfW(Phdr)[]>(eh->e_phnum);
-    if (!read_loop_offset(fd, out_phdr.get(), phdr_sz, eh->e_phoff)) return false;
+
+    // Caller provides the buffer (out_phdr_buf).
+    if (!read_loop_offset(fd, out_phdr_buf, phdr_sz, eh->e_phoff)) return false;
 
     ElfW(Addr) lo = (ElfW(Addr))UINTPTR_MAX;
     ElfW(Addr) hi = 0;
 
     for (int i = 0; i < eh->e_phnum; i++) {
-        if (out_phdr[i].p_type != PT_LOAD) continue;
-        if (out_phdr[i].p_vaddr < lo) lo = out_phdr[i].p_vaddr;
+        if (out_phdr_buf[i].p_type != PT_LOAD) continue;
+        if (out_phdr_buf[i].p_vaddr < lo) lo = out_phdr_buf[i].p_vaddr;
         ElfW(Addr) end;
-        if (__builtin_add_overflow(out_phdr[i].p_vaddr, out_phdr[i].p_memsz, &end)) return false;
+        if (__builtin_add_overflow(out_phdr_buf[i].p_vaddr, out_phdr_buf[i].p_memsz, &end)) return false;
         if (end > hi) hi = end;
     }
 
@@ -42,32 +42,32 @@ bool compute_load_layout(int fd, size_t page_size, ElfW(Ehdr) *eh,
     return true;
 }
 
-bool vaddr_to_offset(const std::unique_ptr<ElfW(Phdr)[]>& phdr, size_t phnum, ElfW(Addr) vaddr, off_t *out_off) {
+bool vaddr_to_offset(const ElfW(Phdr)* phdr, size_t phnum, ElfW(Addr) vaddr, off_t *out_off) {
     for (size_t i = 0; i < phnum; i++) {
         const auto& p = phdr[i];
         if (p.p_type != PT_LOAD) continue;
         ElfW(Addr) seg_start = p.p_vaddr;
         ElfW(Addr) seg_end = p.p_vaddr + p.p_filesz;
-        if (vaddr < seg_start || vaddr >= seg_end) continue;
-        *out_off = (off_t)p.p_offset + (off_t)(vaddr - seg_start);
-        return true;
+        if (vaddr >= seg_start && vaddr < seg_end) {
+            *out_off = (off_t)p.p_offset + (off_t)(vaddr - seg_start);
+            return true;
+        }
     }
     return false;
 }
 
-bool elf_load_dyn_info(void* memory_map, bool is_raw_file, const ElfW(Ehdr) *eh, const std::unique_ptr<ElfW(Phdr)[]>& phdr, elf_dyn_info *out) {
-    // Helper to calculate exact memory pointers without reading from disk
-    auto get_ptr = [&](ElfW(Addr) vaddr) -> void* {
-        if (is_raw_file) {
-            off_t offset;
-            if (vaddr_to_offset(phdr, eh->e_phnum, vaddr, &offset)) {
-                return reinterpret_cast<uint8_t*>(memory_map) + offset;
-            }
-            return nullptr;
+static inline void* get_mapped_ptr(void* map, bool is_raw, const ElfW(Phdr)* phdr, size_t phnum, ElfW(Addr) vaddr) {
+    if (is_raw) {
+        off_t offset;
+        if (vaddr_to_offset(phdr, phnum, vaddr, &offset)) {
+            return reinterpret_cast<uint8_t*>(map) + offset;
         }
-        return reinterpret_cast<uint8_t*>(memory_map) + vaddr;
-    };
+        return nullptr;
+    }
+    return reinterpret_cast<uint8_t*>(map) + vaddr;
+}
 
+bool elf_load_dyn_info(void* memory_map, bool is_raw_file, const ElfW(Ehdr) *eh, const ElfW(Phdr)* phdr, elf_dyn_info *out) {
     const ElfW(Phdr) *dyn_phdr = nullptr;
     for (size_t i = 0; i < eh->e_phnum; i++) {
         if (phdr[i].p_type == PT_DYNAMIC) dyn_phdr = &phdr[i];
@@ -85,7 +85,7 @@ bool elf_load_dyn_info(void* memory_map, bool is_raw_file, const ElfW(Ehdr) *eh,
 
     if (!dyn_phdr || dyn_phdr->p_filesz == 0) return false;
 
-    ElfW(Dyn)* dyn = reinterpret_cast<ElfW(Dyn)*>(get_ptr(dyn_phdr->p_vaddr));
+    ElfW(Dyn)* dyn = reinterpret_cast<ElfW(Dyn)*>(get_mapped_ptr(memory_map, is_raw_file, phdr, eh->e_phnum, dyn_phdr->p_vaddr));
     if (!dyn) return false;
 
     size_t dyn_count = dyn_phdr->p_filesz / sizeof(ElfW(Dyn));
@@ -130,12 +130,12 @@ bool elf_load_dyn_info(void* memory_map, bool is_raw_file, const ElfW(Ehdr) *eh,
     if (!out->syment) out->syment = sizeof(ElfW(Sym));
     if (!symtab_vaddr || !strtab_vaddr || !out->strsz) return false;
 
-    out->symtab = reinterpret_cast<ElfW(Sym)*>(get_ptr(symtab_vaddr));
-    out->strtab = reinterpret_cast<const char*>(get_ptr(strtab_vaddr));
+    out->symtab = reinterpret_cast<ElfW(Sym)*>(get_mapped_ptr(memory_map, is_raw_file, phdr, eh->e_phnum, symtab_vaddr));
+    out->strtab = reinterpret_cast<const char*>(get_mapped_ptr(memory_map, is_raw_file, phdr, eh->e_phnum, strtab_vaddr));
     if (!out->symtab || !out->strtab) return false;
 
     if (gnu_hash_vaddr) {
-        uint32_t* gnu_hash = reinterpret_cast<uint32_t*>(get_ptr(gnu_hash_vaddr));
+        uint32_t* gnu_hash = reinterpret_cast<uint32_t*>(get_mapped_ptr(memory_map, is_raw_file, phdr, eh->e_phnum, gnu_hash_vaddr));
         if (gnu_hash) {
             uint32_t nbuckets = gnu_hash[0];
             out->gnu_symndx = gnu_hash[1];
@@ -170,11 +170,15 @@ bool elf_load_dyn_info(void* memory_map, bool is_raw_file, const ElfW(Ehdr) *eh,
 bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr) *out_value, uint8_t *out_type) {
     if (info->gnu_buckets != nullptr && info->gnu_bloom_filter != nullptr) {
         uint32_t hash = calc_gnu_hash(sym_name);
-        uint32_t h2 = hash >> info->gnu_shift2;
-        uint32_t word_num = (hash / (sizeof(ElfW(Addr)) * 8)) & (info->gnu_bloom_filter_size - 1);
+        constexpr uint32_t ADDR_BITS = sizeof(ElfW(Addr)) * 8;
+        constexpr uint32_t ADDR_MASK = ADDR_BITS - 1;
 
-        ElfW(Addr) mask = (((ElfW(Addr))1) << (hash % (sizeof(ElfW(Addr)) * 8))) |
-                          (((ElfW(Addr))1) << (h2 % (sizeof(ElfW(Addr)) * 8)));
+        // bloom_filter_size is guaranteed to be a power of 2 by the GNU spec
+        uint32_t word_num = (hash / ADDR_BITS) & (info->gnu_bloom_filter_size - 1);
+        uint32_t h2 = hash >> info->gnu_shift2;
+
+        ElfW(Addr) mask = (((ElfW(Addr))1) << (hash & ADDR_MASK)) |
+                          (((ElfW(Addr))1) << (h2 & ADDR_MASK));
 
         if ((info->gnu_bloom_filter[word_num] & mask) == mask) {
             uint32_t sym_idx = info->gnu_buckets[hash % info->gnu_buckets_size];
@@ -186,7 +190,7 @@ bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr
                     if ((chain_val | 1) == (hash | 1)) {
                         const ElfW(Sym)& sym = info->symtab[sym_idx];
                         const char *name = &info->strtab[sym.st_name];
-                        if (strcmp(name, sym_name) == 0 && sym.st_shndx != SHN_UNDEF) {
+                        if (__builtin_strcmp(name, sym_name) == 0 && sym.st_shndx != SHN_UNDEF) {
                             *out_value = sym.st_value;
                             if (out_type) *out_type = ELF_ST_TYPE(sym.st_info);
                             return true;
@@ -205,7 +209,7 @@ bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr
         const ElfW(Sym)& sym = info->symtab[i];
         if (sym.st_name == 0 || sym.st_name >= info->strsz) continue;
         const char *name = &info->strtab[sym.st_name];
-        if (strcmp(name, sym_name) != 0 || sym.st_shndx == SHN_UNDEF) continue;
+        if (__builtin_strcmp(name, sym_name) != 0 || sym.st_shndx == SHN_UNDEF) continue;
         *out_value = sym.st_value;
         if (out_type) *out_type = ELF_ST_TYPE(sym.st_info);
         return true;
@@ -213,19 +217,18 @@ bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr
     return false;
 }
 
-struct SymData {
+struct alignas(void*) SymData {
     const char* lib_name;
     const char* sym_name;
+    uint32_t sym_hash;
     void* result;
 };
 
-static int sym_cb(struct dl_phdr_info* info, [[maybe_unused]] size_t size, void* data) {
+static int sym_cb(struct dl_phdr_info* info, size_t, void* data) {
     auto* search = reinterpret_cast<SymData*>(data);
 
     // Check if this is the library we are looking for
-    if (!info->dlpi_name || !strstr(info->dlpi_name, search->lib_name)) {
-        return 0; // Continue searching
-    }
+    if (!info->dlpi_name || !__builtin_strstr(info->dlpi_name, search->lib_name)) return 0;
 
     ElfW(Addr) base = info->dlpi_addr;
     ElfW(Dyn)* dyn = nullptr;
@@ -243,25 +246,49 @@ static int sym_cb(struct dl_phdr_info* info, [[maybe_unused]] size_t size, void*
     ElfW(Sym)* symtab = nullptr;
     const char* strtab = nullptr;
     uint32_t* gnu_hash = nullptr;
+    uint32_t found_tables = 0;
 
-    // Extract tables
+    // Extracting tables with EARLY EXIT
     for (ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; d++) {
-        if (d->d_tag == DT_SYMTAB) symtab = reinterpret_cast<ElfW(Sym)*>(base + d->d_un.d_ptr);
-        if (d->d_tag == DT_STRTAB) strtab = reinterpret_cast<const char*>(base + d->d_un.d_ptr);
-        if (d->d_tag == DT_GNU_HASH) gnu_hash = reinterpret_cast<uint32_t*>(base + d->d_un.d_ptr);
+        switch (d->d_tag) {
+            case DT_SYMTAB: 
+                symtab = reinterpret_cast<ElfW(Sym)*>(base + d->d_un.d_ptr); 
+                found_tables++; 
+                break;
+            case DT_STRTAB: 
+                strtab = reinterpret_cast<const char*>(base + d->d_un.d_ptr); 
+                found_tables++; 
+                break;
+            case DT_GNU_HASH: 
+                gnu_hash = reinterpret_cast<uint32_t*>(base + d->d_un.d_ptr); 
+                found_tables++; 
+                break;
+        }
+
+        if (found_tables == 3) break; 
     }
 
-    // Android libraries rely on GNU_HASH
-    if (symtab && strtab && gnu_hash) {
+    if (found_tables == 3) {
         uint32_t nbuckets = gnu_hash[0];
         uint32_t symoffset = gnu_hash[1];
         uint32_t bloom_size = gnu_hash[2];
+        uint32_t shift2 = gnu_hash[3];
 
         const ElfW(Addr)* bloom_filter = reinterpret_cast<const ElfW(Addr)*>(&gnu_hash[4]);
         const uint32_t* buckets = reinterpret_cast<const uint32_t*>(&bloom_filter[bloom_size]);
         const uint32_t* chains = &buckets[nbuckets];
 
-        uint32_t hash = calc_gnu_hash(search->sym_name);
+        uint32_t hash = search->sym_hash;
+        constexpr uint32_t ADDR_BITS = sizeof(ElfW(Addr)) * 8;
+        constexpr uint32_t ADDR_MASK = ADDR_BITS - 1;
+        uint32_t word_num = (hash / ADDR_BITS) & (bloom_size - 1);
+        uint32_t h2 = hash >> shift2;
+
+        ElfW(Addr) mask = (((ElfW(Addr))1) << (hash & ADDR_MASK)) |
+                          (((ElfW(Addr))1) << (h2 & ADDR_MASK));
+
+        if ((bloom_filter[word_num] & mask) != mask) return 0;
+
         uint32_t bucket = hash % nbuckets;
         uint32_t sym_idx = buckets[bucket];
 
@@ -270,23 +297,20 @@ static int sym_cb(struct dl_phdr_info* info, [[maybe_unused]] size_t size, void*
             do {
                 const ElfW(Sym)& sym = symtab[sym_idx];
                 if (((chains[sym_idx - symoffset] ^ hash) >> 1) == 0 && sym.st_shndx != SHN_UNDEF) {
-                    if (strcmp(strtab + sym.st_name, search->sym_name) == 0) {
-                        // Symbol found! Apply PAC stripping if necessary depending on your environment, 
-                        // though for JNI calls it's usually safe as-is.
+                    if (__builtin_strcmp(strtab + sym.st_name, search->sym_name) == 0) {
                         search->result = reinterpret_cast<void*>(base + sym.st_value);
-                        return 1; // Stop iterating
+                        return 1; 
                     }
                 }
                 sym_idx++;
             } while ((chains[sym_idx - 1 - symoffset] & 1) == 0);
         }
     }
-    return 0; // Continue just in case
+    return 0; 
 }
 
-// Drops dlopen/dlclose and extracts the symbol purely from mapped memory
 void* resolve_symbol(const char* lib_name, const char* sym_name) {
-    SymData search = {lib_name, sym_name, nullptr};
+    SymData search = {lib_name, sym_name, calc_gnu_hash(sym_name), nullptr};
     dl_iterate_phdr(sym_cb, &search);
     return search.result;
 }
