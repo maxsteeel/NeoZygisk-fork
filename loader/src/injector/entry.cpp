@@ -1,10 +1,8 @@
-#include <dlfcn.h>
+#include <stddef.h>
 
 #include "daemon.hpp"
 #include "logging.hpp"
 #include "zygisk.hpp"
-
-using namespace std;
 
 extern "C" [[gnu::visibility("default")]]
 void entry(void* addr, size_t size, const char* path, void (**init_array)(), size_t init_count) {
@@ -35,34 +33,11 @@ void entry(void* addr, size_t size, const char* path, void (**init_array)(), siz
  * By providing our own version, the dynamic linker resolves any calls from within our
  * injector library (and its static dependencies) to this function instead of the real one.
  *
- * @param func The function pointer (destructor) to be registered.
- * @param arg  A pointer to the argument for the function (the 'this' pointer for an object).
- * @param dso  A handle to the shared object that is registering the handler.
- * @return int Always returns 0 to indicate success, tricking the caller into thinking
- *             the handler was registered while we have actually blocked it.
+ * We silently swallow the registration. Logging or resolving symbols here via dladdr() 
+ * during the volatile init_array phase is slow.
  */
 extern "C" [[gnu::visibility("default")]] 
-int __cxa_atexit(void (*func)(void*), void* arg, void* dso) {
-    // Dl_info will be filled with information about the library
-    // containing the function pointer 'func'.
-    Dl_info info;
-
-    // Use dladdr() to resolve the function pointer to a library and symbol.
-    if (dladdr(reinterpret_cast<const void*>(func), &info)) {
-        // Successfully resolved the address.
-        const char* library_path = info.dli_fname ? info.dli_fname : "<unknown library>";
-        const char* symbol_name = info.dli_sname ? info.dli_sname : "<unknown symbol>";
-
-        LOGV("atexit registration BLOCKED [func, lib, sym, obj, dso]: [%p, %s, %s, %p, %p]", func,
-             library_path, symbol_name, arg, dso);
-
-    } else {
-        // dladdr() failed. We can still log the raw pointer.
-        LOGV("atexit registration BLOCKED for function at %p without library information).", func);
-    }
-
-    return 0;
-}
+int __cxa_atexit(void (*)(void*), void*, void*) { return 0; }
 
 extern "C" [[gnu::visibility("default")]] 
-void __cxa_finalize([[maybe_unused]] void * d) {}
+void __cxa_finalize(void*) {}

@@ -2,9 +2,6 @@
 
 #include <sys/types.h>
 
-#include <string>
-#include <string_view>
-
 #include "types.hpp"
 
 // Forward declaration to break circular dependency
@@ -31,8 +28,8 @@ public:
     // Public methods for state modification
     const Status& get_status() const;
     void notify_injected();
-    void set_daemon_info(std::string_view info);
-    void set_daemon_crashed(std::string_view error);
+    void set_daemon_info(const char* info, size_t len);
+    void set_daemon_crashed(const char* error, size_t len);
 
     const char* const abi_name_;
     const char* const program_path_;

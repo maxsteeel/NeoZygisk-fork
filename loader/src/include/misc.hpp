@@ -1,11 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <pthread.h>
 #include <string.h>
-
-#include <string_view>
-#include <string>
-#include <utility>
 
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #define likely(x)   __builtin_expect(!!(x), 1)
@@ -17,13 +14,13 @@ inline void sort(It first, It last, Compare comp) {
     
     // Insertion sort is faster for very small arrays
     if (n < 32) {
-        for (size_t i = 1; i < n; i += 1) {
-            auto temp = std::move(*(first + i));
+        for (size_t i = 1; i < n; i++) {
+            auto temp = *(first + i);
             size_t j;
-            for (j = i; j > 0 && comp(temp, *(first + (j - 1))); j -= 1) {
-                *(first + j) = std::move(*(first + (j - 1)));
+            for (j = i; j > 0 && comp(temp, *(first + (j - 1))); j--) {
+                *(first + j) = *(first + (j - 1));
             }
-            *(first + j) = std::move(temp);
+            *(first + j) = temp;
         }
         return;
     }
@@ -33,13 +30,13 @@ inline void sort(It first, It last, Compare comp) {
     while (gap < n / 3) gap = 3 * gap + 1;
     
     for (; gap > 0; gap /= 3) {
-        for (size_t i = gap; i < n; i += 1) {
-            auto temp = std::move(*(first + i));
+        for (size_t i = gap; i < n; i++) {
+            auto temp = *(first + i);
             size_t j;
             for (j = i; j >= gap && comp(temp, *(first + (j - gap))); j -= gap) {
-                *(first + j) = std::move(*(first + (j - gap)));
+                *(first + j) = *(first + (j - gap));
             }
-            *(first + j) = std::move(temp);
+            *(first + j) = temp;
         }
     }
 }
@@ -98,6 +95,22 @@ public:
 
 private:
     pthread_mutex_t* mutex;
+};
+
+struct SpinLockGuard {
+    std::atomic_flag& flag_;
+    SpinLockGuard(std::atomic_flag& flag) : flag_(flag) {
+        while (flag_.test_and_set(std::memory_order_acquire)) {
+#if defined(__aarch64__) || defined(__arm__)
+            asm volatile("yield" ::: "memory");
+#elif defined(__i386__) || defined(__x86_64__)
+            asm volatile("pause" ::: "memory");
+#endif
+        }
+    }
+    ~SpinLockGuard() {
+        flag_.clear(std::memory_order_release);
+    }
 };
 
 bool is_kernel_5_9_or_newer();

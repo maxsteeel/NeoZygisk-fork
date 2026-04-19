@@ -2,8 +2,8 @@
 
 #include <sys/types.h>
 #include <unistd.h>
-#include <mutex>
 #include "daemon.hpp"
+#include "utils.hpp"
 
 namespace zygisk_mount { // Renamed from mount to zygisk_mount
 
@@ -29,7 +29,7 @@ private:
     // Unmounts filesystems related to root solutions from the current mount namespace.
     static bool clean_mount_namespace();
 
-    mutable std::mutex mtx_;
+    mutable SpinMutex mtx_;
     int clean_mnt_ns_fd_;
     int root_mnt_ns_fd_;
 };

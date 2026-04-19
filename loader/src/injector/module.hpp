@@ -2,17 +2,126 @@
 
 #include <regex.h>
 
-#include <bitset>
-#include <list>
-#include <span>
-#include <vector>
-#include <unordered_map>
-
 #include "api.hpp"
 #include "daemon.hpp"
+#include "elf_utils.hpp"
 #include "lsplt.hpp"
 #include "misc.hpp"
+#include "utils.hpp"
 #include "zygisk.hpp"
+
+struct CachedMapEntry {
+    const char* name;
+    uint32_t name_hash;
+    const lsplt::MapInfo* info;
+};
+
+struct PltBackupEntry {
+    dev_t dev;
+    ino_t inode;
+    const char* sym;
+    void** backup_ptr;
+};
+
+struct CachedMapList {
+    CachedMapEntry* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+    ~CachedMapList() { free(data); }
+    void push_back(const CachedMapEntry& entry) {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 16 : capacity * 2;
+            data = (CachedMapEntry*)realloc(data, capacity * sizeof(CachedMapEntry));
+        }
+        data[size++] = entry;
+    }
+};
+
+struct PltBackupList {
+    PltBackupEntry* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+    ~PltBackupList() { free(data); }
+    void push_back(const PltBackupEntry& entry) {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 16 : capacity * 2;
+            data = (PltBackupEntry*)realloc(data, capacity * sizeof(PltBackupEntry));
+        }
+        data[size++] = entry;
+    }
+};
+
+struct MountInfoList {
+    mount_info* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+    ~MountInfoList() { free(data); }
+    void push_back(const mount_info& info) {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 8 : capacity * 2;
+            data = (mount_info*)realloc(data, capacity * sizeof(mount_info));
+        }
+        data[size++] = info;
+    }
+};
+
+struct RegisterInfo {
+    char symbol[128];
+    void *callback;
+    void **backup;
+    bool is_regex;
+    char literal[128];
+    regex_t regex;
+};
+
+struct RegisterInfoList {
+    RegisterInfo* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+    ~RegisterInfoList() { free(data); }
+    void push_back(const RegisterInfo& info) {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 16 : capacity * 2;
+            data = (RegisterInfo*)realloc(data, capacity * sizeof(RegisterInfo));
+        }
+        data[size++] = info;
+    }
+};
+
+struct IgnoreInfo {
+    char symbol[128];
+    bool is_regex;
+    char literal[128];
+    regex_t regex;
+};
+
+struct IgnoreInfoList {
+    IgnoreInfo* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+    ~IgnoreInfoList() { free(data); }
+    void push_back(const IgnoreInfo& info) {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 16 : capacity * 2;
+            data = (IgnoreInfo*)realloc(data, capacity * sizeof(IgnoreInfo));
+        }
+        data[size++] = info;
+    }
+};
+
+struct BoolList {
+    bool* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+    ~BoolList() { free(data); }
+    void push_back(bool val) {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 256 : capacity * 2;
+            data = (bool*)realloc(data, capacity * sizeof(bool));
+        }
+        data[size++] = val;
+    }
+};
 
 struct ZygiskContext;
 struct HookContext;
@@ -198,6 +307,7 @@ union ApiTable {
 };
 
 struct ZygiskModule {
+    int id;
     void onLoad(void *env) { entry.fn(&api, env); }
 
     void preAppSpecialize(AppSpecializeArgs_v5 *args) const;
@@ -221,13 +331,12 @@ struct ZygiskModule {
     static bool RegisterModuleImpl(ApiTable *api, long *module);
 
 private:
-    const int id;
     bool unload = false;
 
-    void *const handle;
+    void *handle;
     union {
-        void *const ptr;
-        void (*const fn)(void *, void *);
+        void *ptr;
+        void (*fn)(void *, void *);
     } entry;
 
     ApiTable api;
@@ -255,6 +364,31 @@ enum : uint32_t {
     void name##_pre();                                                                             \
     void name##_post();
 
+struct ModuleInfo {
+    int id;
+    void* handle;
+    void* entry;
+};
+
+struct ModuleList {
+    ZygiskModule** data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+    ~ModuleList() { 
+        if (data) {
+            for (size_t i = 0; i < size; i++) delete data[i];
+            free(data);
+        }
+    }
+    void push_back(ZygiskModule* val) {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 8 : capacity * 2;
+            data = (ZygiskModule**)realloc(data, capacity * sizeof(ZygiskModule*));
+        }
+        data[size++] = val;
+    }
+};
+
 struct ZygiskContext {
     JNIEnv *env;
     union {
@@ -264,33 +398,17 @@ struct ZygiskContext {
     } args;
 
     const char *process;
-    std::list<ZygiskModule> modules;
+    ModuleList modules;
 
     pid_t pid;
     uint32_t flags;
     uint32_t info_flags;
-    std::vector<uint8_t> allowed_fds;
-    std::vector<int> exempted_fds;
-
-    struct RegisterInfo {
-        bool is_regex;
-        regex_t regex;
-        char literal[128];
-        char symbol[128];
-        void *callback;
-        void **backup;
-    };
-
-    struct IgnoreInfo {
-        bool is_regex;
-        regex_t regex;
-        char literal[128];
-        char symbol[128];
-    };
+    BoolList allowed_fds;
+    IntList exempted_fds;
 
     pthread_mutex_t hook_info_lock;
-    std::vector<RegisterInfo> register_info;
-    std::vector<IgnoreInfo> ignore_info;
+    RegisterInfoList register_info;
+    IgnoreInfoList ignore_info;
 
     ZygiskContext(JNIEnv *env, void *args);
     ~ZygiskContext();
@@ -321,23 +439,29 @@ struct ZygiskContext {
 
 #undef DCL_PRE_POST
 
-using JNIMethods = std::span<JNINativeMethod>;
+struct JNIMethods {
+    JNINativeMethod* methods;
+    size_t count;
+    JNIMethods(JNINativeMethod* m, size_t c) : methods(m), count(c) {}
+    JNINativeMethod* begin() const { return methods; }
+    JNINativeMethod* end() const { return methods + count; }
+    size_t size() const { return count; }
+};
 
 struct HookContext {
 #include "jni_hooks.hpp"
 
-    // std::array<JNINativeMethod> zygote_methods
     void *start_addr = nullptr;
+    jmethodID member_getModifiers = nullptr;
+    lsplt::MapInfoList cached_map_infos = {};
+    CachedMapList map_info_cache;
+    PltBackupList plt_backup;
+    MountInfoList zygote_traces;
     size_t block_size = 0;
+    jint MODIFIER_NATIVE = 0;
     bool should_unmap = false;
     bool skip_hooking_unloader = false;
     bool zygote_unmounted = false;
-    jint MODIFIER_NATIVE = 0;
-    jmethodID member_getModifiers = nullptr;
-    std::vector<lsplt::MapInfo> cached_map_infos = {};
-    std::vector<std::pair<std::string_view, const lsplt::MapInfo*>> map_info_cache;
-    std::vector<std::tuple<dev_t, ino_t, const char *, void **>> plt_backup;
-    std::vector<mount_info> zygote_traces;
 
     HookContext(void *start_addr, size_t block_size);
 
@@ -354,13 +478,16 @@ private:
     void register_hook(dev_t dev, ino_t inode, const char *symbol, void *new_func, void **old_func);
 };
 
-inline const lsplt::MapInfo* find_in_cache(const std::vector<std::pair<std::string_view, const lsplt::MapInfo*>>& cache, std::string_view name) {
-    auto it = std::lower_bound(cache.begin(), cache.end(), name,
-        [](const auto& pair, std::string_view n) {
-            return pair.first < n;
-        });
-    if (it != cache.end() && it->first == name) {
-        return it->second;
+inline const lsplt::MapInfo* find_in_cache(const CachedMapList& cache, const char* name) {
+    uint32_t target_hash = calc_gnu_hash(name);
+    for (size_t i = 0; i < cache.size; ++i) {
+        if (__builtin_expect(cache.data[i].name_hash == target_hash, 0)) {
+            if (__builtin_strcmp(cache.data[i].name, name) == 0) {
+                return cache.data[i].info;
+            }
+        }
     }
     return nullptr;
 }
+
+MountInfoList check_zygote_traces(uint32_t info_flags);

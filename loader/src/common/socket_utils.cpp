@@ -3,9 +3,8 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
-
-#include <cstddef>
 #include <cstring>
+#include <stdint.h>
 
 #include "logging.hpp"
 
@@ -13,8 +12,8 @@ namespace socket_utils {
 
 ssize_t xread(int fd, void* buf, size_t count) {
     if (count == 0) [[unlikely]] return 0;
-    std::byte* ptr = static_cast<std::byte*>(buf);
-    const std::byte* const end = ptr + count;
+    uint8_t* ptr = static_cast<uint8_t*>(buf);
+    const uint8_t* const end = ptr + count;
 
     ssize_t ret_initial = read(fd, ptr, count);
     if (ret_initial == static_cast<ssize_t>(count)) [[likely]] {
@@ -40,7 +39,7 @@ ssize_t xread(int fd, void* buf, size_t count) {
         }
     }
 
-    size_t read_sz = ptr - static_cast<std::byte*>(buf);
+    size_t read_sz = ptr - static_cast<uint8_t*>(buf);
     if (read_sz != count) [[unlikely]] {
         PLOGE("read (%zu != %zu)", count, read_sz);
     }
@@ -49,8 +48,8 @@ ssize_t xread(int fd, void* buf, size_t count) {
 
 size_t xwrite(int fd, const void* buf, size_t count) {
     if (count == 0) [[unlikely]] return 0;
-    const std::byte* ptr = static_cast<const std::byte*>(buf);
-    const std::byte* const end = ptr + count;
+    const uint8_t* ptr = static_cast<const uint8_t*>(buf);
+    const uint8_t* const end = ptr + count;
 
     ssize_t ret_initial = write(fd, ptr, count);
     if (ret_initial == static_cast<ssize_t>(count)) [[likely]] {
@@ -70,11 +69,11 @@ size_t xwrite(int fd, const void* buf, size_t count) {
             break;
         } else if (errno != EINTR) [[unlikely]] {
             PLOGE("write");
-            return ptr - static_cast<const std::byte*>(buf);
+            return ptr - static_cast<const uint8_t*>(buf);
         }
     }
 
-    size_t write_sz = ptr - static_cast<const std::byte*>(buf);
+    size_t write_sz = ptr - static_cast<const uint8_t*>(buf);
     if (write_sz != count) [[unlikely]] {
         PLOGE("write (%zu != %zu)", count, write_sz);
     }
@@ -94,8 +93,6 @@ ssize_t xsendmsg(int sockfd, const struct msghdr* msg, int flags) {
 }
 
 void* recv_fds(int sockfd, char* cmsgbuf, size_t bufsz, int cnt) {
-    // Create a throwaway buffer.
-    // It must match the size Rust sends (sizeof(int) = 4 bytes).
     int dummy_data;
 
     iovec iov = {
@@ -110,55 +107,43 @@ void* recv_fds(int sockfd, char* cmsgbuf, size_t bufsz, int cnt) {
                   .msg_controllen = bufsz,
                   .msg_flags = 0};
 
-    // MSG_CMSG_CLOEXEC forces any File Descriptor received 
-    // for this socket to be automatically marked to close in execve,
-    // avoiding leaks to daughter applications.
     ssize_t rec = xrecvmsg(sockfd, &msg, MSG_WAITALL | MSG_CMSG_CLOEXEC);
 
-    // --- IO Failed or Stream Desync ---
     if (rec != sizeof(dummy_data)) {
         PLOGE("recv_fds: IO failure. Read %zd bytes, expected %zu", rec, sizeof(dummy_data));
     }
 
     cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
 
-    // --- No headers received ---
     if (cmsg == nullptr) {
-        LOGE("recv_fds: No control headers received. msg_controllen=%zu",
-             (size_t) msg.msg_controllen);
+        LOGE("recv_fds: No control headers received. msg_controllen=%zu", (size_t) msg.msg_controllen);
         return nullptr;
     }
 
-    // Check msg_controllen <= bufsz
     if (msg.msg_controllen != bufsz) {
-        LOGW("recv_fds: Size mismatch. Buffer capacity: %zu, Received len: %zu", bufsz,
-             (size_t) msg.msg_controllen);
+        LOGW("recv_fds: Size mismatch. Buffer capacity: %zu, Received len: %zu", bufsz, (size_t) msg.msg_controllen);
     }
 
-    // Check Header Length Field
     size_t expected_cmsg_len = CMSG_LEN(sizeof(int) * cnt);
     if (cmsg->cmsg_len != expected_cmsg_len) {
         LOGW("recv_fds: CMSG header len mismatch. Header says: %zu, Calculated: %zu (cnt=%d)",
              (size_t) cmsg->cmsg_len, expected_cmsg_len, cnt);
     }
 
-    // Check Protocol details
     if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) {
         LOGW("recv_fds: Protocol mismatch. Level: %d (exp %d), Type: %d (exp %d)", cmsg->cmsg_level,
              SOL_SOCKET, cmsg->cmsg_type, SCM_RIGHTS);
     }
 
-    // Return data anyway so we can see if the FD is valid
     return CMSG_DATA(cmsg);
 }
 
 uint8_t read_u8(int fd) { return read_exact_or<uint8_t>(fd, 0); }
-
 uint32_t read_u32(int fd) { return read_exact_or<uint32_t>(fd, 0); }
-
 size_t read_usize(int fd) { return read_exact_or<size_t>(fd, 0); }
-
 bool write_usize(int fd, size_t val) { return write_exact<size_t>(fd, val); }
+bool write_u8(int fd, uint8_t val) { return write_exact<uint8_t>(fd, val); }
+bool write_u32(int fd, uint32_t val) { return write_exact<uint32_t>(fd, val); }
 
 void read_string(int fd, char* buf, size_t buf_size) {
     auto len = read_usize(fd);
@@ -171,7 +156,7 @@ void read_string(int fd, char* buf, size_t buf_size) {
     buf[read_len] = '\0';
 
     if (len > read_len) [[unlikely]] {
-        char trash[8196];
+        char trash[1024]; 
         size_t remain = len - read_len;
         while (remain > 0) {
             size_t to_read = (remain < sizeof(trash)) ? remain : sizeof(trash);
@@ -181,16 +166,12 @@ void read_string(int fd, char* buf, size_t buf_size) {
     }
 }
 
-bool write_u8(int fd, uint8_t val) { return write_exact<uint8_t>(fd, val); }
-
-bool write_u32(int fd, uint32_t val) { return write_exact<uint32_t>(fd, val); }
-
-bool write_string(int fd, std::string_view str) {
-    size_t len = str.size();
+bool write_string(int fd, const char* str) {
+    size_t len = str ? __builtin_strlen(str) : 0;
     struct iovec iov[2];
     iov[0].iov_base = &len;
     iov[0].iov_len = sizeof(len);
-    iov[1].iov_base = const_cast<char*>(str.data());
+    iov[1].iov_base = const_cast<char*>(str ? str : "");
     iov[1].iov_len = len;
 
     size_t total = sizeof(len) + len;
@@ -201,7 +182,6 @@ bool write_string(int fd, std::string_view str) {
         if (ret > 0) [[likely]] {
             written += ret;
             if (written < total) [[unlikely]] {
-                // Adjust iovec for partial write
                 if (static_cast<size_t>(ret) >= iov[0].iov_len) {
                     size_t str_written = ret - iov[0].iov_len;
                     iov[1].iov_base = static_cast<char*>(iov[1].iov_base) + str_written;
@@ -229,7 +209,7 @@ int recv_fd(int sockfd) {
     if (data == nullptr) return -1;
 
     int result;
-    memcpy(&result, data, sizeof(int));
+    __builtin_memcpy(&result, data, sizeof(int));
     return result;
 }
 
@@ -251,7 +231,7 @@ bool send_fd(int sockfd, int fd) {
     cmsg->cmsg_level = SOL_SOCKET;
     cmsg->cmsg_type = SCM_RIGHTS;
     cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+    __builtin_memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
 
     ssize_t sent = xsendmsg(sockfd, &msg, 0);
     if (sent != sizeof(dummy_data)) {

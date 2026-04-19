@@ -22,9 +22,7 @@
 #include <stdlib.h>
 #include <sys/auxv.h>
 
-#include <string_view>
-#include <mutex>
-
+#include "misc.hpp"
 #include "logging.hpp"
 #include "files.hpp"
 #include "elf_utils.hpp"
@@ -260,12 +258,11 @@ struct CustomRegionList {
 };
 
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
-static std::mutex* g_custom_regions_lock = nullptr;
+static std::atomic_flag g_custom_regions_lock = ATOMIC_FLAG_INIT;
 static CustomRegionList* g_custom_regions = nullptr;
 
 /* Actual allocator function called only once */
 static void do_init_tracking() {
-    g_custom_regions_lock = new std::mutex();
     g_custom_regions = new CustomRegionList();
 }
 
@@ -278,7 +275,7 @@ static void init_region_tracking() {
 bool is_custom_linker_address(const void* addr) {
     init_region_tracking();
     uintptr_t ptr = reinterpret_cast<uintptr_t>(addr);
-    std::lock_guard<std::mutex> lock(*g_custom_regions_lock);
+    SpinLockGuard lock(g_custom_regions_lock);
     for (size_t i = 0; i < g_custom_regions->size; i++) {
         const auto& reg = g_custom_regions->data[i];
         for (size_t j = 0; j < reg.maps.size; j++) {
@@ -292,7 +289,7 @@ bool is_custom_linker_address(const void* addr) {
 void custom_linker_unload(void* handle) {
     init_region_tracking();
     uintptr_t base = reinterpret_cast<uintptr_t>(handle);
-    std::lock_guard<std::mutex> lock(*g_custom_regions_lock);
+    SpinLockGuard lock(g_custom_regions_lock);
     for (size_t i = 0; i < g_custom_regions->size; i++) {
         auto& reg = g_custom_regions->data[i];
         if (reg.handle == base) {
@@ -974,7 +971,7 @@ static void register_loaded_modules(const LoadedModuleList& loaded_modules) {
     if (loaded_modules.size == 0) return;
 
     init_region_tracking();
-    std::lock_guard<std::mutex> lock(*g_custom_regions_lock);
+    SpinLockGuard lock(g_custom_regions_lock);
     const LoadedModule& main_mod = loaded_modules.data[0];
     
     CustomRegion& region = g_custom_regions->push_back();

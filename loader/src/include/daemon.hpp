@@ -2,10 +2,6 @@
 
 #include <unistd.h>
 #include <cstdint>
-
-#include <string>
-#include <string_view>
-#include <vector>
 #include "misc.hpp"
 
 #if defined(__LP64__)
@@ -33,15 +29,20 @@ public:
 
     UniqueFd& operator=(const UniqueFd&) = delete;
 
-    // Allow move
-    UniqueFd(UniqueFd&& other) { std::swap(fd_, other.fd_); }
+    UniqueFd(UniqueFd&& other) noexcept : fd_(other.fd_) {
+        other.fd_ = -1;
+    }
 
-    UniqueFd& operator=(UniqueFd&& other) {
-        std::swap(fd_, other.fd_);
+    UniqueFd& operator=(UniqueFd&& other) noexcept {
+        if (this != &other) {
+            if (fd_ >= 0) close(fd_);
+            fd_ = other.fd_;
+            other.fd_ = -1;
+        }
         return *this;
     }
 
-    // Implict cast to Fd
+    // Implicit cast to Fd
     operator const Fd&() const { return fd_; }
 
     // Relinquish ownership of the file descriptor without closing it.

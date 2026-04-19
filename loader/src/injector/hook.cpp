@@ -6,12 +6,6 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <string>
-#include <string_view>
-#include <vector>
-#include <algorithm>
-#include <unordered_map>
-#include <functional>
 #include <fcntl.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
@@ -20,6 +14,7 @@
 #include <linux/audit.h>
 #include <stdint.h>
 #include <atomic>
+#include <stdlib.h>
 
 #include <lsplt.hpp>
 
@@ -31,27 +26,46 @@
 #include "zygisk.hpp"
 #include "constants.hpp"
 
-using namespace std;
-
 extern constants::ZygiskSharedData* g_shared_data;
 const char *moduleId = "zygisksu";
 
 struct Property {
-    string key;
-    string value;
+    uint32_t key_hash;
+    char key[92];
+    char value[92];
 };
 
-vector<Property> g_spoof_props;
+struct PropertyList {
+    Property* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+    ~PropertyList() { free(data); }
+    void push_back(uint32_t h, const char* k, const char* v) {
+        if (size >= capacity) {
+            capacity = capacity == 0 ? 8 : capacity * 2;
+            data = (Property*)realloc(data, capacity * sizeof(Property));
+        }
+        data[size].key_hash = h;
+        size_t kl = __builtin_strlen(k); if(kl > 91) kl = 91;
+        __builtin_memcpy(data[size].key, k, kl); data[size].key[kl] = '\0';
+
+        size_t vl = __builtin_strlen(v); if(vl > 91) vl = 91;
+        __builtin_memcpy(data[size].value, v, vl); data[size].value[vl] = '\0';
+        size++;
+    }
+};
+
+PropertyList g_spoof_props;
 
 static const Property* find_spoof_prop(const char* name) {
-    if (!name || g_spoof_props.empty()) return nullptr;
-    std::string_view name_sv(name);
-    auto it = std::lower_bound(g_spoof_props.begin(), g_spoof_props.end(), name_sv,
-        [](const Property& p, std::string_view n) {
-            return std::string_view(p.key) < n;
-        });
-    if (it != g_spoof_props.end() && it->key == name_sv) {
-        return &(*it);
+    if (!name || g_spoof_props.size == 0) return nullptr;
+    uint32_t hash = calc_gnu_hash(name);
+    for (size_t i = 0; i < g_spoof_props.size; i++) {
+        if (__builtin_expect(g_spoof_props.data[i].key_hash == hash, 0)) {
+            if (__builtin_strcmp(g_spoof_props.data[i].key, name) == 0) {
+                return &g_spoof_props.data[i];
+            }
+        }
     }
     return nullptr;
 }
@@ -64,62 +78,66 @@ struct CustomCallbackCookie {
     void* original_cookie;
 };
 
-static string_view trim(string_view sv) {
-    size_t first = sv.find_first_not_of(" \t\r\n");
-    if (string_view::npos == first) return "";
-    size_t last = sv.find_last_not_of(" \t\r\n");
-    return sv.substr(first, (last - first + 1));
+static void trim_inplace(char* str) {
+    if (!str) return;
+    char* start = str;
+    while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+    char* end = start + __builtin_strlen(start) - 1;
+    while (end > start && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) end--;
+    *(end + 1) = '\0';
+    if (start != str) __builtin_memmove(str, start, end - start + 2);
 }
 
-static string generate_random_hex(int len) {
-    UniqueFd fd(open("/dev/urandom", O_RDONLY));
+static void generate_random_hex(char* buf, int len) {
+    UniqueFd fd(open("/dev/urandom", O_RDONLY | O_CLOEXEC));
     if (fd >= 0) {
         int read_len = len / 2;
-        // len is hardcoded to 64 in InitRandomVbmeta, so alloca is safe
-        unsigned char* buffer = static_cast<unsigned char*>(alloca(read_len));
+        unsigned char* buffer = static_cast<unsigned char*>(__builtin_alloca(read_len));
         if (read(fd, buffer, read_len) == read_len) {
             const char* digits = "0123456789abcdef";
-            char* buf = static_cast<char*>(alloca(len));
             for (int i = 0; i < read_len; ++i) {
                 buf[i * 2]     = digits[buffer[i] >> 4];
                 buf[i * 2 + 1] = digits[buffer[i] & 0x0F];
             }
-            // If len is odd, pad the last character with '0'
-            if (len % 2 != 0) {
-                buf[len - 1] = '0';
-            }
-            return string(buf, len);
+            if (len % 2 != 0) buf[len - 1] = '0';
+            buf[len] = '\0';
+            return;
         }
     }
-    return string(len, 0);
+    __builtin_memset(buf, '0', len);
+    buf[len] = '\0';
 }
 
 void InitRandomVbmeta() {
-    // Generate a random value of 64 hex characters
-    char fake_digest[65] = {0};
-    strcpy(fake_digest, generate_random_hex(64).c_str());
-    g_spoof_props.push_back({"ro.boot.vbmeta.digest", fake_digest});
+    char fake_digest[65];
+    generate_random_hex(fake_digest, 64);
+    g_spoof_props.push_back(calc_gnu_hash("ro.boot.vbmeta.digest"), "ro.boot.vbmeta.digest", fake_digest);
 }
 
 void LoadPropConfig() {
-    string config_path = string("/data/adb/modules/") + moduleId + "/spoof.prop";
-    UniqueFd fd(open(config_path.c_str(), O_RDONLY));
+    char config_path[256];
+    snprintf(config_path, sizeof(config_path), "/data/adb/modules/%s/spoof.prop", moduleId);
+    
+    UniqueFd fd(open(config_path, O_RDONLY | O_CLOEXEC));
     if (fd < 0) return;
 
     struct stat st;
     if (fstat(fd, &st) == 0 && st.st_size > 0) {
-        vector<char> buffer(st.st_size + 1, 0);
-        if (read(fd, buffer.data(), st.st_size) == st.st_size) {
+        char* buffer = (char*)malloc(st.st_size + 1);
+        if (read(fd, buffer, st.st_size) == st.st_size) {
+            buffer[st.st_size] = '\0';
             char* saveptr;
-            char* line = strtok_r(buffer.data(), "\n", &saveptr);
+            char* line = strtok_r(buffer, "\n", &saveptr);
             while (line != nullptr) {
-                string_view sLine = trim(line);
-                if (!sLine.empty() && sLine[0] != '#') {
-                    size_t eq_pos = sLine.find('=');
-                    if (eq_pos != string_view::npos) {
-                        string_view key = trim(sLine.substr(0, eq_pos));
-                        string_view value = trim(sLine.substr(eq_pos + 1));
-                        g_spoof_props.push_back({string(key), string(value)});
+                char* eq_pos = __builtin_strchr(line, '=');
+                if (eq_pos && line[0] != '#') {
+                    *eq_pos = '\0';
+                    char* key = line;
+                    char* value = eq_pos + 1;
+                    trim_inplace(key);
+                    trim_inplace(value);
+                    if (key[0] != '\0') {
+                        g_spoof_props.push_back(calc_gnu_hash(key), key, value);
                     }
                 }
                 line = strtok_r(nullptr, "\n", &saveptr);
@@ -200,8 +218,8 @@ static ino_t g_art_inode = 0;
 static dev_t g_art_dev = 0;
 // -----------------------------------------------------------------
 
-#define DCL_HOOK_FUNC(ret, func, ...)                                                      \
-    ret (*old_##func)(__VA_ARGS__);                                                        \
+#define DCL_HOOK_FUNC(ret, func, ...)                                                  \
+    ret (*old_##func)(__VA_ARGS__);                                                    \
     ret new_##func(__VA_ARGS__)
 
 DCL_HOOK_FUNC(static char *, strdup, const char *str) {
@@ -209,7 +227,7 @@ DCL_HOOK_FUNC(static char *, strdup, const char *str) {
     static bool zygote_hooked = false;
 
     if (unlikely(!zygote_hooked && str != nullptr)) {
-        if (*str == 'c' && strcmp(kZygoteInit, str) == 0) {
+        if (*str == 'c' && __builtin_strcmp(kZygoteInit, str) == 0) {
             g_hook->hook_zygote_jni();
 
             // Wipe the old map paths populated by hook_plt() before overwriting them.
@@ -217,7 +235,6 @@ DCL_HOOK_FUNC(static char *, strdup, const char *str) {
             // will be wiped again in hook_zygote_jni() after we are done with hooking.
             g_hook->clear_map_paths();
             g_hook->refresh_map_infos();
-            
             zygote_hooked = true;
         }
     }
@@ -241,14 +258,12 @@ DCL_HOOK_FUNC(static int, unshare, int flags) {
         if (!should_unmount && g_hook->zygote_unmounted) {
             ZygiskContext::update_mount_namespace(zygiskd::MountNamespace::Root);
         }
-        bool is_zygote_clean = g_hook->zygote_unmounted && g_hook->zygote_traces.size() == 0;
+        bool is_zygote_clean = g_hook->zygote_unmounted && g_hook->zygote_traces.size == 0;
         if (should_unmount && !is_zygote_clean) {
             ZygiskContext::update_mount_namespace(zygiskd::MountNamespace::Clean);
         }
     }
-
-    int res = old_unshare(flags);
-    return res;
+    return old_unshare(flags);
 }
 
 static void custom_property_read_callback(void* cookie, const char* name, const char* value, uint32_t serial) {
@@ -256,7 +271,7 @@ static void custom_property_read_callback(void* cookie, const char* name, const 
     auto* custom_cookie = static_cast<CustomCallbackCookie*>(cookie);
 
     if (const Property* prop = find_spoof_prop(name)) {
-        custom_cookie->original_callback(custom_cookie->original_cookie, name, prop->value.c_str(), serial);
+        custom_cookie->original_callback(custom_cookie->original_cookie, name, prop->value, serial);
         return;
     }
 
@@ -270,12 +285,9 @@ DCL_HOOK_FUNC(void, __system_property_read_callback, const prop_info* pi, prop_i
 
 DCL_HOOK_FUNC(int, __system_property_get, const char *name, char *value) {
     if (const Property* prop = find_spoof_prop(name)) {
-        int len = prop->value.length();
-        // PROP_VALUE_MAX is 92, we limit it to 91 to be safe
-        if (len >= 92) len = 91;
-
+        int len = __builtin_strlen(prop->value);
         if (value) {
-            strncpy(value, prop->value.c_str(), len);
+            __builtin_memcpy(value, prop->value, len);
             value[len] = '\0';
         }
         return len;
@@ -286,9 +298,9 @@ DCL_HOOK_FUNC(int, __system_property_get, const char *name, char *value) {
 DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *default_value) {
 
     if (const Property* prop = find_spoof_prop(key)) {
-        int len = prop->value.length();
+        int len = __builtin_strlen(prop->value);
         if (value) {
-            strncpy(value, prop->value.c_str(), len);
+            __builtin_memcpy(value, prop->value, len);
             value[len] = '\0';
         }
         return len;
@@ -303,26 +315,26 @@ DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *defau
             g_hook->hook_unloader();
             g_hook->skip_hooking_unloader = true;
 
-            for (auto it = g_hook->plt_backup.rbegin(); it != g_hook->plt_backup.rend();) {
-                const auto &[dev, inode, sym, old_func] = *it;
-                bool is_prop_get = (*old_func == reinterpret_cast<void*>(old_property_get));
-                bool is_sys_prop_get = (*old_func == reinterpret_cast<void*>(old___system_property_get));
-                bool is_sys_prop_read = (*old_func == reinterpret_cast<void*>(old___system_property_read_callback));
+            for (size_t i = g_hook->plt_backup.size; i > 0; ) {
+                i--;
+                const auto& bkp = g_hook->plt_backup.data[i];
+                bool is_prop_get = (*bkp.backup_ptr == reinterpret_cast<void*>(old_property_get));
+                bool is_sys_prop_get = (*bkp.backup_ptr == reinterpret_cast<void*>(old___system_property_get));
+                bool is_sys_prop_read = (*bkp.backup_ptr == reinterpret_cast<void*>(old___system_property_read_callback));
 
                 if (is_prop_get || is_sys_prop_get || is_sys_prop_read) {
-                    if (!lsplt::RegisterHook(dev, inode, sym, *old_func, nullptr) ||
+                    if (!lsplt::RegisterHook(bkp.dev, bkp.inode, bkp.sym, *bkp.backup_ptr, nullptr) ||
                         !lsplt::CommitHook(g_hook->cached_map_infos, true)) {
-                        PLOGE("unhook %s", sym);
-                        ++it;
+                        PLOGE("unhook %s", bkp.sym);
                     } else {
-                        it = decltype(it)(g_hook->plt_backup.erase(std::next(it).base()));
+                        if (i < g_hook->plt_backup.size - 1) {
+                            __builtin_memmove(&g_hook->plt_backup.data[i], &g_hook->plt_backup.data[i + 1], 
+                                              (g_hook->plt_backup.size - i - 1) * sizeof(PltBackupEntry));
+                        }
+                        g_hook->plt_backup.size--;
                     }
-                } else {
-                    ++it;
                 }
             }
-
-            // Clear the map paths here after all unhook operations are successfully completed
             g_hook->clear_map_paths();
         }
     }
@@ -388,13 +400,13 @@ DCL_HOOK_FUNC(int, prctl, int option, unsigned long arg2, unsigned long arg3, un
             size_t total_len = prepend_len + prog->len;
 
             if (total_len <= BPF_MAXINSNS) {
-                // Use dynamic stack allocation via alloca to avoid reserving 32KB unconditionally.
+                // Use dynamic stack allocation via alloca.
                 size_t alloc_size = total_len * sizeof(struct sock_filter);
                 struct sock_filter* new_filter = static_cast<struct sock_filter*>(__builtin_alloca(alloc_size));
 
                 if (new_filter != nullptr) {
-                    memcpy(new_filter, prepend, sizeof(prepend));
-                    memcpy(new_filter + prepend_len, prog->filter, prog->len * sizeof(struct sock_filter));
+                    __builtin_memcpy(new_filter, prepend, sizeof(prepend));
+                    __builtin_memcpy(new_filter + prepend_len, prog->filter, prog->len * sizeof(struct sock_filter));
 
                     // Temporarily modify the prog to point to our new filter
                     struct sock_fprog new_prog;
@@ -425,8 +437,13 @@ ZygiskContext::ZygiskContext(JNIEnv *env, void *args)
       pid(-1),
       flags(0),
       info_flags(0),
-      allowed_fds(get_fd_max()),
       hook_info_lock(PTHREAD_MUTEX_INITIALIZER) {
+
+    size_t fd_max = get_fd_max();
+    allowed_fds.capacity = fd_max;
+    allowed_fds.size = fd_max;
+    allowed_fds.data = (bool*)malloc(fd_max * sizeof(bool));
+    __builtin_memset(allowed_fds.data, 0, fd_max * sizeof(bool));
     g_ctx = this;
 }
 
@@ -435,15 +452,8 @@ ZygiskContext::~ZygiskContext() {
     // Set this to nullptr to prevent leaking local variable.
     // This also disables most plt hooked functions.
     g_ctx = nullptr;
-
     if (!is_child()) return;
-
-    // Strip out all API function pointers
-    for (auto &m : modules) {
-        m.clearApi();
-    }
-
-    // Cleanup
+    for (size_t i = 0; i < modules.size; i++) modules.data[i]->clearApi();
     g_hook->should_unmap = true;
     g_hook->restore_zygote_hook(env);
 }
@@ -453,14 +463,12 @@ ZygiskContext::~ZygiskContext() {
 HookContext::HookContext(void *start_addr, size_t block_size)
     : start_addr{start_addr}, block_size{block_size} {};
 
-
-void HookContext::register_hook(dev_t dev, ino_t inode, const char *symbol, void *new_func,
-                                void **old_func) {
+void HookContext::register_hook(dev_t dev, ino_t inode, const char *symbol, void *new_func, void **old_func) {
     if (!lsplt::RegisterHook(dev, inode, symbol, new_func, old_func)) {
         LOGE("failed to register plt_hook \"%s\"\n", symbol);
         return;
     }
-    plt_backup.emplace_back(dev, inode, symbol, old_func);
+    plt_backup.push_back({dev, inode, symbol, old_func});
 }
 
 #define PLT_HOOK_REGISTER_SYM(DEV, INODE, SYM, NAME)                                       \
@@ -470,35 +478,21 @@ void HookContext::register_hook(dev_t dev, ino_t inode, const char *symbol, void
 #define PLT_HOOK_REGISTER(DEV, INODE, NAME) PLT_HOOK_REGISTER_SYM(DEV, INODE, #NAME, NAME)
 
 void HookContext::refresh_map_infos() {
-    map_info_cache.clear();
-    cached_map_infos = lsplt::MapInfo::Scan();
-    map_info_cache.reserve(cached_map_infos.size());
-
-    for (const auto &map : cached_map_infos) {
+    map_info_cache.size = 0;
+    cached_map_infos = lsplt::Scan();
+    
+    for (size_t i = 0; i < cached_map_infos.size; i++) {
+        const auto& map = cached_map_infos.data[i];
         if (map.path[0] != '\0') {
-            std::string_view path(map.path);
-            size_t last_slash = path.find_last_of('/');
-            std::string_view filename = (last_slash != std::string_view::npos) 
-                                        ? path.substr(last_slash + 1) 
-                                        : path;
-            map_info_cache.emplace_back(filename, &map);
+            const char* filename = __builtin_strrchr(map.path, '/');
+            filename = filename ? filename + 1 : map.path;
+            CachedMapEntry entry;
+            entry.name = filename;
+            entry.name_hash = calc_gnu_hash(filename);
+            entry.info = &map;
+            map_info_cache.push_back(entry);
         }
     }
-
-    if (map_info_cache.empty()) return;
-
-    ::sort(map_info_cache.begin(), map_info_cache.end(), [](const auto& a, const auto& b) {
-        return a.first < b.first;
-    });
-
-    size_t write_idx = 1;
-    for (size_t read_idx = 1; read_idx < map_info_cache.size(); ++read_idx) {
-        if (map_info_cache[read_idx].first != map_info_cache[write_idx - 1].first) {
-            map_info_cache[write_idx++] = map_info_cache[read_idx];
-        }
-    }
-
-    map_info_cache.resize(write_idx);
 }
 
 void HookContext::hook_plt() {
@@ -527,10 +521,13 @@ void HookContext::hook_plt() {
 
     if (!lsplt::CommitHook(cached_map_infos)) LOGE("HookContext::hook_plt failed");
 
-    // Remove unhooked methods
-    plt_backup.erase(std::remove_if(plt_backup.begin(), plt_backup.end(),
-                                    [](auto &t) { return *std::get<3>(t) == nullptr; }),
-                     plt_backup.end());
+    size_t new_size = 0;
+    for (size_t i = 0; i < plt_backup.size; i++) {
+        if (*plt_backup.data[i].backup_ptr != nullptr) {
+            plt_backup.data[new_size++] = plt_backup.data[i];
+        }
+    }
+    plt_backup.size = new_size;
 }
 
 void HookContext::hook_unloader() {
@@ -553,17 +550,18 @@ void HookContext::clear_map_paths() {
     static std::atomic_flag clearing = ATOMIC_FLAG_INIT;
     if (clearing.test_and_set()) return;
 
-    for (auto &map : cached_map_infos) {
+    for (size_t i = 0; i < cached_map_infos.size; i++) {
+        auto& map = cached_map_infos.data[i];
         size_t len = strnlen(map.path, sizeof(map.path));
         if (len > 0) memzero(map.path, len);
     }
 }
 
 void HookContext::restore_plt_hook() {
-    // Unhook plt_hook
-    for (const auto &[dev, inode, sym, old_func] : plt_backup) {
-        if (!lsplt::RegisterHook(dev, inode, sym, *old_func, nullptr)) {
-            LOGE("failed to register plt_hook [%s]", sym);
+    for (size_t i = 0; i < plt_backup.size; i++) {
+        const auto& bkp = plt_backup.data[i];
+        if (!lsplt::RegisterHook(bkp.dev, bkp.inode, bkp.sym, *bkp.backup_ptr, nullptr)) {
+            LOGE("failed to register plt_hook [%s]", bkp.sym);
             should_unmap = false;
         }
     }
@@ -574,8 +572,7 @@ void HookContext::restore_plt_hook() {
 
     // Clear cached map info
     clear_map_paths();
-    cached_map_infos.clear();
-    cached_map_infos.shrink_to_fit();
+    cached_map_infos.size = 0;
 }
 
 // -----------------------------------------------------------------
@@ -584,15 +581,14 @@ void HookContext::hook_jni_methods(JNIEnv *env, const char *clz, JNIMethods meth
     auto clazz = env->FindClass(clz);
     if (clazz == nullptr) {
         env->ExceptionClear();
-        for (auto &method : methods) {
-            method.fnPtr = nullptr;
-        }
+        for (auto &method : methods) method.fnPtr = nullptr;
         return;
     }
 
-    vector<JNINativeMethod> hooks;
+    JNINativeMethod* hooks = static_cast<JNINativeMethod*>(__builtin_alloca(methods.size() * sizeof(JNINativeMethod)));
+    size_t hooks_count = 0;
+
     for (auto &native_method : methods) {
-        // It's useful to allow nullptr function pointer for restoring hook
         if (!native_method.fnPtr) continue;
 
         auto method_id = env->GetMethodID(clazz, native_method.name, native_method.signature);
@@ -614,14 +610,14 @@ void HookContext::hook_jni_methods(JNIEnv *env, const char *clz, JNIMethods meth
             continue;
         }
         auto artMethod = util::art::ArtMethod::FromReflectedMethod(env, method);
-        hooks.push_back(native_method);
+        hooks[hooks_count++] = native_method;
         auto original_method = artMethod->GetData();
         LOGV("replaced %s!%s @%p", clz, native_method.name, original_method);
         native_method.fnPtr = original_method;
     }
 
-    if (hooks.empty()) return;
-    env->RegisterNatives(clazz, hooks.data(), hooks.size());
+    if (hooks_count == 0) return;
+    env->RegisterNatives(clazz, hooks, hooks_count);
 }
 
 void HookContext::hook_zygote_jni() {
@@ -658,11 +654,11 @@ void HookContext::hook_zygote_jni() {
         LOGE("failed to init ArtMethod");
         return;
     }
-    hook_jni_methods(env, kZygote, zygote_methods);
+    hook_jni_methods(env, kZygote, JNIMethods(zygote_methods, sizeof(zygote_methods) / sizeof(zygote_methods[0])));
 }
 
 void HookContext::restore_zygote_hook(JNIEnv *env) {
-    hook_jni_methods(env, kZygote, zygote_methods);
+    hook_jni_methods(env, kZygote, JNIMethods(zygote_methods, sizeof(zygote_methods) / sizeof(zygote_methods[0])));
 }
 
 // -----------------------------------------------------------------
@@ -671,11 +667,7 @@ void hook_entry(void *start_addr, size_t block_size) {
     LoadPropConfig();
     InitRandomVbmeta();
 
-    ::sort(g_spoof_props.begin(), g_spoof_props.end(), [](const auto& a, const auto& b) {
-        return a.key < b.key;
-    });
-
-    UniqueFd shm_fd = UniqueFd(zygiskd::GetZygiskSharedData());
+    UniqueFd shm_fd(zygiskd::GetZygiskSharedData());
     if (shm_fd >= 0) {
         void* map_res = mmap(nullptr, sizeof(constants::ZygiskSharedData), PROT_READ, MAP_SHARED, shm_fd, 0);
         if (map_res != MAP_FAILED) {

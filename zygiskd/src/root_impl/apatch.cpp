@@ -5,8 +5,6 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <mutex>
-#include <shared_mutex>
 #include <atomic>
 
 #include "root_impl.hpp"
@@ -25,7 +23,7 @@ struct ConfigData {
 static const char* CONFIG_FILE = "/data/adb/ap/package_config";
 
 static ConfigData g_config;
-static std::shared_mutex g_config_mutex;
+static SpinRWLock g_config_mutex;
 static std::atomic<int64_t> last_stat_time_ms{0};
 
 // Macro to extract only the UID from the packed integer
@@ -108,18 +106,18 @@ static void parse_and_sort_config(int fd, size_t size, ConfigData& config) {
     }
 }
 
-std::optional<Version> detect_version() {
-    static std::optional<Version> cached_version = std::nullopt;
-    static std::once_flag flag;
+Version detect_version() {
+    static Version cached_version = Version::Null; 
+    static ::once_flag flag{0};
 
-    std::call_once(flag, []() {
+    ::call_once(flag, []() {
         char buf[256];
         const char* args[] = {"apd", "-V", nullptr};
         auto output = utils::exec_command(args, buf, sizeof(buf));
         if (!output) return;
 
         const char* p = buf;
-        while (*p && !isdigit(static_cast<unsigned char>(*p))) p++;
+        while (*p && (*p < '0' || *p > '9')) p++;
 
         if (*p) {
             int version = fast_atoi(p);
@@ -149,7 +147,7 @@ void refresh_cache() {
 
     // Fast Check (Read Lock)
     {
-        std::shared_lock<std::shared_mutex> read_lock(g_config_mutex);
+        SharedLock<SpinRWLock> read_lock(g_config_mutex);
         if (g_config.mtim.tv_sec == st.st_mtim.tv_sec &&
             g_config.mtim.tv_nsec == st.st_mtim.tv_nsec) {
             return;
@@ -157,7 +155,7 @@ void refresh_cache() {
     }
 
     // Slow Update (Write Lock)
-    std::unique_lock<std::shared_mutex> write_lock(g_config_mutex);
+    UniqueLock<SpinRWLock> write_lock(g_config_mutex);
 
     // Double-check to prevent concurrent rebuilds
     if (g_config.mtim.tv_sec == st.st_mtim.tv_sec &&
@@ -197,13 +195,13 @@ static uint32_t find_package(const ConfigData& config, int32_t uid) {
 }
 
 bool uid_granted_root(int32_t uid) {
-    std::shared_lock<std::shared_mutex> lock(g_config_mutex);
+    SharedLock<SpinRWLock> lock(g_config_mutex);
     uint32_t pkg = find_package(g_config, uid);
     return (pkg & (1U << 30)) != 0;
 }
 
 bool uid_should_umount(int32_t uid) {
-    std::shared_lock<std::shared_mutex> lock(g_config_mutex);
+    SharedLock<SpinRWLock> lock(g_config_mutex);
     uint32_t pkg = find_package(g_config, uid);
     return (pkg & (1U << 31)) != 0;
 }

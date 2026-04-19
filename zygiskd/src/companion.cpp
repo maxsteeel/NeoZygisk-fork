@@ -98,7 +98,7 @@ static void run_companion(int fd) {
         return;
     }
 
-    ZygiskCompanionEntryFn entry_fn = load_module_entry(std::move(library_fd));
+    ZygiskCompanionEntryFn entry_fn = load_module_entry(static_cast<UniqueFd&&>(library_fd));
 
     if (entry_fn) {
         LOGD("Companion entry point found for module `%s`", name);

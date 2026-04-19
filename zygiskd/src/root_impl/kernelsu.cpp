@@ -6,7 +6,6 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <cstring>
-#include <mutex>
 
 #include "root_impl.hpp"
 #include "constants.hpp"
@@ -18,7 +17,7 @@ namespace kernelsu {
 
 // --- KernelSU Communication Method Enum & Cached State ---
 
-static std::once_flag ksu_result_flag;
+static ::once_flag ksu_result_flag{0};
 static UniqueFd g_ksu_fd; // RAII safety for the driver FD
 static Version g_ksu_version = Version::TooOld;
 static bool g_is_detected = false;
@@ -121,8 +120,7 @@ static int ksuctl_prctl(int option, unsigned long arg2 = 0, unsigned long arg3 =
 // Fixed C++ variadic template recursion to avoid compiler garbage
 template <typename T>
 static unsigned long to_prctl_arg(T arg) {
-    if constexpr (std::is_pointer_v<T>) return reinterpret_cast<unsigned long>(arg);
-    else return static_cast<unsigned long>(arg);
+    return (unsigned long)arg;
 }
 
 static void init_legacy_variant_probe() {
@@ -202,7 +200,7 @@ static int32_t prctl_get_manager_uid() {
 // --- Core Detection and Dispatch Logic ---
 
 static void detect_and_init() {
-    std::call_once(ksu_result_flag, []() {
+    ::call_once(ksu_result_flag, []() {
         int fd = init_driver_fd();
         if (fd >= 0) {
             KsuGetInfoCmd cmd = {0, 0, 0};
@@ -260,10 +258,10 @@ static void detect_and_init() {
     });
 }
 
-std::optional<Version> detect_version() {
+Version detect_version() {
     detect_and_init();
     if (g_is_detected) return g_ksu_version;
-    return std::nullopt;
+    return Version::Null;
 }
 
 bool uid_granted_root(int32_t uid) { return uid_granted_root_impl(uid); }

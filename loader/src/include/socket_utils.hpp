@@ -1,7 +1,6 @@
 #pragma once
 
-#include <string>
-#include <string_view>
+#include <string.h>
 #include <cstdint>
 
 namespace socket_utils {
@@ -39,5 +38,5 @@ namespace socket_utils {
 
     bool write_usize(int fd, size_t val);
 
-    bool write_string(int fd, std::string_view str);
+    bool write_string(int fd, const char* str);
 }

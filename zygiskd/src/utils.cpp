@@ -79,7 +79,7 @@ const char* get_property(const char* name, char* out_buf) {
     return "";
 }
 
-bool unix_datagram_sendto(const char* path, const void* buf, size_t len) {
+bool unix_datagram_sendto(const char* name, const void* buf, size_t len) {
     char attr_buf[256];
     const char* attr = get_current_attr(attr_buf, sizeof(attr_buf));
     if (!set_socket_create_context(attr)) return false;
@@ -87,19 +87,14 @@ bool unix_datagram_sendto(const char* path, const void* buf, size_t len) {
     UniqueFd fd(socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0));
     if (fd < 0) return false;
 
-    struct sockaddr_un addr {};
+    struct sockaddr_un addr = {};
     addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0';
+    size_t name_len = __builtin_strlen(name);
+    if (name_len >= sizeof(addr.sun_path) - 1) return false;
     
-    // Loop-based copy is often faster than strlcpy/strlen for small, bound-checked strings
-    size_t i = 0;
-    while (path[i] && i < sizeof(addr.sun_path) - 1) {
-        addr.sun_path[i] = path[i];
-        i++;
-    }
-    if (path[i] != '\0') return false; // Path too long
-    addr.sun_path[i] = '\0';
-
-    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + i + 1;
+    __builtin_memcpy(addr.sun_path + 1, name, name_len);
+    socklen_t addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + name_len;
 
     if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), addr_len) < 0) return false;
     

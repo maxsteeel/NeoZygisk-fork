@@ -4,14 +4,9 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
-#include <string_view>
-
 #include "daemon.hpp"  // For GetTmpPath and UniqueFd
 #include "logging.hpp"
 #include "monitor.hpp"
-
-// Use string_view literals for efficient, allocation-free string comparisons.
-using namespace std::string_view_literals;
 
 const char *const kWorkDirectory = WORK_DIRECTORY;
 
@@ -34,21 +29,22 @@ void send_control_command(Command cmd) {
     UniqueFd sockfd(socket(PF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0));
     if (sockfd == -1) err(EXIT_FAILURE, "socket");
 
-    struct sockaddr_un addr{
-        .sun_family = AF_UNIX,
-        .sun_path = {0},
-    };
-    if (snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/%s", zygiskd::GetTmpPath(),
-                 AppMonitor::SOCKET_NAME) >= static_cast<int>(sizeof(addr.sun_path))) {
+    struct sockaddr_un addr = {};
+    addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0';
+    size_t name_len = __builtin_strlen(AppMonitor::SOCKET_NAME);
+
+    if (name_len >= sizeof(addr.sun_path) - 1) {
         errx(EXIT_FAILURE, "UNIX domain socket path too long");
     }
-    socklen_t socklen = sizeof(sa_family_t) + strlen(addr.sun_path);
+    __builtin_memcpy(addr.sun_path + 1, AppMonitor::SOCKET_NAME, name_len);
+    socklen_t socklen = offsetof(struct sockaddr_un, sun_path) + 1 + name_len;
 
     auto nsend = sendto(sockfd, (void *) &cmd, sizeof(cmd), 0, (sockaddr *) &addr, socklen);
     if (nsend == -1) {
         err(EXIT_FAILURE, "send");
-    } else if (nsend != sizeof(cmd)) {
-        fprintf(stderr, "send %zu != %zu\n", nsend, sizeof(cmd));
+    } else if (static_cast<size_t>(nsend) != sizeof(cmd)) {
+        fprintf(stderr, "send %zd != %zu\n", nsend, sizeof(cmd));
         exit(1);
     }
     printf("command sent\n");
@@ -78,15 +74,14 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    // Delegate to the appropriate handler based on the command.
-    const auto command = std::string_view(argv[1]);
-    if (command == "monitor"sv) {
+    const char* command = argv[1];
+    if (__builtin_strcmp(command, "monitor") == 0) {
         return handle_monitor();
-    } else if (command == "trace"sv) {
+    } else if (__builtin_strcmp(command, "trace") == 0) {
         return handle_trace(argc, argv);
-    } else if (command == "ctl"sv) {
+    } else if (__builtin_strcmp(command, "ctl") == 0) {
         return handle_ctl(argc, argv);
-    } else if (command == "version"sv) {
+    } else if (__builtin_strcmp(command, "version") == 0) {
         return handle_version();
     } else {
         fprintf(stderr, "error: unknown command '%s'\n", argv[1]);
@@ -145,7 +140,7 @@ static int handle_trace(int argc, char **argv) {
     printf("preparing to trace PID: %d\n", pid);
 
     // Handle optional --restart flag.
-    if (argc >= 4 && argv[3] == "--restart"sv) {
+    if (argc >= 4 && __builtin_strcmp(argv[3], "--restart") == 0) {
         printf("zygote restart requested...\n");
         zygiskd::ZygoteRestart();
     }
@@ -174,17 +169,17 @@ static int handle_ctl(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    const auto action = std::string_view(argv[2]);
-    printf("sending control command: '%s'\n", argv[2]);
+    const char* action = argv[2];
+    printf("sending control command: '%s'\n", action);
 
-    if (action == "start"sv) {
+    if (__builtin_strcmp(action, "start") == 0) {
         send_control_command(START);
-    } else if (action == "stop"sv) {
+    } else if (__builtin_strcmp(action, "stop") == 0) {
         send_control_command(STOP);
-    } else if (action == "exit"sv) {
+    } else if (__builtin_strcmp(action, "exit") == 0) {
         send_control_command(EXIT);
     } else {
-        fprintf(stderr, "error: unknown ctl action: '%s'\n", argv[2]);
+        fprintf(stderr, "error: unknown ctl action: '%s'\n", action);
         print_usage(argv[0]);
         return EXIT_FAILURE;
     }

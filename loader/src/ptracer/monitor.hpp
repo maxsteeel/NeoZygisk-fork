@@ -1,12 +1,10 @@
 #pragma once
 
-#include <string>
-#include <vector>
-
 #include "daemon.hpp"
 #include "event_loop.hpp"
 #include "main.hpp"
 #include "types.hpp"
+#include "utils.hpp"
 #include "zygote_abi.hpp"
 
 // Helper to check ptrace status.
@@ -124,12 +122,15 @@ public:
     TracingState get_tracing_state() const;
 
 private:
-    class SocketHandler : public EventHandler {
+    class SocketHandler {
     public:
         explicit SocketHandler(AppMonitor &monitor) : monitor_(monitor) {}
         bool Init();
-        int GetFd() override;
-        void HandleEvent(EventLoop &loop, uint32_t) override;
+        static void DispatchEvent(EventLoop &loop, uint32_t event, void* context) {
+            static_cast<SocketHandler*>(context)->HandleEvent(loop, event);
+        }
+        void HandleEvent(EventLoop &loop, uint32_t event);
+        EventHandler epoll_evt;
 
     private:
         struct [[gnu::packed]] MsgHead {
@@ -141,12 +142,15 @@ private:
         UniqueFd sock_fd_;
     };
 
-    class SigChldHandler : public EventHandler {
+    class SigChldHandler {
     public:
         explicit SigChldHandler(AppMonitor &monitor) : monitor_(monitor) {}
         bool Init();
-        int GetFd() override;
-        void HandleEvent(EventLoop &, uint32_t) override;
+        static void DispatchEvent(EventLoop &loop, uint32_t event, void* context) {
+            static_cast<SigChldHandler*>(context)->HandleEvent(loop, event);
+        }
+        void HandleEvent(EventLoop &loop, uint32_t event);
+        EventHandler epoll_evt;
 
     private:
         void handleChildEvent(int pid, int &status);
@@ -160,8 +164,8 @@ private:
         AppMonitor &monitor_;
         UniqueFd signal_fd_;
         int status_ = 0;
-        std::vector<int> process_;
-        std::vector<int> stub_processes_;
+        IntList process_;
+        IntList stub_processes_;
     };
 
     void write_abi_status_section(char *status_text, const Status &daemon_status);

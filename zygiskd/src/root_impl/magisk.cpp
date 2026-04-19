@@ -4,8 +4,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <mutex>
-#include <shared_mutex>
 #include <dlfcn.h>
 
 #include "root_impl.hpp"
@@ -29,15 +27,16 @@ struct Cache {
 };
 
 static Cache g_cache;
-static std::shared_mutex g_cache_mutex;
+static SpinRWLock g_cache_mutex;
 
 static const char* MAGISK_OFFICIAL_PKG = "com.topjohnwu.magisk";
-static const std::pair<const char*, const char*> MAGISK_THIRD_PARTIES[] = {
+struct StringPair { const char* first; const char* second; };
+static const StringPair MAGISK_THIRD_PARTIES[] = {
     {"alpha", "io.github.vvb2060.magisk"},
     {"kitsune", "io.github.huskydg.magisk"},
 };
 
-static std::once_flag variant_flag;
+static ::once_flag variant_flag{0};
 static char magisk_variant_pkg[128] = {0};
 
 // --- Native SQLite Implementation ---
@@ -192,7 +191,7 @@ static bool list_contains_pkg(const StringList& list, const char* value) {
 
 // --- General Magisk Detection ---
 static void detect_variant() {
-    std::call_once(variant_flag, []() {
+    ::call_once(variant_flag, []() {
         char buf[256];
         const char* args[] = {"magisk", "-v", nullptr};
         if (utils::exec_command(args, buf, sizeof(buf))) {
@@ -208,10 +207,10 @@ static void detect_variant() {
     });
 }
 
-std::optional<Version> detect_version() {
+Version detect_version() {
     char buf[256];
     const char* args[] = {"magisk", "-V", nullptr};
-    if (!utils::exec_command(args, buf, sizeof(buf))) return std::nullopt;
+    if (!utils::exec_command(args, buf, sizeof(buf))) return Version::Null;
 
     int version = fast_atoi(buf);
     detect_variant();
@@ -281,7 +280,7 @@ void refresh_cache() {
 
     // Fast check (Shared lock)
     {
-        std::shared_lock<std::shared_mutex> read_lock(g_cache_mutex);
+        SharedLock<SpinRWLock> read_lock(g_cache_mutex);
         if (g_cache.db_mtime.tv_sec == db_st.st_mtim.tv_sec &&
             g_cache.db_mtime.tv_nsec == db_st.st_mtim.tv_nsec &&
             g_cache.pkg_mtime.tv_sec == pkg_st.st_mtim.tv_sec &&
@@ -292,7 +291,7 @@ void refresh_cache() {
     }
 
     // Heavy update (Unique lock)
-    std::unique_lock<std::shared_mutex> write_lock(g_cache_mutex);
+    UniqueLock<SpinRWLock> write_lock(g_cache_mutex);
     
     if (g_cache.db_mtime.tv_sec == db_st.st_mtim.tv_sec &&
         g_cache.db_mtime.tv_nsec == db_st.st_mtim.tv_nsec &&
@@ -410,13 +409,13 @@ static bool is_valid_pkg_name(const char* pkg_name) {
 }
 
 bool uid_granted_root(int32_t uid) {
-    std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
+    SharedLock<SpinRWLock> lock(g_cache_mutex);
     return list_contains_uid(g_cache.granted_uids, uid);
 }
 
 bool uid_should_umount(int32_t uid) {
     {
-        std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
+        SharedLock<SpinRWLock> lock(g_cache_mutex);
         if (list_contains_uid(g_cache.denylist_uids, uid)) return true;
         if (list_contains_uid(g_cache.all_known_uids, uid)) return false;
     }
@@ -425,12 +424,12 @@ bool uid_should_umount(int32_t uid) {
     if (!get_package_by_uid_from_xml(uid, pkg_name, sizeof(pkg_name))) return false;
     if (!is_valid_pkg_name(pkg_name)) return false;
 
-    std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
+    SharedLock<SpinRWLock>lock(g_cache_mutex);
     return list_contains_pkg(g_cache.denylist_pkgs, pkg_name);
 }
 
 bool uid_is_manager(int32_t uid) {
-    std::shared_lock<std::shared_mutex> lock(g_cache_mutex);
+    SharedLock<SpinRWLock> lock(g_cache_mutex);
     return g_cache.manager_uid == uid;
 }
 

@@ -11,12 +11,6 @@
 #include <unistd.h>
 #include <malloc.h>
 
-#include <cinttypes>
-#include <cstdio>
-#include <cstdlib>
-#include <string>
-#include <vector>
-
 #include "daemon.hpp"
 #include "logging.hpp"
 #include "utils.hpp"
@@ -64,47 +58,46 @@ static bool find_entry_point(int pid, const struct user_regs_struct &regs, uintp
     int argc;
     read_proc(pid, sp, &argc, sizeof(argc));
 
-    auto argv = reinterpret_cast<char **>(sp + sizeof(uintptr_t));
-    auto envp = argv + argc + 1;
+    auto argv = reinterpret_cast<uintptr_t *>(sp + sizeof(uintptr_t));
+    auto p = argv + argc + 1;
 
-    // Iterate past the environment variables to find the start of the auxiliary vector.
-    // The end of envp is marked by a null pointer.
-    auto p = envp;
+    uintptr_t ptr_chunk[32];
     while (true) {
-        uintptr_t val;
-        read_proc(pid, (uintptr_t) p, &val, sizeof(val));
-        if (val != 0) {
-            p++;
-        } else {
-            break;
+        read_proc(pid, (uintptr_t)p, ptr_chunk, sizeof(ptr_chunk));
+        int i = 0;
+        for (; i < 32; i++) {
+            if (ptr_chunk[i] == 0) break;
         }
+        p += i;
+        if (i < 32) break;
     }
-    p++;  // Skip the final null pointer to get to auxv.
-    auto auxv = reinterpret_cast<ElfW(auxv_t) *>(p);
-    LOGV("parsed process startup info: argc=%d, argv=%p, envp=%p, auxv=%p", argc, argv, envp, auxv);
+    p++;
 
-    // Now, scan the auxiliary vector to find AT_ENTRY. This gives us the program's
-    // entry address, which is where execution will begin.
+    auto v = reinterpret_cast<ElfW(auxv_t) *>(p);
     entry_addr = 0;
     addr_of_entry_addr = 0;
-    auto v = auxv;
-    while (true) {
-        ElfW(auxv_t) buf;
-        read_proc(pid, (uintptr_t) v, &buf, sizeof(buf));
-        if (buf.a_type == AT_NULL) {
-            break;  // End of auxiliary vector.
+
+    ElfW(auxv_t) auxv_chunk[16];
+    bool found = false;
+    
+    while (!found) {
+        read_proc(pid, (uintptr_t)v, auxv_chunk, sizeof(auxv_chunk));
+        for (int i = 0; i < 16; i++) {
+            if (auxv_chunk[i].a_type == AT_NULL) {
+                found = true; 
+                break;
+            }
+            if (auxv_chunk[i].a_type == AT_ENTRY) {
+                entry_addr = (uintptr_t)auxv_chunk[i].a_un.a_val;
+                addr_of_entry_addr = (uintptr_t)v + (i * sizeof(ElfW(auxv_t))) + offsetof(ElfW(auxv_t), a_un);
+                return true;
+            }
         }
-        if (buf.a_type == AT_ENTRY) {
-            entry_addr = (uintptr_t) buf.a_un.a_val;
-            addr_of_entry_addr = (uintptr_t) v + offsetof(ElfW(auxv_t), a_un);
-            break;
-        }
-        v++;
+        if (!found) v += 16;
     }
 
     if (entry_addr == 0) {
-        LOGE("failed to find AT_ENTRY in auxiliary vector for PID %d, cannot determine entry point",
-             pid);
+        LOGE("failed to find AT_ENTRY in auxiliary vector for PID %d, cannot determine entry point", pid);
         return false;
     }
     LOGI("found program entry point at 0x%" PRIxPTR, entry_addr);
@@ -117,8 +110,7 @@ static bool hijack_and_wait(int pid, uintptr_t entry_addr, uintptr_t addr_of_ent
     // We replace the program's entry point with an invalid address. This causes a SIGSEGV
     // as soon as we resume the process, allowing us to regain control at the perfect time.
     LOGV("hijacking entry point to intercept execution");
-    // For arm32 compatibility, we set the last bit to the same as the entry address.
-    uintptr_t break_addr = (-0x05ec1cff & ~1) | (entry_addr & 1);  // An arbitrary invalid address.
+    uintptr_t break_addr = (-0x05ec1cff & ~1) | (entry_addr & 1); 
     if (!write_proc(pid, addr_of_entry_addr, &break_addr, sizeof(break_addr))) {
         LOGE("failed to write hijack address to PID %d, injection aborted", pid);
         return false;
@@ -189,8 +181,7 @@ static bool execute_remote_injection(int pid, const char *lib_path, uintptr_t en
         return false;
     }
 
-    // Backup the current registers before we start making remote calls.
-    memcpy(&backup, &regs, sizeof(regs));
+    __builtin_memcpy(&backup, &regs, sizeof(regs));
 
     uintptr_t remote_base = 0;
     size_t remote_size = 0;
@@ -495,13 +486,11 @@ bool trace_zygote(int pid) {
         PLOGE("PTRACE_SEIZE failed (errno: %d)", errno);
     }
 
-#ifdef M_PURGE
     // The injection process is extremely memory-intensive (parsing ELFs, 
     // string manipulations, maps scanning). Now that we are done and detached,
     // we force the allocator to return all cached pages back to the kernel,
     // dropping the daemon's RAM footprint to the absolute minimum.
     mallopt(M_PURGE, 0);
-#endif
 
     return success;
 }

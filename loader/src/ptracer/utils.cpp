@@ -1,7 +1,6 @@
 #include "utils.hpp"
 
 #include <dlfcn.h>
-#include <elf.h>
 #include <fcntl.h>
 #include <link.h>
 #include <sched.h>
@@ -13,19 +12,6 @@
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-#include <array>
-#include <cinttypes>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <string>
-#include <vector>
-#include <link.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <memory>
 
 #include "daemon.hpp"
 #include "logging.hpp"

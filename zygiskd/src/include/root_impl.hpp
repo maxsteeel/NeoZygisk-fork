@@ -1,11 +1,15 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
+
+enum class Version { 
+    Supported,
+    TooOld,
+    Null
+};
 
 namespace apatch {
-    enum class Version { Supported, TooOld };
-    std::optional<Version> detect_version();
+    Version detect_version();
     bool uid_granted_root(int32_t uid);
     bool uid_should_umount(int32_t uid);
     bool uid_is_manager(int32_t uid);
@@ -14,8 +18,7 @@ namespace apatch {
 }
 
 namespace kernelsu {
-    enum class Version { Supported, TooOld };
-    std::optional<Version> detect_version();
+    Version detect_version();
     bool uid_granted_root(int32_t uid);
     bool uid_should_umount(int32_t uid);
     bool uid_is_manager(int32_t uid);
@@ -23,8 +26,7 @@ namespace kernelsu {
 }
 
 namespace magisk {
-    enum class Version { Supported, TooOld };
-    std::optional<Version> detect_version();
+    Version detect_version();
     bool uid_granted_root(int32_t uid);
     bool uid_should_umount(int32_t uid);
     bool uid_is_manager(int32_t uid);

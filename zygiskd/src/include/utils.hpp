@@ -1,17 +1,12 @@
 #pragma once
 
-#include <string>
 #include <dirent.h>
-#include <utility>
 #include <cstdio>
-#include <vector>
-#include <optional>
 #include <pthread.h>
 #include <malloc.h>
-#include <type_traits>
 #include <cstdlib> 
-#include <cstring> 
-#include <string_view>
+#include <cstring>
+#include <atomic>
 
 #define PROP_VALUE_MAX 92
 
@@ -65,9 +60,13 @@ struct StringList {
     StringList& operator=(StringList&& other) noexcept {
         if (this != &other) {
             clear();
-            data = std::exchange(other.data, nullptr);
-            size = std::exchange(other.size, 0);
-            capacity = std::exchange(other.capacity, 0);
+            data = other.data;
+            size = other.size;
+            capacity = other.capacity;
+            
+            other.data = nullptr;
+            other.size = 0;
+            other.capacity = 0;
         }
         return *this;
     }
@@ -96,19 +95,12 @@ struct StringList {
             data = new_data;
             capacity = new_cap;
         }
-        data[size++] = strdup(str);
-    }
-
-    void push_back(std::string_view str) {
-        if (str.empty()) return;
-        if (size >= capacity) {
-            size_t new_cap = capacity == 0 ? 16 : capacity * 2;
-            char** new_data = (char**)realloc(data, new_cap * sizeof(char*));
-            if (!new_data) return; // SAFE
-            data = new_data;
-            capacity = new_cap;
+        size_t len = __builtin_strlen(str) + 1;
+        char* dup = (char*)malloc(len);
+        if (dup) {
+            __builtin_memcpy(dup, str, len);
+            data[size++] = dup;
         }
-        data[size++] = strndup(str.data(), str.size());
     }
 };
 
@@ -119,16 +111,25 @@ struct UniqueFile {
     UniqueFile() = default;
     explicit UniqueFile(FILE* f) : fp(f) {}
     ~UniqueFile() { if (fp) fclose(fp); }
+    
     UniqueFile(const UniqueFile&) = delete;
     UniqueFile& operator=(const UniqueFile&) = delete;
-    UniqueFile(UniqueFile&& other) noexcept { fp = std::exchange(other.fp, nullptr); }
+    
+    // Move Constructor bare-metal
+    UniqueFile(UniqueFile&& other) noexcept : fp(other.fp) { 
+        other.fp = nullptr; 
+    }
+    
+    // Move Assignment bare-metal
     UniqueFile& operator=(UniqueFile&& other) noexcept {
         if (this != &other) {
             if (fp) fclose(fp);
-            fp = std::exchange(other.fp, nullptr);
+            fp = other.fp;         // Robamos el puntero
+            other.fp = nullptr;    // Invalidamos el donante
         }
         return *this;
     }
+    
     operator FILE*() const { return fp; }
     explicit operator bool() const { return fp != nullptr; } // Safer boolean check
 };
@@ -140,11 +141,12 @@ struct UniquePipe {
     ~UniquePipe() { if (fp) pclose(fp); }
     UniquePipe(const UniquePipe&) = delete;
     UniquePipe& operator=(const UniquePipe&) = delete;
-    UniquePipe(UniquePipe&& other) noexcept { fp = std::exchange(other.fp, nullptr); }
+    UniquePipe(UniquePipe&& other) noexcept : fp(other.fp) { other.fp = nullptr; }
     UniquePipe& operator=(UniquePipe&& other) noexcept {
         if (this != &other) {
             if (fp) pclose(fp);
-            fp = std::exchange(other.fp, nullptr);
+            fp = other.fp;
+            other.fp = nullptr;
         }
         return *this;
     }
@@ -159,16 +161,112 @@ struct UniqueDir {
     ~UniqueDir() { if (dir) closedir(dir); }
     UniqueDir(const UniqueDir&) = delete;
     UniqueDir& operator=(const UniqueDir&) = delete;
-    UniqueDir(UniqueDir&& other) noexcept { dir = std::exchange(other.dir, nullptr); }
+    UniqueDir(UniqueDir&& other) noexcept : dir(other.dir) { other.dir = nullptr; }
     UniqueDir& operator=(UniqueDir&& other) noexcept {
         if (this != &other) {
             if (dir) closedir(dir);
-            dir = std::exchange(other.dir, nullptr);
+            dir = other.dir;
+            other.dir = nullptr;
         }
         return *this;
     }
     operator DIR*() const { return dir; }
     explicit operator bool() const { return dir != nullptr; }
+};
+
+using once_flag = std::atomic<int>;
+
+template<class Callable>
+inline void call_once(::once_flag& flag, Callable func) {
+    int expected = 0;
+    if (flag.compare_exchange_strong(expected, 1, std::memory_order_acquire)) {
+        func();
+        flag.store(2, std::memory_order_release);
+    } else {
+        while (flag.load(std::memory_order_acquire) == 1) {
+#if defined(__aarch64__) || defined(__arm__)
+            asm volatile("yield" ::: "memory");
+#elif defined(__i386__) || defined(__x86_64__)
+            asm volatile("pause" ::: "memory");
+#endif
+        }
+    }
+}
+
+class SpinMutex {
+    std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
+
+public:
+    void lock() {
+        while (flag_.test_and_set(std::memory_order_acquire)) {
+#if defined(__aarch64__) || defined(__arm__)
+            asm volatile("yield" ::: "memory");
+#elif defined(__i386__) || defined(__x86_64__)
+            asm volatile("pause" ::: "memory");
+#endif
+        }
+    }
+    void unlock() {
+        flag_.clear(std::memory_order_release);
+    }
+};
+
+class SpinRWLock {
+    std::atomic<uint32_t> state_{0};
+    static constexpr uint32_t WRITE_LOCKED = 0xFFFFFFFF;
+
+public:
+    void lock_shared() {
+        uint32_t expected;
+        while (true) {
+            expected = state_.load(std::memory_order_relaxed);
+            if (expected != WRITE_LOCKED) {
+                if (state_.compare_exchange_weak(expected, expected + 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+                    break;
+                }
+            }
+#if defined(__aarch64__) || defined(__arm__)
+            asm volatile("yield" ::: "memory");
+#elif defined(__i386__) || defined(__x86_64__)
+            asm volatile("pause" ::: "memory");
+#endif
+        }
+    }
+    void unlock_shared() {
+        state_.fetch_sub(1, std::memory_order_release);
+    }
+    void lock() {
+        uint32_t expected;
+        while (true) {
+            expected = 0;
+            if (state_.compare_exchange_weak(expected, WRITE_LOCKED, std::memory_order_acquire, std::memory_order_relaxed)) {
+                break;
+            }
+#if defined(__aarch64__) || defined(__arm__)
+            asm volatile("yield" ::: "memory");
+#elif defined(__i386__) || defined(__x86_64__)
+            asm volatile("pause" ::: "memory");
+#endif
+        }
+    }
+
+    void unlock() {
+        state_.store(0, std::memory_order_release);
+    }
+};
+
+template <typename T>
+struct SharedLock {
+    T& lock_;
+    SharedLock(T& l) : lock_(l) { lock_.lock_shared(); }
+    ~SharedLock() { lock_.unlock_shared(); }
+};
+
+template <typename T>
+struct UniqueLock {
+    T& lock_;
+    UniqueLock(T& l) : lock_(l) { lock_.lock(); }
+    ~UniqueLock() { lock_.unlock(); }
 };
 
 // --- Fast Parsers and Threading ---
@@ -198,7 +296,7 @@ namespace utils {
     bool set_socket_create_context(const char* context);
     const char* get_current_attr(char* out_buf, size_t max_len);
     const char* get_property(const char* name, char* out_buf);
-    bool unix_datagram_sendto(const char* path, const void* buf, size_t len);
+    bool unix_datagram_sendto(const char* name, const void* buf, size_t len);
     bool is_socket_alive(int fd);
     bool exec_command(const char* const* args, char* out_buf, size_t out_size);
 }

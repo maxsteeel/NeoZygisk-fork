@@ -36,12 +36,12 @@ bool switch_mount_namespace(pid_t pid) {
 MountNamespaceManager::MountNamespaceManager() : clean_mnt_ns_fd_(-1), root_mnt_ns_fd_(-1) {}
 
 int MountNamespaceManager::get_namespace_fd(zygiskd::MountNamespace namespace_type) const {
-    std::lock_guard<std::mutex> lock(mtx_);
+    UniqueLock<SpinMutex> lock(mtx_);
     return (namespace_type == zygiskd::MountNamespace::Clean) ? clean_mnt_ns_fd_ : root_mnt_ns_fd_;
 }
 
 int MountNamespaceManager::save_mount_namespace(pid_t pid, zygiskd::MountNamespace namespace_type) {
-    std::lock_guard<std::mutex> lock(mtx_);
+    UniqueLock<SpinMutex> lock(mtx_);
 
     int& fd_ref = (namespace_type == zygiskd::MountNamespace::Clean) ? clean_mnt_ns_fd_ : root_mnt_ns_fd_;
     if (fd_ref >= 0) return fd_ref;

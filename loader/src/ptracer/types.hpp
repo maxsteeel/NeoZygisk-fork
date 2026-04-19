@@ -1,8 +1,7 @@
 #pragma once
 
 #include <sys/types.h>
-
-#include <string>
+#include <time.h>
 
 // Defines common data structures used across the monitor application.
 

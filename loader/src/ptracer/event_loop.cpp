@@ -2,15 +2,13 @@
 
 #include <sys/epoll.h>
 #include <unistd.h>
-
-#include <cerrno>
-#include <cstring>
+#include <errno.h>
 
 #include "daemon.hpp"
 #include "logging.hpp"
 
 bool EventLoop::Init() {
-    epoll_fd_ = UniqueFd(epoll_create(1));
+    epoll_fd_ = UniqueFd(epoll_create1(EPOLL_CLOEXEC));
     
     if (epoll_fd_ == -1) {
         PLOGE("create epoll fd");
@@ -23,7 +21,7 @@ void EventLoop::Stop() { running = false; }
 
 void EventLoop::Loop() {
     running = true;
-    constexpr auto MAX_EVENTS = 32;
+    constexpr int MAX_EVENTS = 32;
     struct epoll_event events[MAX_EVENTS];
 
     while (running) {
@@ -36,19 +34,18 @@ void EventLoop::Loop() {
         }
 
         for (int i = 0; i < nfds; i++) {
-            // Dispatch the event to the handler stored in the data pointer.
-            reinterpret_cast<EventHandler *>(events[i].data.ptr)
-                ->HandleEvent(*this, events[i].events);
+            EventHandler *handler = static_cast<EventHandler *>(events[i].data.ptr);
+            handler->handler_fn(*this, events[i].events, handler->context);
             if (!running) break;
         }
     }
 }
 
-bool EventLoop::RegisterHandler(EventHandler &handler, uint32_t events) {
-    struct epoll_event ev{};
+bool EventLoop::RegisterHandler(EventHandler *handler, uint32_t events) {
+    struct epoll_event ev = {};
     ev.events = events;
-    ev.data.ptr = &handler;
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, handler.GetFd(), &ev) == -1) {
+    ev.data.ptr = handler;
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, handler->fd, &ev) == -1) {
         PLOGE("add event handler");
         return false;
     }

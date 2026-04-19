@@ -1,7 +1,6 @@
 #include "misc.hpp"
 
 #include <cstdint>
-#include <string_view>
 #include <sys/utsname.h>
 
 #include "logging.hpp"
@@ -85,6 +84,6 @@ extern "C" {
     KEEP void _Unwind_Resume(void*) {}
     KEEP int _Unwind_RaiseException(void*) { return 0; }
     KEEP int _Unwind_DeleteException(void*) { return 0; }
-    KEEP void __stub_atexit(void (*func)()) {}
+    KEEP void __stub_atexit([[maybe_unused]] void (*func)()) {}
     __attribute__((weak, alias("__stub_atexit"))) void atexit(void (*func)());
 }

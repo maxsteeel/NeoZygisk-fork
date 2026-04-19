@@ -5,8 +5,7 @@
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-
-#include <array>
+#include <stdint.h>
 
 #include "daemon.hpp"
 #include "logging.hpp"
@@ -48,8 +47,7 @@ static bool should_skip_seccomp_injection() {
     // ensure that it is a null-terminated string
     buf[bytes_read] = '\0';
 
-    // search for the substring directly in the buffer
-    if (strstr(buf, "Seccomp_filters:") != nullptr) {
+    if (__builtin_strstr(buf, "Seccomp_filters:") != nullptr) {
         return true;
     }
 
@@ -61,8 +59,7 @@ void send_seccomp_event_if_needed() {
         return;
     }
 
-    // Use std::array for type-safe, fixed-size arrays.
-    std::array<uint32_t, 4> args{};
+    uint32_t args[4] = {0};
 
     // Read random bytes to create a unique syscall signature
     UniqueFd random_fd(open("/dev/urandom", O_RDONLY | O_CLOEXEC));
@@ -71,9 +68,9 @@ void send_seccomp_event_if_needed() {
         return;
     }
     
-    ssize_t read_res = read(random_fd, args.data(), args.size() * sizeof(uint32_t));
+    ssize_t read_res = read(random_fd, args, sizeof(args));
     
-    if (read_res != static_cast<ssize_t>(args.size() * sizeof(uint32_t))) {
+    if (read_res != static_cast<ssize_t>(sizeof(args))) {
         PLOGE("seccomp: read(random_file)");
         return;
     }
@@ -81,7 +78,7 @@ void send_seccomp_event_if_needed() {
     // Modify a bit to ensure the signature is highly unlikely to occur naturally.
     args[0] |= 0x10000;
 
-    const std::array<sock_filter, 12> filter = {{
+    const struct sock_filter filter[12] = {
         // 1. Check if the syscall is __NR_exit_group. If not, allow it.
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_exit_group, 0, 9),
@@ -101,12 +98,12 @@ void send_seccomp_event_if_needed() {
 
         // 4. Default action for any non-matching syscall is to allow it.
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-    }};
+    };
 
-    sock_fprog prog = {
-        .len = static_cast<unsigned short>(filter.size()),
+    struct sock_fprog prog = {
+        .len = static_cast<unsigned short>(sizeof(filter) / sizeof(filter[0])),
         // prctl API requires a non-const pointer.
-        .filter = const_cast<sock_filter *>(filter.data()),
+        .filter = const_cast<struct sock_filter *>(filter),
     };
 
     if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)) {

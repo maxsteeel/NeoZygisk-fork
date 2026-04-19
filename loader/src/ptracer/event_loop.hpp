@@ -1,10 +1,12 @@
 #pragma once
 
-#include <cstdint>
+#include <stdint.h>
 #include "daemon.hpp"
 
 // Forward declaration
 class EventLoop;
+
+typedef void (*EventCallback)(EventLoop &loop, uint32_t event, void* context);
 
 /**
  * @brief An abstract interface for event handlers.
@@ -14,19 +16,11 @@ class EventLoop;
  * and a method to handle events on that descriptor.
  */
 struct EventHandler {
-    virtual int GetFd() = 0;
-    virtual void HandleEvent(EventLoop &loop, uint32_t event) = 0;
-    virtual ~EventHandler() = default;
+    int fd;
+    EventCallback handler_fn;
+    void* context;
 };
 
-/**
- * @brief A generic, epoll-based event loop.
- *
- * This class provides a simple abstraction over Linux's epoll mechanism.
- * It allows for registering multiple EventHandlers, each associated with a
- * file descriptor, and runs a loop that dispatches events to the appropriate
- * handler.
- */
 class EventLoop {
 public:
     EventLoop &operator=(const EventLoop &) = delete;
@@ -34,7 +28,7 @@ public:
     bool Init();
     void Stop();
     void Loop();
-    bool RegisterHandler(EventHandler &handler, uint32_t events);
+    bool RegisterHandler(EventHandler *handler, uint32_t events);
 
 private:
     UniqueFd epoll_fd_;

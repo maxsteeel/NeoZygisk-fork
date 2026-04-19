@@ -14,25 +14,25 @@ static void do_detect_root() {
     auto magisk_ver = magisk::detect_version();
 
     // In C++, booleans cast to 1 or 0 cleanly without ternary overhead
-    int detection_count = (apatch_ver != std::nullopt) + 
-                          (ksu_ver != std::nullopt) + 
-                          (magisk_ver != std::nullopt);
+    int detection_count = (apatch_ver != Version::Null) + 
+                          (ksu_ver != Version::Null) + 
+                          (magisk_ver != Version::Null);
 
     if (detection_count > 1) {
         g_root_impl = RootImpl::Multiple;
         return;
     }
 
-    if (apatch_ver != std::nullopt) {
-        g_root_impl = (apatch_ver.value() == apatch::Version::Supported) ? RootImpl::APatch : RootImpl::TooOld;
+    if (apatch_ver != Version::Null) {
+        g_root_impl = (apatch_ver == Version::Supported) ? RootImpl::APatch : RootImpl::TooOld;
         return;
     }
-    if (ksu_ver != std::nullopt) {
-        g_root_impl = (ksu_ver.value() == kernelsu::Version::Supported) ? RootImpl::KernelSU : RootImpl::TooOld;
+    if (ksu_ver != Version::Null) {
+        g_root_impl = (ksu_ver == Version::Supported) ? RootImpl::KernelSU : RootImpl::TooOld;
         return;
     }
-    if (magisk_ver != std::nullopt) {
-        g_root_impl = (magisk_ver.value() == magisk::Version::Supported) ? RootImpl::Magisk : RootImpl::TooOld;
+    if (magisk_ver != Version::Null) {
+        g_root_impl = (magisk_ver == Version::Supported) ? RootImpl::Magisk : RootImpl::TooOld;
         return;
     }
 

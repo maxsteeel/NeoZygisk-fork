@@ -9,9 +9,6 @@
 #include <signal.h>
 #include <string.h>
 
-#include <string>
-#include <vector>
-
 struct MapInfo {
     /// \brief The start address of the memory region.
     uintptr_t start;

@@ -17,13 +17,13 @@ const Status& ZygoteAbiManager::get_status() const { return status_; }
 
 void ZygoteAbiManager::notify_injected() { status_.zygote_injected = true; }
 
-void ZygoteAbiManager::set_daemon_info(std::string_view info) { 
-    strlcpy(status_.daemon_info, info.data(), sizeof(status_.daemon_info)); 
+void ZygoteAbiManager::set_daemon_info(const char* info, size_t len) { 
+    strlcpy(status_.daemon_info, info, len); 
 }
 
-void ZygoteAbiManager::set_daemon_crashed(std::string_view error) {
+void ZygoteAbiManager::set_daemon_crashed(const char* error, size_t len) {
     status_.daemon_running = false;
-    strlcpy(status_.daemon_error_info, error.data(), sizeof(status_.daemon_error_info));
+    strlcpy(status_.daemon_error_info, error, len);
 }
 
 bool ZygoteAbiManager::is_in_crash_loop() {

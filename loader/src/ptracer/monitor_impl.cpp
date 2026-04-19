@@ -5,15 +5,33 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-#include <algorithm>
 #include <csignal>
+#include <stdlib.h> 
 
 #include "daemon.hpp"
 #include "files.hpp"
 #include "logging.hpp"
 #include "monitor.hpp"
 #include "utils.hpp"
+
+// --- Helper Functions  ---
+
+static inline bool contains(const IntList& vec, int pid) {
+    for (size_t i = 0; i < vec.size; i++) {
+        if (unlikely(vec.data[i] == pid)) return true;
+    }
+    return false;
+}
+
+static inline void fast_erase(IntList& vec, int pid) {
+    for (size_t i = 0; i < vec.size; i++) {
+        if (vec.data[i] == pid) {
+            vec.data[i] = vec.data[vec.size - 1];
+            vec.size--;
+            return;
+        }
+    }
+}
 
 // --- AppMonitor Method Implementations ---
 
@@ -35,7 +53,7 @@ TracingState AppMonitor::get_tracing_state() const { return tracing_state_; }
 void AppMonitor::write_abi_status_section(char *status_text, const Status &daemon_status) {
     if (!daemon_status.supported) return;
 
-    size_t len = strlen(status_text);
+    size_t len = __builtin_strlen(status_text);
     char* p = status_text + len;
     size_t remaining = sizeof(final_output_) - len;
 
@@ -83,35 +101,35 @@ void AppMonitor::update_status() {
     strlcat(final_output_, post_section_, sizeof(final_output_));
 
     ftruncate(prop_fd_, 0);
-    pwrite(prop_fd_, final_output_, strlen(final_output_), 0);
+    pwrite(prop_fd_, final_output_, __builtin_strlen(final_output_), 0);
 }
 
 bool AppMonitor::prepare_environment() {
-    memset(pre_section_, 0, sizeof(pre_section_));
-    memset(post_section_, 0, sizeof(post_section_));
-    memset(this->prop_path_, 0, sizeof(this->prop_path_));
+    __builtin_memset(pre_section_, 0, sizeof(pre_section_));
+    __builtin_memset(post_section_, 0, sizeof(post_section_));
+    __builtin_memset(this->prop_path_, 0, sizeof(this->prop_path_));
     snprintf(this->prop_path_, sizeof(this->prop_path_), "%s/module.prop", zygiskd::GetTmpPath());
     this->prop_fd_ = UniqueFd(open(this->prop_path_, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
     if (this->prop_fd_ < 0) {
         PLOGE("failed to create/open prop_file at %s", this->prop_path_);
         return false;
     }
-    auto orig_prop = xopen_file("./module.prop", "r");
-    if (orig_prop == nullptr) {
+    UniqueFd orig_prop_fd(open("./module.prop", O_RDONLY | O_CLOEXEC));
+    if (orig_prop_fd < 0) {
         PLOGE("open original prop");
         return false;
     }
     bool post = false;
-    file_readline(false, orig_prop.get(), [&](std::string_view line) -> bool {
-        if (line.starts_with("updateJson=")) return true;
-        if (line.starts_with("description=")) {
+    file_readline(false, orig_prop_fd, [&](const char* line) -> bool {
+        if (__builtin_strncmp(line, "updateJson=", 11) == 0) return true;
+        if (__builtin_strncmp(line, "description=", 12) == 0) {
             post = true;
-            strncat(post_section_, line.data() + 12, sizeof(post_section_) - strlen(post_section_) - 1);
+            strncat(post_section_, line + 12, sizeof(post_section_) - __builtin_strlen(post_section_) - 1);
         } else {
             char* target = post ? post_section_ : pre_section_;
-            strncat(target, "\t", sizeof(pre_section_) - strlen(target) - 1);
-            strncat(target, line.data(), sizeof(pre_section_) - strlen(target) - 1);
-            strncat(target, "\n", sizeof(pre_section_) - strlen(target) - 1);
+            strncat(target, "\t", sizeof(pre_section_) - __builtin_strlen(target) - 1);
+            strncat(target, line, sizeof(pre_section_) - __builtin_strlen(target) - 1);
+            strncat(target, "\n", sizeof(pre_section_) - __builtin_strlen(target) - 1);
         }
         return true;
     });
@@ -120,24 +138,12 @@ bool AppMonitor::prepare_environment() {
     return true;
 }
 
-static inline bool contains(const std::vector<int>& vec, int pid) {
-    return std::find(vec.begin(), vec.end(), pid) != vec.end();
-}
-
-static inline void fast_erase(std::vector<int>& vec, int pid) {
-    auto it = std::find(vec.begin(), vec.end(), pid);
-    if (it != vec.end()) {
-        *it = vec.back();
-        vec.pop_back();
-    }
-}
-
 void AppMonitor::run() {
     socket_handler_.Init();
     ptrace_handler_.Init();
     event_loop_.Init();
-    event_loop_.RegisterHandler(socket_handler_, EPOLLIN | EPOLLET);
-    event_loop_.RegisterHandler(ptrace_handler_, EPOLLIN | EPOLLET);
+    event_loop_.RegisterHandler(&socket_handler_.epoll_evt, EPOLLIN | EPOLLET);
+    event_loop_.RegisterHandler(&ptrace_handler_.epoll_evt, EPOLLIN | EPOLLET);
     event_loop_.Loop();
 }
 
@@ -156,8 +162,10 @@ void AppMonitor::request_stop(const char* reason) {
     if (tracing_state_ == TRACING) {
         LOGI("stop tracing requested");
         tracing_state_ = STOPPING;
-        strncpy(monitor_stop_reason_, reason, sizeof(monitor_stop_reason_) - 1);
-        monitor_stop_reason_[sizeof(monitor_stop_reason_) - 1] = '\0';
+        size_t rlen = __builtin_strlen(reason);
+        if (rlen >= sizeof(monitor_stop_reason_)) rlen = sizeof(monitor_stop_reason_) - 1;
+        __builtin_memcpy(monitor_stop_reason_, reason, rlen);
+        monitor_stop_reason_[rlen] = '\0';
         ptrace(PTRACE_INTERRUPT, 1, 0, 0);
         update_status();
     }
@@ -166,8 +174,10 @@ void AppMonitor::request_stop(const char* reason) {
 void AppMonitor::request_exit() {
     LOGI("prepare for exit ...");
     tracing_state_ = EXITING;
-    strncpy(monitor_stop_reason_, "user requested", sizeof(monitor_stop_reason_) - 1);
-    monitor_stop_reason_[sizeof(monitor_stop_reason_) - 1] = '\0';
+    const char* reason = "user requested";
+    size_t rlen = __builtin_strlen(reason);
+    __builtin_memcpy(monitor_stop_reason_, reason, rlen);
+    monitor_stop_reason_[rlen] = '\0';
     update_status();
     event_loop_.Stop();
 }
@@ -179,31 +189,36 @@ void AppMonitor::notify_init_detached() {
 
 // --- SocketHandler Method Implementations ---
 
-int AppMonitor::SocketHandler::GetFd() { return sock_fd_; }
-
 bool AppMonitor::SocketHandler::Init() {
     sock_fd_ = UniqueFd(socket(PF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
     if (sock_fd_ == -1) {
         PLOGE("socket create");
         return false;
     }
-    struct sockaddr_un addr {
-        .sun_family = AF_UNIX, .sun_path = {0},
-    };
-    if (snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/%s", zygiskd::GetTmpPath(),
-                 AppMonitor::SOCKET_NAME) >= static_cast<int>(sizeof(addr.sun_path))) {
+
+    struct sockaddr_un addr = {};
+    addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0';
+    size_t name_len = __builtin_strlen(AppMonitor::SOCKET_NAME);
+    if (name_len >= sizeof(addr.sun_path) - 1) {
         PLOGE("UNIX domain socket path too long");
         return false;
     }
-    socklen_t socklen = sizeof(sa_family_t) + strlen(addr.sun_path);
+    __builtin_memcpy(addr.sun_path + 1, AppMonitor::SOCKET_NAME, name_len);
+    socklen_t socklen = offsetof(struct sockaddr_un, sun_path) + 1 + name_len;
     if (bind(sock_fd_, (struct sockaddr *) &addr, socklen) == -1) {
         PLOGE("bind socket");
         return false;
     }
+
+    epoll_evt.fd = sock_fd_; 
+    epoll_evt.handler_fn = &SocketHandler::DispatchEvent;
+    epoll_evt.context = this;
+    
     return true;
 }
 
-void AppMonitor::SocketHandler::HandleEvent([[maybe_unused]] EventLoop &loop, uint32_t) {
+void AppMonitor::SocketHandler::HandleEvent(EventLoop &, uint32_t) {
     alignas(MsgHead) char buffer[8192];
 
     for (;;) {
@@ -226,26 +241,19 @@ void AppMonitor::SocketHandler::HandleEvent([[maybe_unused]] EventLoop &loop, ui
         }
 
         switch (full_msg.cmd) {
-        case START:
-            monitor_.request_start();
-            break;
-        case STOP:
-            monitor_.request_stop("user requested");
-            break;
-        case EXIT:
-            monitor_.request_exit();
-            break;
+        case START: monitor_.request_start(); break;
+        case STOP: monitor_.request_stop("user requested"); break;
+        case EXIT: monitor_.request_exit(); break;
         case ZYGOTE_INJECTED:
             monitor_.get_abi_manager().notify_injected();
             monitor_.update_status();
             break;
         case DAEMON_SET_INFO:
-            monitor_.get_abi_manager().set_daemon_info({full_msg.data, (size_t) full_msg.length});
+            monitor_.get_abi_manager().set_daemon_info(full_msg.data, (size_t) full_msg.length);
             monitor_.update_status();
             break;
         case DAEMON_SET_ERROR_INFO:
-            monitor_.get_abi_manager().set_daemon_crashed(
-                {full_msg.data, (size_t) full_msg.length});
+            monitor_.get_abi_manager().set_daemon_crashed(full_msg.data, (size_t) full_msg.length);
             monitor_.update_status();
             break;
         case SYSTEM_SERVER_STARTED:
@@ -256,8 +264,6 @@ void AppMonitor::SocketHandler::HandleEvent([[maybe_unused]] EventLoop &loop, ui
 }
 
 // --- SigChldHandler Method Implementations ---
-
-int AppMonitor::SigChldHandler::GetFd() { return signal_fd_; }
 
 bool AppMonitor::SigChldHandler::Init() {
     sigset_t mask;
@@ -273,6 +279,11 @@ bool AppMonitor::SigChldHandler::Init() {
         return false;
     }
     ptrace(PTRACE_SEIZE, 1, 0, PTRACE_O_TRACEFORK);
+
+    epoll_evt.fd = signal_fd_; 
+    epoll_evt.handler_fn = &SigChldHandler::DispatchEvent;
+    epoll_evt.context = this;
+    
     return true;
 }
 
@@ -414,8 +425,7 @@ void AppMonitor::SigChldHandler::handleParentEvent(int pid, int &status) {
             // Injecting these back would physically freeze the parent process,
             // causing the entire boot chain to hang.
             if (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU) {
-                LOGW("suppressing stop signal %s (%d) sent to parent %d", sigabbrev_np(sig), sig,
-                     pid);
+            // causing the entire boot chain to hang.
             }
             // Protect stub_zygote from SIGCHLD.
             // When we freeze/resume its child for injection, the kernel sends SIGCHLD to the stub.
@@ -522,7 +532,7 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
         // --- Intermediate Stub Identification ---
         // If this program is a stub_zygote, we must promote it to a Process Factory.
         // It will remain attached forever so we can shield it from SIGCHLD.
-        if (strstr(program, "stub_zygote") != nullptr) {
+        if (__builtin_strstr(program, "stub_zygote") != nullptr) {
             LOGI("detected stub zygote at %d, promoting to parent monitor", pid);
             stub_processes_.push_back(pid);
 
@@ -540,8 +550,8 @@ bool AppMonitor::SigChldHandler::handleExecEvent(int pid, int &status) {
             break;
         }
 
-        if (strcmp(program, monitor_.get_abi_manager().program_path_) != 0) {
-            break;  // Irrelevant program, exit block and return false.
+        if (__builtin_strcmp(program, monitor_.get_abi_manager().program_path_) != 0) {
+            break;  
         }
 
         const char *tracer = monitor_.get_abi_manager().check_and_prepare_injection();

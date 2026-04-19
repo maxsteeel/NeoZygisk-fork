@@ -1,7 +1,6 @@
 #pragma once
 
 #include <jni.h>
-#include <string>
 
 struct mount_info {
     unsigned int id;
@@ -20,5 +19,3 @@ void hook_entry(void *start_addr, size_t block_size);
 void hookJniNativeMethods(JNIEnv *env, const char *clz, JNINativeMethod *methods, int numMethods);
 
 void send_seccomp_event_if_needed();
-
-std::vector<mount_info> check_zygote_traces(uint32_t info_flags);

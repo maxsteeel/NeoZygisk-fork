@@ -63,9 +63,7 @@ struct ThreadPayload {
     AppContext* context;
 };
 
-static char CONTROLLER_SOCKET[256] = {0};
 static const char* const DAEMON_SOCKET_PATH = LP_SELECT("cp32.sock", "cp64.sock");
-
 static UniqueFd g_shm_fd;
 static constants::ZygiskSharedData* g_shm_base = nullptr;
 
@@ -82,13 +80,6 @@ static void trigger_shm_refresh() {
 }
 
 static bool initialize_globals() {
-    const char* env_tmp = getenv("TMP_PATH");
-    if (!env_tmp) {
-        LOGE("TMP_PATH environment variable not set");
-        return false;
-    }
-    snprintf(CONTROLLER_SOCKET, sizeof(CONTROLLER_SOCKET), "%s/init_monitor", env_tmp);
-
     int raw_fd = syscall(SYS_memfd_create, "zygisk-shm", MFD_ALLOW_SEALING | MFD_CLOEXEC);
     if (raw_fd < 0) {
         PLOGE("memfd_create zygisk-shm failed");
@@ -204,7 +195,7 @@ static void send_startup_info(AppContext* context) {
 
     uint32_t text_len = static_cast<uint32_t>(written) + 1;
     memcpy(msg + 4, &text_len, 4);
-    utils::unix_datagram_sendto(CONTROLLER_SOCKET, msg, 8 + text_len);
+    utils::unix_datagram_sendto("init_monitor", msg, 8 + text_len);
 }
 
 static int create_library_fd(int raw_file_fd) {
@@ -462,7 +453,7 @@ static void handle_connection(UniqueFd stream, AppContext* context) {
         }
         case DaemonSocketAction::PingHeartbeat: {
             uint32_t val = constants::ZYGOTE_INJECTED;
-            utils::unix_datagram_sendto(CONTROLLER_SOCKET, &val, sizeof(val));
+            utils::unix_datagram_sendto("init_monitor", &val, sizeof(val));
             break;
         }
         case DaemonSocketAction::ZygoteRestart: {
@@ -476,7 +467,7 @@ static void handle_connection(UniqueFd stream, AppContext* context) {
         }
         case DaemonSocketAction::SystemServerStarted: {
             uint32_t val = constants::SYSTEM_SERVER_STARTED;
-            utils::unix_datagram_sendto(CONTROLLER_SOCKET, &val, sizeof(val));
+            utils::unix_datagram_sendto("init_monitor", &val, sizeof(val));
             break;
         }
         case DaemonSocketAction::GetSharedMemoryFd:
@@ -541,7 +532,7 @@ int main() {
 
     while (true) {
         UniqueFd stream = accept(listener, nullptr, nullptr);
-        if (stream >= 0) handle_connection(std::move(stream), context);
+        if (stream >= 0) handle_connection(static_cast<UniqueFd&&>(stream), context);
     }
 
     return 0;

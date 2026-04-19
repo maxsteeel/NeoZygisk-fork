@@ -2,16 +2,15 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <cstring>
-#include <vector>
+#include <stdlib.h>
 
 #include "daemon.hpp"
 #include "logging.hpp"
 #include "module.hpp"
 #include "zygisk.hpp"
 
-std::vector<mount_info> check_zygote_traces(uint32_t info_flags) {
-    std::vector<mount_info> traces;
+MountInfoList check_zygote_traces(uint32_t info_flags) {
+    MountInfoList traces;
 
     const char* mount_source_name = nullptr;
     bool is_kernelsu = false;
@@ -35,34 +34,39 @@ std::vector<mount_info> check_zygote_traces(uint32_t info_flags) {
         return traces;
     }
 
-    std::vector<char> buf;
-    buf.resize(1024 * 128); // 128KB is usually enough, avoids vector reallocations
+    size_t capacity = 1024 * 128; // 128KB iniciales
+    char* buf = static_cast<char*>(malloc(capacity));
+    if (!buf) return traces;
+    
     size_t total_read = 0;
 
     while (true) {
-        if (total_read == buf.size()) buf.resize(buf.size() * 2);
-        ssize_t bytes_read = read(fd, buf.data() + total_read, buf.size() - total_read);
+        if (total_read == capacity) {
+            capacity *= 2;
+            buf = static_cast<char*>(realloc(buf, capacity));
+        }
+        ssize_t bytes_read = read(fd, buf + total_read, capacity - total_read);
         if (bytes_read <= 0) break;
         total_read += bytes_read;
     }
 
-    if (total_read == 0) return traces;
+    if (total_read == 0) {
+        free(buf);
+        return traces;
+    }
     buf[total_read] = '\0'; // Null terminate
 
-    std::vector<mount_info> all_mounts;
-    all_mounts.reserve(256); // Pre-allocate to avoid reallocations
     char ksu_module_source[256] = {0};
 
-    char* p = buf.data();
-    char* end = buf.data() + total_read;
+    char* p = buf;
+    char* end = buf + total_read;
 
     while (p < end) {
-        // Fast line splitting using memchr
-        char* line_end = static_cast<char*>(memchr(p, '\n', end - p));
+        char* line_end = static_cast<char*>(__builtin_memchr(p, '\n', end - p));
         if (!line_end) line_end = end;
-        *line_end = '\0'; // Null terminate
+        *line_end = '\0';
 
-        char* separator = strstr(p, " - ");
+        char* separator = __builtin_strstr(p, " - ");
         if (separator) {
             mount_info info = {};
             unsigned int maj = 0, min = 0;
@@ -71,49 +75,54 @@ std::vector<mount_info> check_zygote_traces(uint32_t info_flags) {
                 info.device = makedev(maj, min);
 
                 if (sscanf(separator + 3, "%63s %255s", info.type, info.source) >= 2) {
-
-                    if (is_kernelsu && strcmp(info.target, "/data/adb/modules") == 0 &&
-                        strncmp(info.source, "/dev/block/loop", 15) == 0) {
-                        strlcpy(ksu_module_source, info.source, sizeof(ksu_module_source));
+                    if (is_kernelsu && __builtin_strcmp(info.target, "/data/adb/modules") == 0 &&
+                        __builtin_strncmp(info.source, "/dev/block/loop", 15) == 0) {
+                        size_t src_len = __builtin_strlen(info.source);
+                        if (src_len > 255) src_len = 255;
+                        __builtin_memcpy(ksu_module_source, info.source, src_len);
+                        ksu_module_source[src_len] = '\0';
                         LOGV("detected KernelSU loop device module source: %s", ksu_module_source);
                     }
 
-                    all_mounts.push_back(info);
+                    bool should_unmount = false;
+                    if (__builtin_strncmp(info.root, "/adb/modules", 12) == 0) {
+                        should_unmount = true;
+                    } else if (__builtin_strncmp(info.target, "/data/adb/modules", 17) == 0) {
+                        should_unmount = true;
+                    } else if (__builtin_strcmp(info.source, mount_source_name) == 0) {
+                        should_unmount = true;
+                    } else if (ksu_module_source[0] != '\0' && __builtin_strcmp(info.source, ksu_module_source) == 0) {
+                        should_unmount = true;
+                    }
+
+                    if (should_unmount) {
+                        traces.push_back(info);
+                    }
                 }
             }
         }
         p = line_end + 1;
     }
 
-    traces.reserve(all_mounts.size());
+    free(buf);
 
-    for (const auto& info : all_mounts) {
-        bool should_unmount = false;
-
-        if (strncmp(info.root, "/adb/modules", 12) == 0) {
-            should_unmount = true;
-        } else if (strncmp(info.target, "/data/adb/modules", 17) == 0) {
-            should_unmount = true;
-        } else if (strcmp(info.source, mount_source_name) == 0) {
-            should_unmount = true;
-        } else if (ksu_module_source[0] != '\0' && strcmp(info.source, ksu_module_source) == 0) {
-            should_unmount = true;
-        }
-
-        if (should_unmount) {
-            traces.push_back(info);
-        }
-    }
-
-    if (traces.empty()) {
+    if (traces.size == 0) {
         LOGV("no relevant mount points found to unmount.");
         return traces;
     }
 
-    ::sort(traces.begin(), traces.end(), [](const auto& a, const auto& b) {
-        return a.id > b.id; 
-    });
+    if (traces.size > 1) {
+        for (size_t i = 1; i < traces.size; i++) {
+            mount_info temp = traces.data[i];
+            size_t j = i;
+            while (j > 0 && traces.data[j - 1].id < temp.id) {
+                traces.data[j] = traces.data[j - 1];
+                j--;
+            }
+            traces.data[j] = temp;
+        }
+    }
 
-    LOGV("found %zu mounting traces in zygote.", traces.size());
+    LOGV("found %zu mounting traces in zygote.", traces.size);
     return traces;
 }
