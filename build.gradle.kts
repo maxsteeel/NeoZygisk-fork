@@ -53,6 +53,12 @@ fun Project.configureBaseExtension() {
             minSdk = androidMinSdkVersion
         }
 
+        externalNativeBuild {
+            cmake {
+                version = "3.31.6+"
+            }
+        }
+
         lint {
             abortOnError = true
         }

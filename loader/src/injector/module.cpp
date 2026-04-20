@@ -29,6 +29,7 @@
 static __thread sigjmp_buf g_segv_jmp_buf;
 static __thread volatile sig_atomic_t g_in_module_load = 0;
 static struct sigaction old_segv, old_bus;
+static pthread_mutex_t unmount_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void module_segv_handler(int sig, siginfo_t *info, void *context) {
     if (g_in_module_load) {
@@ -218,20 +219,23 @@ void ZygiskContext::plt_hook_exclude(const char *regex, const char *symbol) {
 void ZygiskContext::plt_hook_process_regex() {
     if (register_info.size == 0) return;
     const size_t ignore_count = ignore_info.size;
-    
-    // Fast-stack allocation for matches
-    uint8_t* ign_matches = static_cast<uint8_t*>(__builtin_alloca(ignore_count));
+    uint8_t* ign_matches = nullptr;
+    if (ignore_count > 0) {
+        ign_matches = new uint8_t[ignore_count];
+    }
 
     for (size_t i = 0; i < g_hook->cached_map_infos.size; i++) {
         auto& map = g_hook->cached_map_infos.data[i];
         if (map.offset != 0 || !map.is_private || !(map.perms & PROT_READ)) continue;
 
-        for (size_t j = 0; j < ignore_count; ++j) {
-            auto &ign = ignore_info.data[j];
-            if (!ign.is_regex) {
-                ign_matches[j] = (__builtin_strstr(map.path, ign.literal) != nullptr);
-            } else {
-                ign_matches[j] = (regexec(&ign.regex, map.path, 0, nullptr, 0) == 0);
+        if (ignore_count > 0) {
+            for (size_t j = 0; j < ignore_count; ++j) {
+                auto &ign = ignore_info.data[j];
+                if (!ign.is_regex) {
+                    ign_matches[j] = (__builtin_strstr(map.path, ign.literal) != nullptr);
+                } else {
+                    ign_matches[j] = (regexec(&ign.regex, map.path, 0, nullptr, 0) == 0);
+                }
             }
         }
 
@@ -255,6 +259,10 @@ void ZygiskContext::plt_hook_process_regex() {
                 lsplt::RegisterHook(map.dev, map.inode, reg.symbol, reg.callback, reg.backup);
             }
         }
+    }
+
+    if (ign_matches) {
+        delete[] ign_matches;
     }
 }
 
@@ -612,20 +620,23 @@ void ZygiskContext::nativeSpecializeAppProcess_pre() {
         LOGI("AppZygote [%s] is on denylist, performing manual unmount", process);
         
         MountInfoList new_traces = check_zygote_traces(info_flags);
-        
-        // Copiamos datos al context global manualmente
-        g_hook->zygote_traces.size = 0;
-        for(size_t i=0; i<new_traces.size; i++) g_hook->zygote_traces.push_back(new_traces.data[i]);
 
-        if (!abort_zygote_unmount(g_hook->zygote_traces, info_flags)) {
-            for (size_t i = 0; i < g_hook->zygote_traces.size; i++) {
-                const auto& trace = g_hook->zygote_traces.data[i];
-                if (__builtin_strcmp(trace.source, "magisk") == 0) continue;
-                LOGV("AppZygote unmounting %s", trace.target);
-                umount2(trace.target, MNT_DETACH);
-            }
-            g_hook->zygote_unmounted = true;
+        {
+            mutex_guard lock(unmount_lock); 
+
             g_hook->zygote_traces.size = 0;
+            for(size_t i=0; i<new_traces.size; i++) g_hook->zygote_traces.push_back(new_traces.data[i]);
+
+            if (!abort_zygote_unmount(g_hook->zygote_traces, info_flags)) {
+                for (size_t i = 0; i < g_hook->zygote_traces.size; i++) {
+                    const auto& trace = g_hook->zygote_traces.data[i];
+                    if (__builtin_strcmp(trace.source, "magisk") == 0) continue;
+                    LOGV("AppZygote unmounting %s", trace.target);
+                    umount2(trace.target, MNT_DETACH);
+                }
+                g_hook->zygote_unmounted = true;
+                g_hook->zygote_traces.size = 0;
+            }
         }
     }
 }
@@ -645,26 +656,30 @@ void ZygiskContext::nativeForkAndSpecialize_pre() {
         info_flags = zygiskd::GetProcessFlags(args.app->uid);
 
         MountInfoList new_traces = check_zygote_traces(info_flags);
-        g_hook->zygote_traces.size = 0;
-        for(size_t i=0; i<new_traces.size; i++) g_hook->zygote_traces.push_back(new_traces.data[i]);
 
-        if (!abort_zygote_unmount(g_hook->zygote_traces, info_flags)) {
-            size_t valid = 0;
-            for (size_t i = 0; i < g_hook->zygote_traces.size; i++) {
-                const auto& trace = g_hook->zygote_traces.data[i];
-                if (__builtin_strcmp(trace.source, "magisk") == 0) {
-                    LOGV("skip magisk specific mounts for compatibility: %s", trace.source);
-                    g_hook->zygote_traces.data[valid++] = trace; 
-                } else {
-                    LOGV("unmounting %s (mnt_id: %u)", trace.target, trace.id);
-                    if (umount2(trace.target, MNT_DETACH) != 0) {
-                        LOGE("failed to unmount %s: %s", trace.target, strerror(errno));
+        {
+            mutex_guard lock(unmount_lock);
+            g_hook->zygote_traces.size = 0;
+            for(size_t i=0; i<new_traces.size; i++) g_hook->zygote_traces.push_back(new_traces.data[i]);
+
+            if (!abort_zygote_unmount(g_hook->zygote_traces, info_flags)) {
+                size_t valid = 0;
+                for (size_t i = 0; i < g_hook->zygote_traces.size; i++) {
+                    const auto& trace = g_hook->zygote_traces.data[i];
+                    if (__builtin_strcmp(trace.source, "magisk") == 0) {
+                        LOGV("skip magisk specific mounts for compatibility: %s", trace.source);
                         g_hook->zygote_traces.data[valid++] = trace; 
+                    } else {
+                        LOGV("unmounting %s (mnt_id: %u)", trace.target, trace.id);
+                        if (umount2(trace.target, MNT_DETACH) != 0) {
+                            LOGE("failed to unmount %s: %s", trace.target, strerror(errno));
+                            g_hook->zygote_traces.data[valid++] = trace; 
+                        }
                     }
                 }
+                g_hook->zygote_traces.size = valid;
+                g_hook->zygote_unmounted = true;
             }
-            g_hook->zygote_traces.size = valid;
-            g_hook->zygote_unmounted = true;
         }
     }
 

@@ -35,35 +35,37 @@ struct Property {
     char value[92];
 };
 
-struct PropertyList {
-    Property* data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    ~PropertyList() { free(data); }
-    void push_back(uint32_t h, const char* k, const char* v) {
-        if (size >= capacity) {
-            capacity = capacity == 0 ? 8 : capacity * 2;
-            data = (Property*)realloc(data, capacity * sizeof(Property));
-        }
-        data[size].key_hash = h;
-        size_t kl = __builtin_strlen(k); if(kl > 91) kl = 91;
-        __builtin_memcpy(data[size].key, k, kl); data[size].key[kl] = '\0';
+UniqueList<Property>& GetSpoofProps() {
+    // Safe local static initialization
+    // This ensures that the constructor is called exactly once in 
+    // runtime, ignoring linker order problems.
+    static UniqueList<Property> spoof_props;
+    return spoof_props;
+}
 
-        size_t vl = __builtin_strlen(v); if(vl > 91) vl = 91;
-        __builtin_memcpy(data[size].value, v, vl); data[size].value[vl] = '\0';
-        size++;
-    }
-};
-
-PropertyList g_spoof_props;
+static void push_spoof_prop(uint32_t hash, const char* key, const char* value) {
+    Property p;
+    p.key_hash = hash;
+    size_t kl = __builtin_strlen(key); 
+    if (kl > 91) kl = 91;
+    __builtin_memcpy(p.key, key, kl); 
+    p.key[kl] = '\0';
+    size_t vl = __builtin_strlen(value); 
+    if (vl > 91) vl = 91;
+    __builtin_memcpy(p.value, value, vl); 
+    p.value[vl] = '\0';
+    GetSpoofProps().push_back(p);
+}
 
 static const Property* find_spoof_prop(const char* name) {
-    if (!name || g_spoof_props.size == 0) return nullptr;
+    if (!name) return nullptr;
+    auto& spoof_props = GetSpoofProps();
+    if (spoof_props.size == 0) return nullptr;
     uint32_t hash = calc_gnu_hash(name);
-    for (size_t i = 0; i < g_spoof_props.size; i++) {
-        if (__builtin_expect(g_spoof_props.data[i].key_hash == hash, 0)) {
-            if (__builtin_strcmp(g_spoof_props.data[i].key, name) == 0) {
-                return &g_spoof_props.data[i];
+    for (size_t i = 0; i < spoof_props.size; ++i) {
+        if (__builtin_expect(spoof_props.data[i].key_hash == hash, 0)) {
+            if (__builtin_strcmp(spoof_props.data[i].key, name) == 0) {
+                return &spoof_props.data[i];
             }
         }
     }
@@ -89,19 +91,24 @@ static void trim_inplace(char* str) {
 }
 
 static void generate_random_hex(char* buf, int len) {
+    if (len <= 0) return;
     UniqueFd fd(open("/dev/urandom", O_RDONLY | O_CLOEXEC));
     if (fd >= 0) {
         int read_len = len / 2;
-        unsigned char* buffer = static_cast<unsigned char*>(__builtin_alloca(read_len));
-        if (read(fd, buffer, read_len) == read_len) {
-            const char* digits = "0123456789abcdef";
-            for (int i = 0; i < read_len; ++i) {
-                buf[i * 2]     = digits[buffer[i] >> 4];
-                buf[i * 2 + 1] = digits[buffer[i] & 0x0F];
+        unsigned char* buffer = static_cast<unsigned char*>(malloc(read_len));
+        if (buffer) {
+            if (read(fd, buffer, read_len) == read_len) {
+                const char* digits = "0123456789abcdef";
+                for (int i = 0; i < read_len; ++i) {
+                    buf[i * 2]     = digits[buffer[i] >> 4];
+                    buf[i * 2 + 1] = digits[buffer[i] & 0x0F];
+                }
+                if (len % 2 != 0) buf[len - 1] = '0';
+                buf[len] = '\0';
+                free(buffer);
+                return;
             }
-            if (len % 2 != 0) buf[len - 1] = '0';
-            buf[len] = '\0';
-            return;
+            free(buffer);
         }
     }
     __builtin_memset(buf, '0', len);
@@ -111,7 +118,7 @@ static void generate_random_hex(char* buf, int len) {
 void InitRandomVbmeta() {
     char fake_digest[65];
     generate_random_hex(fake_digest, 64);
-    g_spoof_props.push_back(calc_gnu_hash("ro.boot.vbmeta.digest"), "ro.boot.vbmeta.digest", fake_digest);
+    push_spoof_prop(calc_gnu_hash("ro.boot.vbmeta.digest"), "ro.boot.vbmeta.digest", fake_digest);
 }
 
 void LoadPropConfig() {
@@ -137,7 +144,7 @@ void LoadPropConfig() {
                     trim_inplace(key);
                     trim_inplace(value);
                     if (key[0] != '\0') {
-                        g_spoof_props.push_back(calc_gnu_hash(key), key, value);
+                        push_spoof_prop(calc_gnu_hash(key), key, value);
                     }
                 }
                 line = strtok_r(nullptr, "\n", &saveptr);
@@ -400,9 +407,9 @@ DCL_HOOK_FUNC(int, prctl, int option, unsigned long arg2, unsigned long arg3, un
             size_t total_len = prepend_len + prog->len;
 
             if (total_len <= BPF_MAXINSNS) {
-                // Use dynamic stack allocation via alloca.
+                // Use dynamic allocation via malloc.
                 size_t alloc_size = total_len * sizeof(struct sock_filter);
-                struct sock_filter* new_filter = static_cast<struct sock_filter*>(__builtin_alloca(alloc_size));
+                struct sock_filter* new_filter = static_cast<struct sock_filter*>(malloc(alloc_size));
 
                 if (new_filter != nullptr) {
                     __builtin_memcpy(new_filter, prepend, sizeof(prepend));
@@ -413,7 +420,9 @@ DCL_HOOK_FUNC(int, prctl, int option, unsigned long arg2, unsigned long arg3, un
                     new_prog.len = static_cast<unsigned short>(total_len);
                     new_prog.filter = new_filter;
 
-                    return old_prctl(option, arg2, reinterpret_cast<unsigned long>(&new_prog), arg4, arg5);
+                    int result = old_prctl(option, arg2, reinterpret_cast<unsigned long>(&new_prog), arg4, arg5);
+                    free(new_filter);
+                    return result;
                 }
             }
         }
@@ -585,7 +594,7 @@ void HookContext::hook_jni_methods(JNIEnv *env, const char *clz, JNIMethods meth
         return;
     }
 
-    JNINativeMethod* hooks = static_cast<JNINativeMethod*>(__builtin_alloca(methods.size() * sizeof(JNINativeMethod)));
+    JNINativeMethod* hooks = new JNINativeMethod[methods.size()];
     size_t hooks_count = 0;
 
     for (auto &native_method : methods) {
@@ -616,8 +625,8 @@ void HookContext::hook_jni_methods(JNIEnv *env, const char *clz, JNIMethods meth
         native_method.fnPtr = original_method;
     }
 
-    if (hooks_count == 0) return;
-    env->RegisterNatives(clazz, hooks, hooks_count);
+    if (hooks_count > 0) env->RegisterNatives(clazz, hooks, hooks_count);
+    delete[] hooks;
 }
 
 void HookContext::hook_zygote_jni() {

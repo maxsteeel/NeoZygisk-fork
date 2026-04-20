@@ -80,16 +80,19 @@ static int scan_driver_fd() {
     UniqueDir dir(opendir("/proc/self/fd"));
     if (!dir) return -1;
 
+    int dir_fd = dirfd(dir.dir); 
+    if (dir_fd < 0) return -1;
+
     struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
+    char target[256]; 
+
+    while ((entry = readdir(dir.dir)) != nullptr) {
         if (entry->d_name[0] == '.') continue;
-        char path[256];
-        snprintf(path, sizeof(path), "/proc/self/fd/%s", entry->d_name);
-        char target[256];
-        ssize_t len = readlink(path, target, sizeof(target) - 1);
+        ssize_t len = readlinkat(dir_fd, entry->d_name, target, sizeof(target) - 1);
+        
         if (len > 0) {
             target[len] = '\0';
-            if (strstr(target, "[ksu_driver]")) {
+            if (len >= 12 && __builtin_memcmp(target + len - 12, "[ksu_driver]", 12) == 0) {
                 return fast_atoi(entry->d_name);
             }
         }
@@ -201,10 +204,13 @@ static int32_t prctl_get_manager_uid() {
 
 static void detect_and_init() {
     ::call_once(ksu_result_flag, []() {
-        int fd = init_driver_fd();
-        if (fd >= 0) {
+        // Wrap the raw integer immediately. If this function exits early,
+        // the destructor of local_fd will automatically close the descriptor.
+        UniqueFd local_fd(init_driver_fd());
+        if (local_fd >= 0) {
             KsuGetInfoCmd cmd = {0, 0, 0};
-            if (ksuctl_ioctl(fd, KSU_IOCTL_GET_INFO, &cmd)) {
+            // Use the implicit cast operator of UniqueFd to pass the int
+            if (ksuctl_ioctl((int)local_fd, KSU_IOCTL_GET_INFO, &cmd)) { 
                 int version_code = static_cast<int>(cmd.version);
                 if (version_code > 0) {
                     struct stat st;
@@ -213,8 +219,9 @@ static void detect_and_init() {
                         if (version_code > MAX_KSU_VERSION) {
                             LOGW("Support for current KernelSU (variant) could be incomplete");
                         }
-                        // Success path: Take ownership of FD
-                        g_ksu_fd = UniqueFd(fd); 
+                        // Transfer ownership from local to global.
+                        g_ksu_fd = static_cast<UniqueFd&&>(local_fd);
+                        
                         g_ksu_version = Version::Supported;
                         uid_granted_root_impl = ioctl_granted_root;
                         uid_should_umount_impl = ioctl_should_umount;
@@ -224,12 +231,12 @@ static void detect_and_init() {
                     } else if (version_code < MIN_KSU_VERSION) {
                         g_ksu_version = Version::TooOld;
                         g_is_detected = true;
-                        close(fd); // Prevent FD leak
+                        // local_fd falls out of scope here and auto-closes. No manual close() needed!
                         return;
                     }
                 }
             }
-            close(fd); // Prevent FD leak if IOCTL failed
+            // local_fd falls out of scope here and auto-closes. No manual close() needed!
         }
 
         // Fallback to legacy prctl
@@ -290,3 +297,4 @@ bool uid_is_manager(int32_t uid) {
 }
 
 } // namespace kernelsu
+

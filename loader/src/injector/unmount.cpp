@@ -41,12 +41,26 @@ MountInfoList check_zygote_traces(uint32_t info_flags) {
     size_t total_read = 0;
 
     while (true) {
-        if (total_read == capacity) {
-            capacity *= 2;
-            buf = static_cast<char*>(realloc(buf, capacity));
+        if (total_read >= capacity - 1) {
+            size_t new_capacity = capacity * 2;
+            char* new_buf = static_cast<char*>(malloc(new_capacity));
+            if (!new_buf) {
+                free(buf);
+                return traces; // OOM Fallback
+            }
+            __builtin_memcpy(new_buf, buf, total_read);
+            free(buf);
+            buf = new_buf;
+            capacity = new_capacity;
         }
-        ssize_t bytes_read = read(fd, buf + total_read, capacity - total_read);
-        if (bytes_read <= 0) break;
+        ssize_t bytes_read = read(fd, buf + total_read, capacity - total_read - 1);
+        if (bytes_read < 0) {
+            if (errno == EINTR) continue; // if interrupted, retry
+            PLOGE("Error leyendo /proc/self/mountinfo");
+            break; // real error
+        } else if (bytes_read == 0) {
+            break; // EOF
+        }
         total_read += bytes_read;
     }
 

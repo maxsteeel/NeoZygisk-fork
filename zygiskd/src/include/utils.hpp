@@ -18,31 +18,141 @@ struct linux_dirent64 {
     char d_name[];
 };
 
-struct IntList {
-    int32_t* data = nullptr;
+template <typename T>
+struct UniqueList {
+    T* data = nullptr;
     size_t size = 0;
     size_t capacity = 0;
 
-    ~IntList() { free(data); }
+    // Default constructor
+    UniqueList() = default;
 
-    void clear() {
-        free(data);
-        data = nullptr;
-        size = 0;
-        capacity = 0;
+    // Block copies to prevent Double-Free and Use-After-Free
+    UniqueList(const UniqueList&) = delete;
+    UniqueList& operator=(const UniqueList&) = delete;
+
+    // Allow move semantics (Transfer ownership)
+    UniqueList(UniqueList&& other) noexcept : data(other.data), size(other.size), capacity(other.capacity) {
+        other.data = nullptr;
+        other.size = 0;
+        other.capacity = 0;
     }
 
-    void push_back(int32_t val) {
+    UniqueList& operator=(UniqueList&& other) noexcept {
+        if (this != &other) {
+            free(data); 
+            data = other.data;
+            size = other.size;
+            capacity = other.capacity;
+
+            // Invalidate donor
+            other.data = nullptr;
+            other.size = 0;
+            other.capacity = 0;
+        }
+        return *this;
+    }
+
+    ~UniqueList() { 
+        free(data); 
+    }
+
+    void clear() {
+        size = 0; 
+    }
+
+    void push_back(const T& val) {
         if (size >= capacity) {
-            size_t new_cap = capacity == 0 ? 32 : capacity * 2;
-            int32_t* new_data = (int32_t*)realloc(data, new_cap * sizeof(int32_t));
-            if (!new_data) return; // SAFE: Prevent memory leak and segfault if OOM
+            size_t new_cap = capacity == 0 ? 8 : capacity * 2;
+            T* new_data = static_cast<T*>(malloc(new_cap * sizeof(T)));
+            if (!new_data) return; // Prevent segfault on OOM
+            if (data && size > 0) { __builtin_memcpy(new_data, data, size * sizeof(T)); }
+            if (data) free(data);
             data = new_data;
             capacity = new_cap;
         }
         data[size++] = val;
     }
+
+    void resize(size_t new_size) {
+        if (new_size > capacity) {
+            size_t old_cap = capacity;
+            size_t new_cap = old_cap == 0 ? (new_size > 256 ? new_size : 256) : old_cap * 2;
+            while (new_size > new_cap) { new_cap *= 2; }
+            T* new_data = static_cast<T*>(malloc(new_cap * sizeof(T)));
+            if (!new_data) return;
+            if (data && old_cap > 0) { __builtin_memcpy(new_data, data, old_cap * sizeof(T)); }
+            if (data) free(data);
+            data = new_data;
+            capacity = new_cap;
+            __builtin_memset((void*)(data + old_cap), 0, (new_cap - old_cap) * sizeof(T));
+        }
+        size = new_size;
+    }
 };
+
+template <typename T>
+struct RegexUniqueList {
+    T* data = nullptr;
+    size_t size = 0;
+    size_t capacity = 0;
+
+    RegexUniqueList() = default;
+    RegexUniqueList(const RegexUniqueList&) = delete;
+    RegexUniqueList& operator=(const RegexUniqueList&) = delete;
+    RegexUniqueList(RegexUniqueList&& other) noexcept : data(other.data), size(other.size), capacity(other.capacity) {
+        other.data = nullptr;
+        other.size = 0;
+        other.capacity = 0;
+    }
+    RegexUniqueList& operator=(RegexUniqueList&& other) noexcept {
+        if (this != &other) {
+            clear_regexes();
+            free(data);
+            data = other.data;
+            size = other.size;
+            capacity = other.capacity;
+            other.data = nullptr;
+            other.size = 0;
+            other.capacity = 0;
+        }
+        return *this;
+    }
+    ~RegexUniqueList() { 
+        clear_regexes();
+        free(data); 
+    }
+    void clear() {
+        clear_regexes();
+        size = 0;
+    }
+    void push_back(const T& val) {
+        if (size >= capacity) {
+            size_t new_cap = capacity == 0 ? 8 : capacity * 2;
+            T* new_data = static_cast<T*>(malloc(new_cap * sizeof(T)));
+            if (!new_data) return; 
+            if (data && size > 0) { __builtin_memcpy(new_data, data, size * sizeof(T)); }
+            if (data) free(data);
+            data = new_data;
+            capacity = new_cap;
+        }
+        data[size++] = val;
+    }
+
+private:
+    void clear_regexes() {
+        if (data) {
+            for (size_t i = 0; i < size; ++i) {
+                if (data[i].is_regex) {
+                    regfree(&data[i].regex);
+                    data[i].is_regex = false;
+                }
+            }
+        }
+    }
+};
+
+using IntList = UniqueList<int32_t>;
 
 struct StringList {
     char** data = nullptr;
@@ -78,7 +188,7 @@ struct StringList {
 
     void clear() {
         if (data) {
-            for (size_t i = 0; i < size; ++i) free(data[i]);
+            for (size_t i = 0; i < size; ++i) { if (data[i]) free(data[i]); }
             free(data);
             data = nullptr;
         }
@@ -90,13 +200,15 @@ struct StringList {
         if (!str) return;
         if (size >= capacity) {
             size_t new_cap = capacity == 0 ? 16 : capacity * 2;
-            char** new_data = (char**)realloc(data, new_cap * sizeof(char*));
-            if (!new_data) return; // SAFE
+            char** new_data = static_cast<char**>(malloc(new_cap * sizeof(char*)));
+            if (!new_data) return; // SAFE OOM
+            if (data && size > 0) { __builtin_memcpy(new_data, data, size * sizeof(char*)); }
+            if (data) free(data);
             data = new_data;
             capacity = new_cap;
         }
         size_t len = __builtin_strlen(str) + 1;
-        char* dup = (char*)malloc(len);
+        char* dup = static_cast<char*>(malloc(len));
         if (dup) {
             __builtin_memcpy(dup, str, len);
             data[size++] = dup;
@@ -271,12 +383,49 @@ struct UniqueLock {
 
 // --- Fast Parsers and Threading ---
 
-inline int fast_atoi(const char *str) {
+__attribute__((always_inline))
+static inline int fast_atoi(const char *str) {
     int val = 0;
     while (*str >= '0' && *str <= '9') {
         val = val * 10 + (*str++ - '0');
     }
     return val;
+}
+
+__attribute__((always_inline))
+static inline uint64_t fast_strtoull(const char* str, char** endptr, int base) {
+    uint64_t result = 0;
+    const char* p = str;
+    while (*p == ' ' || *p == '\t') p++;
+    if (base == 16) {
+        while (true) {
+            char c = *p;
+            uint64_t digit;
+            if (c >= '0' && c <= '9') {
+                digit = c - '0';
+            } else if (c >= 'a' && c <= 'f') {
+                digit = c - 'a' + 10;
+            } else if (c >= 'A' && c <= 'F') {
+                digit = c - 'A' + 10;
+            } else {
+                break;
+            }
+            result = (result << 4) | digit; 
+            p++;
+        }
+    } else if (base == 10) {
+        while (true) {
+            char c = *p;
+            if (c >= '0' && c <= '9') {
+                result = result * 10 + (c - '0');
+                p++;
+            } else {
+                break;
+            }
+        }
+    }
+    if (endptr) *endptr = const_cast<char*>(p);
+    return result;
 }
 
 static inline void spawn_thread(void* (*thread_func)(void*), void* arg) {
@@ -300,3 +449,4 @@ namespace utils {
     bool is_socket_alive(int fd);
     bool exec_command(const char* const* args, char* out_buf, size_t out_size);
 }
+

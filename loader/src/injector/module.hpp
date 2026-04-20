@@ -23,48 +23,6 @@ struct PltBackupEntry {
     void** backup_ptr;
 };
 
-struct CachedMapList {
-    CachedMapEntry* data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    ~CachedMapList() { free(data); }
-    void push_back(const CachedMapEntry& entry) {
-        if (size >= capacity) {
-            capacity = capacity == 0 ? 16 : capacity * 2;
-            data = (CachedMapEntry*)realloc(data, capacity * sizeof(CachedMapEntry));
-        }
-        data[size++] = entry;
-    }
-};
-
-struct PltBackupList {
-    PltBackupEntry* data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    ~PltBackupList() { free(data); }
-    void push_back(const PltBackupEntry& entry) {
-        if (size >= capacity) {
-            capacity = capacity == 0 ? 16 : capacity * 2;
-            data = (PltBackupEntry*)realloc(data, capacity * sizeof(PltBackupEntry));
-        }
-        data[size++] = entry;
-    }
-};
-
-struct MountInfoList {
-    mount_info* data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    ~MountInfoList() { free(data); }
-    void push_back(const mount_info& info) {
-        if (size >= capacity) {
-            capacity = capacity == 0 ? 8 : capacity * 2;
-            data = (mount_info*)realloc(data, capacity * sizeof(mount_info));
-        }
-        data[size++] = info;
-    }
-};
-
 struct RegisterInfo {
     char symbol[128];
     void *callback;
@@ -74,20 +32,6 @@ struct RegisterInfo {
     regex_t regex;
 };
 
-struct RegisterInfoList {
-    RegisterInfo* data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    ~RegisterInfoList() { free(data); }
-    void push_back(const RegisterInfo& info) {
-        if (size >= capacity) {
-            capacity = capacity == 0 ? 16 : capacity * 2;
-            data = (RegisterInfo*)realloc(data, capacity * sizeof(RegisterInfo));
-        }
-        data[size++] = info;
-    }
-};
-
 struct IgnoreInfo {
     char symbol[128];
     bool is_regex;
@@ -95,33 +39,12 @@ struct IgnoreInfo {
     regex_t regex;
 };
 
-struct IgnoreInfoList {
-    IgnoreInfo* data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    ~IgnoreInfoList() { free(data); }
-    void push_back(const IgnoreInfo& info) {
-        if (size >= capacity) {
-            capacity = capacity == 0 ? 16 : capacity * 2;
-            data = (IgnoreInfo*)realloc(data, capacity * sizeof(IgnoreInfo));
-        }
-        data[size++] = info;
-    }
-};
-
-struct BoolList {
-    bool* data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    ~BoolList() { free(data); }
-    void push_back(bool val) {
-        if (size >= capacity) {
-            capacity = capacity == 0 ? 256 : capacity * 2;
-            data = (bool*)realloc(data, capacity * sizeof(bool));
-        }
-        data[size++] = val;
-    }
-};
+using CachedMapList = UniqueList<CachedMapEntry>;
+using PltBackupList = UniqueList<PltBackupEntry>;
+using MountInfoList = UniqueList<mount_info>;
+using RegisterInfoList = RegexUniqueList<RegisterInfo>;
+using IgnoreInfoList = RegexUniqueList<IgnoreInfo>;
+using BoolList = UniqueList<bool>;
 
 struct ZygiskContext;
 struct HookContext;
@@ -374,16 +297,48 @@ struct ModuleList {
     ZygiskModule** data = nullptr;
     size_t size = 0;
     size_t capacity = 0;
-    ~ModuleList() { 
-        if (data) {
-            for (size_t i = 0; i < size; i++) delete data[i];
-            free(data);
+    ModuleList() = default;
+    ModuleList(const ModuleList&) = delete;
+    ModuleList& operator=(const ModuleList&) = delete;
+    ModuleList(ModuleList&& other) noexcept : data(other.data), size(other.size), capacity(other.capacity) {
+        other.data = nullptr;
+        other.size = 0;
+        other.capacity = 0;
+    }
+    ModuleList& operator=(ModuleList&& other) noexcept {
+        if (this != &other) {
+            clear();
+            data = other.data;
+            size = other.size;
+            capacity = other.capacity;
+            other.data = nullptr;
+            other.size = 0;
+            other.capacity = 0;
         }
+        return *this;
+    }
+    ~ModuleList() { 
+        clear(); 
+    }
+    void clear() {
+        if (data) {
+            for (size_t i = 0; i < size; i++) { if (data[i]) delete data[i]; }
+            free(data);
+            data = nullptr;
+        }
+        size = 0;
+        capacity = 0;
     }
     void push_back(ZygiskModule* val) {
+        if (!val) return;
         if (size >= capacity) {
-            capacity = capacity == 0 ? 8 : capacity * 2;
-            data = (ZygiskModule**)realloc(data, capacity * sizeof(ZygiskModule*));
+            size_t new_cap = capacity == 0 ? 8 : capacity * 2;
+            ZygiskModule** new_data = static_cast<ZygiskModule**>(malloc(new_cap * sizeof(ZygiskModule*)));
+            if (!new_data) return;
+            if (data && size > 0) { __builtin_memcpy(new_data, data, size * sizeof(ZygiskModule*)); }
+            if (data) free(data);
+            data = new_data;
+            capacity = new_cap;
         }
         data[size++] = val;
     }

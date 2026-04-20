@@ -104,23 +104,12 @@ struct MountInfo {
     char path[256];
 };
 
-struct MountTargetList {
-    MountInfo* data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-
-    ~MountTargetList() { free(data); }
-
+struct MountTargetList : public UniqueList<MountInfo> {
     void push_back(int id, const char* p) {
-        if (size >= capacity) {
-            capacity = capacity == 0 ? 32 : capacity * 2;
-            MountInfo* new_data = (MountInfo*)realloc(data, capacity * sizeof(MountInfo));
-            if (!new_data) return; // Prevent segfault on OOM
-            data = new_data;
-        }
-        data[size].mnt_id = id;
-        strlcpy(data[size].path, p, sizeof(data[size].path));
-        size++;
+        MountInfo info;
+        info.mnt_id = id;
+        strlcpy(info.path, p, sizeof(info.path));
+        UniqueList<MountInfo>::push_back(info);
     }
 };
 
@@ -159,56 +148,63 @@ bool MountNamespaceManager::clean_mount_namespace() {
     char ksu_module_source[256] = {0};
 
     char buf[4096];
-    char line[1024];
-    size_t line_pos = 0;
+    size_t current_pos = 0;
     ssize_t bytes_read;
 
-    while ((bytes_read = read(fd, buf, sizeof(buf))) > 0) {
-        for (ssize_t i = 0; i < bytes_read; ++i) {
-            char c = buf[i];
-            
-            if (c == '\n' || line_pos >= sizeof(line) - 1) {
-                line[line_pos] = '\0';
+    while ((bytes_read = read(fd, buf + current_pos, sizeof(buf) - current_pos - 1)) > 0) {
+        size_t total_bytes = current_pos + bytes_read;
+        buf[total_bytes] = '\0';
+
+        char *line_start = buf;
+        char *line_end;
+
+        while ((line_end = static_cast<char*>(__builtin_memchr(line_start, '\n', total_bytes - (line_start - buf)))) != nullptr) {
+            *line_end = '\0';
                 
-                if (line_pos > 0) {
-                    char* ptr = line;
-                    char* next;
+            if (line_start < line_end) {
+                char* ptr = line_start;
+                char* next;
 
-                    // Se extrae mnt_id
-                    int mnt_id = fast_atoi(ptr);
-                    if (mnt_id != 0) {
-                        ptr = tokenize_word(ptr, &next); // skip mnt_id
-                        ptr = tokenize_word(next, &next); // skip parent_id
-                        ptr = tokenize_word(next, &next); // skip major:minor
-                        char* root_path = tokenize_word(next, &next);
-                        char* mount_point = tokenize_word(next, &next);
-                        ptr = tokenize_word(next, &next); // skip mount options
-                        ptr = tokenize_word(next, &next); // skip optional fields
-                        if (*ptr == '-') ptr = tokenize_word(next, &next); // skip separator
-                        ptr = tokenize_word(next, &next); // skip filesystem type
-                        char* mount_source = tokenize_word(next, &next);
+                // extract mnt_id
+                int mnt_id = fast_atoi(ptr);
+                if (mnt_id != 0) {
+                    ptr = tokenize_word(ptr, &next); // skip mnt_id
+                    ptr = tokenize_word(next, &next); // skip parent_id
+                    ptr = tokenize_word(next, &next); // skip major:minor
+                    char* root_path = tokenize_word(next, &next);
+                    char* mount_point = tokenize_word(next, &next);
+                    ptr = tokenize_word(next, &next); // skip mount options
+                    ptr = tokenize_word(next, &next); // skip optional fields
+                    if (*ptr == '-') ptr = tokenize_word(next, &next); // skip separator
+                    ptr = tokenize_word(next, &next); // skip filesystem type
+                    char* mount_source = tokenize_word(next, &next);
 
-                        if (is_ksu && strncmp(mount_point, "/data/adb/modules", 17) == 0) {
-                            if (strncmp(mount_source, "/dev/block/loop", 15) == 0) {
-                                strlcpy(ksu_module_source, mount_source, sizeof(ksu_module_source));
-                            }
-                        }
-
-                        bool should_unmount = false;
-                        if (strncmp(root_path, "/adb/modules", 12) == 0) should_unmount = true;
-                        else if (strncmp(mount_point, "/data/adb/modules", 17) == 0) should_unmount = true;
-                        else if (root_source && strcmp(mount_source, root_source) == 0) should_unmount = true;
-                        else if (ksu_module_source[0] != '\0' && strcmp(mount_source, ksu_module_source) == 0) should_unmount = true;
-
-                        if (should_unmount) {
-                            unmount_targets.push_back(mnt_id, mount_point);
+                    if (is_ksu && __builtin_strncmp(mount_point, "/data/adb/modules", 17) == 0) {
+                        if (__builtin_strncmp(mount_source, "/dev/block/loop", 15) == 0) {
+                            strlcpy(ksu_module_source, mount_source, sizeof(ksu_module_source));
                         }
                     }
+
+                    bool should_unmount = false;
+                    if (__builtin_strncmp(root_path, "/adb/modules", 12) == 0) should_unmount = true;
+                    else if (__builtin_strncmp(mount_point, "/data/adb/modules", 17) == 0) should_unmount = true;
+                    else if (root_source && __builtin_strcmp(mount_source, root_source) == 0) should_unmount = true;
+                    else if (ksu_module_source[0] != '\0' && __builtin_strcmp(mount_source, ksu_module_source) == 0) should_unmount = true;
+
+                    if (should_unmount) {
+                        unmount_targets.push_back(mnt_id, mount_point);
+                    }
                 }
-                line_pos = 0;
-            } else {
-                line[line_pos++] = c;
             }
+            line_start = line_end + 1;
+        }
+
+        size_t remaining = total_bytes - (line_start - buf);
+        if (remaining > 0 && remaining < sizeof(buf)) {
+            __builtin_memmove(buf, line_start, remaining);
+            current_pos = remaining;
+        } else {
+            current_pos = 0;
         }
     }
 
@@ -229,3 +225,4 @@ bool MountNamespaceManager::clean_mount_namespace() {
 }
 
 } // namespace zygisk_mount
+

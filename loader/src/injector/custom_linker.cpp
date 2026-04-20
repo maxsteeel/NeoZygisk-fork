@@ -119,36 +119,16 @@ extern "C" ptrdiff_t custom_tlsdesc_resolver_stub(void*);
 #endif
 
 struct deferred_ifunc { uintptr_t target; uintptr_t resolver; };
-struct IfuncList {
-    deferred_ifunc* data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    ~IfuncList() { free(data); }
+struct IfuncList : public UniqueList<deferred_ifunc> {
     void push_back(uintptr_t target, uintptr_t resolver) {
-        if (size >= capacity) {
-            capacity = capacity == 0 ? 8 : capacity * 2;
-            data = (deferred_ifunc*)realloc(data, capacity * sizeof(deferred_ifunc));
-        }
-        data[size++] = {target, resolver};
+        UniqueList<deferred_ifunc>::push_back({target, resolver});
     }
 };
 
 struct tlsdesc { void* resolver; uint64_t arg; };
 struct CustomTlsInfo { size_t module_id; pthread_key_t key; size_t size; };
 struct tls_index { size_t module_id; size_t offset; };
-struct TlsIndexList {
-    tls_index** data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    ~TlsIndexList() { free(data); }
-    void push_back(tls_index* val) {
-        if (size >= capacity) {
-            capacity = capacity == 0 ? 4 : capacity * 2;
-            data = (tls_index**)realloc(data, capacity * sizeof(tls_index*));
-        }
-        data[size++] = val;
-    }
-};
+using TlsIndexList = UniqueList<tls_index*>;
 
 struct DestructorAction {
     enum Type { FUNC_PTR, TLS_CLEANUP, TLSDESC_CLEANUP } type;
@@ -159,35 +139,10 @@ struct DestructorAction {
         tls_index* tlsdesc_arg;
     };
 };
-
-struct DestructorList {
-    DestructorAction* data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    ~DestructorList() { free(data); }
-    void push_back(DestructorAction action) {
-        if (size >= capacity) {
-            capacity = capacity == 0 ? 8 : capacity * 2;
-            data = (DestructorAction*)realloc(data, capacity * sizeof(DestructorAction));
-        }
-        data[size++] = action;
-    }
-};
+using DestructorList = UniqueList<DestructorAction>;
 
 struct MemMap { uintptr_t base; size_t size; };
-struct MemMapList {
-    MemMap* data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    ~MemMapList() { free(data); }
-    void push_back(MemMap map) {
-        if (size >= capacity) {
-            capacity = capacity == 0 ? 4 : capacity * 2;
-            data = (MemMap*)realloc(data, capacity * sizeof(MemMap));
-        }
-        data[size++] = map;
-    }
-};
+using MemMapList = UniqueList<MemMap>;
 
 struct LoadedModule {
     char path[256];
@@ -200,34 +155,40 @@ struct LoadedModule {
     TlsIndexList tlsdesc_args;
 };
 
-struct LoadedModuleList {
-    LoadedModule* data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    ~LoadedModuleList() { free(data); }
+struct LoadedModuleList : public UniqueList<LoadedModule> {
     LoadedModule& push_back() {
-        if (size >= capacity) {
-            capacity = capacity == 0 ? 4 : capacity * 2;
-            data = (LoadedModule*)realloc(data, capacity * sizeof(LoadedModule));
-            // Initialize the newly allocated structure cleanly
-            memset((void*)&data[size], 0, sizeof(LoadedModule));
+        if (this->size >= this->capacity) {
+            size_t new_cap = this->capacity == 0 ? 4 : this->capacity * 2;
+            LoadedModule* new_data = static_cast<LoadedModule*>(malloc(new_cap * sizeof(LoadedModule)));
+            if (!new_data) return this->data[this->size - 1]; // Safe fallback
+            if (this->data && this->size > 0) {
+                __builtin_memcpy((void*)new_data, this->data, this->size * sizeof(LoadedModule));
+            }
+            if (this->data) free(this->data);
+            this->data = new_data;
+            this->capacity = new_cap;
         }
-        return data[size++];
+        // Initialize the newly allocated structure cleanly
+        __builtin_memset((void*)&this->data[this->size], 0, sizeof(LoadedModule));
+        return this->data[this->size++];
     }
 };
 
 struct CachedLib { const char* name; uint32_t hash; };
-struct CachedLibList {
-    CachedLib* data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    ~CachedLibList() { free(data); }
+struct CachedLibList : public UniqueList<CachedLib> {
     void push_back(const char* n) {
-        if (size >= capacity) {
-            capacity = capacity == 0 ? 128 : capacity * 2;
-            data = (CachedLib*)realloc(data, capacity * sizeof(CachedLib));
+        if (this->size >= this->capacity) {
+            size_t new_cap = this->capacity == 0 ? 128 : this->capacity * 2;
+            CachedLib* new_data = static_cast<CachedLib*>(malloc(new_cap * sizeof(CachedLib)));
+            if (!new_data) return;
+            if (this->data && this->size > 0) {
+                __builtin_memcpy(new_data, this->data, this->size * sizeof(CachedLib));
+            }
+            if (this->data) free(this->data);
+            this->data = new_data;
+            this->capacity = new_cap;
         }
-        data[size++] = {n, calc_gnu_hash(n)};
+        this->data[this->size++] = {n, calc_gnu_hash(n)};
     }
 };
 
@@ -236,13 +197,34 @@ struct CustomRegionList {
     CustomRegion* data = nullptr;
     size_t size = 0;
     size_t capacity = 0;
+    CustomRegionList() = default;
+    CustomRegionList(const CustomRegionList&) = delete;
+    CustomRegionList& operator=(const CustomRegionList&) = delete;
+    CustomRegionList(CustomRegionList&& other) noexcept : data(other.data), size(other.size), capacity(other.capacity) {
+        other.data = nullptr; other.size = 0; other.capacity = 0;
+    }
+    CustomRegionList& operator=(CustomRegionList&& other) noexcept {
+        if (this != &other) {
+            data = other.data; size = other.size; capacity = other.capacity;
+            other.data = nullptr; other.size = 0; other.capacity = 0;
+        }
+        return *this;
+    }
     // We intentionally don't free in destructor because this is a global state
+    ~CustomRegionList() = default; 
     CustomRegion& push_back() {
         if (size >= capacity) {
-            capacity = capacity == 0 ? 4 : capacity * 2;
-            data = (CustomRegion*)realloc(data, capacity * sizeof(CustomRegion));
-            memset((void*)&data[size], 0, sizeof(CustomRegion)); // Clean initialization
+            size_t new_cap = capacity == 0 ? 4 : capacity * 2;
+            CustomRegion* new_data = static_cast<CustomRegion*>(malloc(new_cap * sizeof(CustomRegion)));
+            if (!new_data) return data[size > 0 ? size - 1 : 0]; // Evitar desreferenciar nullptr
+            if (data && size > 0) {
+                __builtin_memcpy((void*)new_data, data, size * sizeof(CustomRegion));
+            }
+            if (data) free(data);
+            data = new_data;
+            capacity = new_cap;
         }
+        __builtin_memset((void*)&data[size], 0, sizeof(CustomRegion)); // Clean initialization
         return data[size++];
     }
     void erase(size_t index) {
@@ -251,9 +233,12 @@ struct CustomRegionList {
         data[index].maps.~MemMapList();
         data[index].destructors.~DestructorList();
         if (index < size - 1) {
-            memmove((void*)&data[index], (void*)&data[index + 1], (size - index - 1) * sizeof(CustomRegion));
+            __builtin_memmove((void*)&data[index], (void*)&data[index + 1], (size - index - 1) * sizeof(CustomRegion));
         }
         size--;
+        // The garbage left in the last slot after the memmove is cleaned
+        // to prevent old internal lists from being accidentally reused or released twice.
+        __builtin_memset((void*)&data[size], 0, sizeof(CustomRegion));
     }
 };
 

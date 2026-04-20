@@ -233,35 +233,50 @@ static void parse_packages_list() {
     if (fd < 0) return;
 
     char buf[4096];
-    char line[512];
-    size_t line_pos = 0;
+    size_t current_pos = 0;
     ssize_t bytes_read;
 
-    while ((bytes_read = read(fd, buf, sizeof(buf))) > 0) {
-        for (ssize_t i = 0; i < bytes_read; ++i) {
-            char c = buf[i];
-            if (c == '\n' || line_pos >= sizeof(line) - 1) {
-                line[line_pos] = '\0';
-                if (line_pos > 0) {
-                    char* ptr = line;
-                    while (*ptr > ' ') ++ptr; // Find end of package name
+    while ((bytes_read = read(fd, buf + current_pos, sizeof(buf) - current_pos - 1)) > 0) {
+        size_t total_bytes = current_pos + bytes_read;
+        buf[total_bytes] = '\0';
+        char *line_start = buf;
+        char *line_end;
+
+        while ((line_end = static_cast<char*>(memchr(line_start, '\n', total_bytes - (line_start - buf)))) != nullptr) {
+            *line_end = '\0';
+
+            if (line_start < line_end) {
+                char* ptr = line_start;
+                while (*ptr > ' ' && ptr < line_end) ++ptr;
+
+                if (ptr < line_end) {
+                    *ptr = '\0'; ++ptr;
+                    while (*ptr == ' ' && ptr < line_end) ++ptr; // Find end of package name
                     if (*ptr != '\0') {
                         *ptr = '\0'; // Null-terminate pkg name natively
                         ++ptr;
-                        while (*ptr == ' ') ++ptr; // Skip spaces to UID
-                        
-                        int32_t parsed_uid = fast_atoi(ptr);
-                        if (parsed_uid > 0) {
-                            g_cache.all_known_uids.push_back(parsed_uid);
-                            if (list_contains_pkg(g_cache.denylist_pkgs, line)) {
-                                g_cache.denylist_uids.push_back(parsed_uid);
+                        while (*ptr == ' ' && ptr < line_end) ++ptr; // Skip spaces to UID
+
+                        if (ptr < line_end) {
+                            int32_t parsed_uid = fast_atoi(ptr);
+                            if (parsed_uid > 0) {
+                                g_cache.all_known_uids.push_back(parsed_uid);
+                                if (list_contains_pkg(g_cache.denylist_pkgs, line_start)) {
+                                    g_cache.denylist_uids.push_back(parsed_uid);
+                                }
                             }
                         }
                     }
                 }
-                line_pos = 0;
+                line_start = line_end + 1;
+            }
+            
+            size_t remaining = total_bytes - (line_start - buf);
+            if (remaining > 0 && remaining < sizeof(buf)) {
+                memmove(buf, line_start, remaining);
+                current_pos = remaining;
             } else {
-                line[line_pos++] = c;
+                current_pos = 0;
             }
         }
     }
@@ -434,3 +449,4 @@ bool uid_is_manager(int32_t uid) {
 }
 
 } // namespace magisk
+

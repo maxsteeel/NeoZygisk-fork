@@ -17,12 +17,6 @@
 #include "logging.hpp"
 #include "elf_utils.hpp"
 
-#ifndef PAGE_SIZE
-#define PAGE_SIZE 4096
-#endif
-#define PAGE_START(x) ((x) & ~(PAGE_SIZE - 1))
-#define PAGE_END(x) PAGE_START((x) + (PAGE_SIZE - 1))
-
 /**
  * @brief Writes data to another process's memory using process_vm_writev.
  * @return The number of bytes written, or -1 on error.
@@ -501,7 +495,7 @@ bool get_program(int pid, char* buf, size_t buf_size) {
     return true;
 }
 
-uintptr_t find_syscall_gadget([[maybe_unused]] int local_pid, int remote_pid) {
+uintptr_t find_syscall_gadget(int remote_pid) {
     void* local_syscall = dlsym(RTLD_DEFAULT, "syscall");
     if (!local_syscall) {
         LOGE("Failed to find local syscall function");
@@ -543,7 +537,7 @@ uintptr_t find_syscall_gadget([[maybe_unused]] int local_pid, int remote_pid) {
         return 0;
     }
 
-    uintptr_t local_base = (uintptr_t)find_module_base(local_pid, "libc.so");
+    uintptr_t local_base = (uintptr_t)find_module_base(-1, "libc.so");
     uintptr_t remote_base = (uintptr_t)find_module_base(remote_pid, "libc.so");
 
     if (!local_base || !remote_base) {

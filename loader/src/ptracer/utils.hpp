@@ -8,6 +8,8 @@
 #include <cinttypes>
 #include <signal.h>
 #include <string.h>
+#include <fcntl.h>
+#include "daemon.hpp"
 
 struct MapInfo {
     /// \brief The start address of the memory region.
@@ -39,40 +41,89 @@ struct MapInfo {
     static void Scan(int pid, Callback cb) {
         char map_path[64];
         if (pid == -1 || pid == getpid()) {
-            strcpy(map_path, "/proc/self/maps");
+            __builtin_memcpy(map_path, "/proc/self/maps\0", 16);
         } else {
             snprintf(map_path, sizeof(map_path), "/proc/%d/maps", pid);
         }
 
-        UniqueFile fp(fopen(map_path, "re"));
-        if (!fp) return;
+        UniqueFd fd(open(map_path, O_RDONLY | O_CLOEXEC));
+        if (fd < 0) return;
 
-        char line[512];
-        while (fgets(line, sizeof(line), fp)) {
-            MapInfo info{};
-            info.perms = 0;
-            char perms_str[5] = {0};
-            uint64_t temp_inode = 0; 
-          
-            // Standard proc maps format: 
-            // 7f9c000000-7f9c001000 r-xp 00000000 103:04 123456 /system/lib64/libc.so
-            int matched = sscanf(line, "%" PRIxPTR "-%" PRIxPTR " %4s %" PRIxPTR " %*x:%*x %" PRIu64 " %255s",
-                                 &info.start, &info.end, perms_str, &info.offset, &temp_inode, info.path);
-            info.inode = static_cast<ino_t>(temp_inode);
+        char buf[8192];
+        size_t current_pos = 0;
+        ssize_t bytes_read;
 
-            if (matched >= 4) {
-                if (perms_str[0] == 'r') info.perms |= PROT_READ;
-                if (perms_str[1] == 'w') info.perms |= PROT_WRITE;
-                if (perms_str[2] == 'x') info.perms |= PROT_EXEC;
-                info.is_private = (perms_str[3] == 'p');
-                
-                // If scanf did not read the path (because it was anonymous memory), path remains empty
-                if (matched < 6) info.path[0] = '\0';
+        while ((bytes_read = read(fd, buf + current_pos, sizeof(buf) - current_pos - 1)) > 0) {
+            size_t total_bytes = current_pos + bytes_read;
+            buf[total_bytes] = '\0';
 
-                // Execute the callback. If it returns true, we stop scanning.
-                if (cb(info)) {
-                    break; 
+            char *line_start = buf;
+            char *line_end;
+            while ((line_end = static_cast<char*>(memchr(line_start, '\n', total_bytes - (line_start - buf)))) != nullptr) {
+                *line_end = '\0'; // null termination
+
+                if (line_start < line_end) {
+                    MapInfo info{};
+                    info.perms = 0;
+                    char* ptr = line_start;
+                    char* next;
+
+                    info.start = fast_strtoull(ptr, &next, 16); // parse start address (hex)
+                    if (ptr == next || *next != '-') goto skip_line;
+                    ptr = next + 1;
+
+                    info.end = fast_strtoull(ptr, &next, 16); // parse end address (hex)
+                    if (ptr == next || *next != ' ') goto skip_line;
+                    ptr = next + 1;
+
+                    // parse perms (e.g., "r-xp")
+                    if (line_end - ptr >= 4) {
+                        if (ptr[0] == 'r') info.perms |= PROT_READ;
+                        if (ptr[1] == 'w') info.perms |= PROT_WRITE;
+                        if (ptr[2] == 'x') info.perms |= PROT_EXEC;
+                        info.is_private = (ptr[3] == 'p');
+                        ptr += 4;
+                    } else {
+                        goto skip_line;
+                    }
+
+                    while (*ptr == ' ' && ptr < line_end) ++ptr; // skip spaces
+                    info.offset = fast_strtoull(ptr, &next, 16); // parse offset (hex)
+                    if (ptr == next) goto skip_line;
+                    ptr = next;
+                    while (*ptr == ' ' && ptr < line_end) ++ptr;// skip spaces
+                    while (*ptr != ' ' && ptr < line_end) ++ptr; // skip major:minor
+                    while (*ptr == ' ' && ptr < line_end) ++ptr;
+                    info.inode = fast_strtoull(ptr, &next, 10); // parse inode (decimal)
+                    ptr = next;
+                    while (*ptr == ' ' && ptr < line_end) ++ptr; // skip spaces
+
+                    // extract path
+                    size_t path_len = line_end - ptr;
+                    if (path_len > 0) {
+                        if (path_len >= sizeof(info.path)) path_len = sizeof(info.path) - 1;
+                        __builtin_memcpy(info.path, ptr, path_len);
+                        info.path[path_len] = '\0';
+                    } else {
+                        info.path[0] = '\0';
+                    }
+
+                    // execute callback. if it returns true, stop scanning.
+                    if (cb(info)) {
+                        return; // returns direct to exit the outer loop as well
+                    }
                 }
+
+    skip_line:
+                line_start = line_end + 1;
+            }
+
+            size_t remaining = total_bytes - (line_start - buf);
+            if (remaining > 0 && remaining < sizeof(buf)) {
+                __builtin_memmove(buf, line_start, remaining);
+                current_pos = remaining;
+            } else {
+                current_pos = 0;
             }
         }
     }
@@ -186,7 +237,7 @@ inline const char *sigabbrev_np(int sig) {
 bool get_program(int pid, char* buf, size_t buf_size);
 
 // Finds a raw 'svc 0' or 'syscall' gadget in the remote libc.so
-uintptr_t find_syscall_gadget(int local_pid, int remote_pid);
+uintptr_t find_syscall_gadget(int remote_pid);
 
 // Executes a raw kernel syscall in the remote process, bypassing BTI and libc wrappers.
 long remote_syscall(int pid, struct user_regs_struct &regs, uintptr_t syscall_gadget, long sysnr, const long *args, size_t args_size);

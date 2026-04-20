@@ -164,12 +164,13 @@ static void* shm_refresh_thread(void*) {
 }
 
 static void send_startup_info(AppContext* context) {
-    uint8_t msg[1024]; 
-    memset(msg, 0, sizeof(msg));
+    uint8_t* msg = (uint8_t*)malloc(4096);
+    if (!msg) return;
+    memset(msg, 0, 4096);
 
     uint32_t* magic_ptr = reinterpret_cast<uint32_t*>(msg);
     char* info_ptr = reinterpret_cast<char*>(msg + 8);
-    size_t max_info_sz = sizeof(msg) - 8 - 1;
+    size_t max_info_sz = 4096 - 8 - 1;
     int written = 0;
 
     auto root = root_impl::get();
@@ -193,9 +194,11 @@ static void send_startup_info(AppContext* context) {
         }
     }
 
+    if (written < 0) written = 0;
     uint32_t text_len = static_cast<uint32_t>(written) + 1;
     memcpy(msg + 4, &text_len, 4);
     utils::unix_datagram_sendto("init_monitor", msg, 8 + text_len);
+    free(msg);
 }
 
 static int create_library_fd(int raw_file_fd) {
@@ -285,12 +288,12 @@ static int spawn_companion(const char* name) {
     UniqueFd daemon_sock(pair[0]);
     UniqueFd companion_sock(pair[1]);
 
-    char self_exe[256];
+    char self_exe[PATH_MAX];
     ssize_t len = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
     if (len < 0) return -1;
     self_exe[len] = '\0';
 
-    const char* base_name = strrchr(self_exe, '/');
+    const char* base_name = __builtin_strrchr(self_exe, '/');
     base_name = base_name ? base_name + 1 : "zygiskd";
 
     pid_t pid = fork();
@@ -300,11 +303,29 @@ static int spawn_companion(const char* name) {
         daemon_sock = UniqueFd();
         fcntl(companion_sock, F_SETFD, fcntl(companion_sock, F_GETFD) & ~FD_CLOEXEC);
 
-        char arg0[256], fd_str[32];
-        snprintf(arg0, sizeof(arg0), "%s-%s", base_name, name);
-        snprintf(fd_str, sizeof(fd_str), "%d", (int)companion_sock);
+        char arg0[128]; 
+        size_t base_len = __builtin_strlen(base_name);
+        size_t name_len = __builtin_strlen(name);
+        size_t total_len = base_len + 1 + name_len;
+        if (total_len >= sizeof(arg0)) total_len = sizeof(arg0) - 1;
+        
+        char* arg0_ptr = arg0;
+        __builtin_memcpy(arg0_ptr, base_name, base_len); arg0_ptr += base_len;
+        *arg0_ptr++ = '-';
+        size_t copy_len = total_len - base_len - 1;
+        __builtin_memcpy(arg0_ptr, name, copy_len); arg0_ptr += copy_len;
+        *arg0_ptr = '\0';
 
-        const char* argv[] = {arg0, "companion", fd_str, nullptr};
+        char fd_str[16];
+        char* fd_ptr = fd_str + sizeof(fd_str) - 1;
+        *fd_ptr = '\0';
+        int fd_val = (int)companion_sock;
+        do {
+            *(--fd_ptr) = '0' + (fd_val % 10);
+            fd_val /= 10;
+        } while (fd_val > 0);
+
+        const char* argv[] = {arg0, "companion", fd_ptr, nullptr};
         execv(self_exe, const_cast<char**>(argv));
         _exit(1);
     }
@@ -539,3 +560,4 @@ int main() {
 }
 
 } // namespace zygiskd_main
+

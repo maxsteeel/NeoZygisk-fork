@@ -38,20 +38,7 @@
 #define ELF_R_SYM ELF32_R_SYM
 #endif
 
-struct MapInfoList {
-    MapInfo* data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    ~MapInfoList() { free(data); }
-    void push_back(const MapInfo& m) {
-        if (size >= capacity) {
-            capacity = capacity == 0 ? 64 : capacity * 2;
-            data = (MapInfo*)realloc(data, capacity * sizeof(MapInfo));
-        }
-        data[size++] = m;
-    }
-};
-
+using MapInfoList = UniqueList<MapInfo>;
 static uintptr_t smart_resolve_symbol(const char* sym_name,
                                       const MapInfoList& local_maps,
                                       const MapInfoList& remote_maps) {
@@ -312,7 +299,7 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
 
     if (unlikely(!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size))) return false;
 
-    uintptr_t syscall_gadget = find_syscall_gadget(local_pid, remote_pid);
+    uintptr_t syscall_gadget = find_syscall_gadget(remote_pid);
     if (!syscall_gadget) {
         LOGE("Failed to find syscall gadget for Remote-Custom Linker");
         return false;
