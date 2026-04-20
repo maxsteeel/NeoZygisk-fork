@@ -270,14 +270,14 @@ static void parse_packages_list() {
                 }
                 line_start = line_end + 1;
             }
-            
-            size_t remaining = total_bytes - (line_start - buf);
-            if (remaining > 0 && remaining < sizeof(buf)) {
-                memmove(buf, line_start, remaining);
-                current_pos = remaining;
-            } else {
-                current_pos = 0;
-            }
+        }
+
+        size_t remaining = total_bytes - (line_start - buf);
+        if (remaining > 0 && remaining < sizeof(buf)) {
+            memmove(buf, line_start, remaining);
+            current_pos = remaining;
+        } else {
+            current_pos = 0;
         }
     }
     sort_uids(g_cache.all_known_uids);

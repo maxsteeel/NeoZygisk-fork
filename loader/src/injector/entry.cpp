@@ -38,6 +38,3 @@ void entry(void* addr, size_t size, const char* path, void (**init_array)(), siz
  */
 extern "C" [[gnu::visibility("default")]] 
 int __cxa_atexit(void (*)(void*), void*, void*) { return 0; }
-
-extern "C" [[gnu::visibility("default")]] 
-void __cxa_finalize(void*) {}

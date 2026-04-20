@@ -435,13 +435,28 @@ private:
 
 inline const lsplt::MapInfo* find_in_cache(const CachedMapList& cache, const char* name) {
     uint32_t target_hash = calc_gnu_hash(name);
-    for (size_t i = 0; i < cache.size; ++i) {
-        if (__builtin_expect(cache.data[i].name_hash == target_hash, 0)) {
-            if (__builtin_strcmp(cache.data[i].name, name) == 0) {
-                return cache.data[i].info;
-            }
+
+    size_t left = 0;
+    size_t right = cache.size;
+
+    // Binary search for the first element with name_hash >= target_hash
+    while (left < right) {
+        size_t mid = left + (right - left) / 2;
+        if (cache.data[mid].name_hash < target_hash) {
+            left = mid + 1;
+        } else {
+            right = mid;
         }
     }
+
+    // Linear scan for hash collisions
+    while (left < cache.size && cache.data[left].name_hash == target_hash) {
+        if (__builtin_strcmp(cache.data[left].name, name) == 0) {
+            return cache.data[left].info;
+        }
+        left++;
+    }
+
     return nullptr;
 }
 

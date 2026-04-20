@@ -62,10 +62,24 @@ static const Property* find_spoof_prop(const char* name) {
     auto& spoof_props = GetSpoofProps();
     if (spoof_props.size == 0) return nullptr;
     uint32_t hash = calc_gnu_hash(name);
-    for (size_t i = 0; i < spoof_props.size; ++i) {
-        if (__builtin_expect(spoof_props.data[i].key_hash == hash, 0)) {
-            if (__builtin_strcmp(spoof_props.data[i].key, name) == 0) {
-                return &spoof_props.data[i];
+
+    size_t left = 0;
+    size_t right = spoof_props.size;
+    while (left < right) {
+        size_t mid = left + (right - left) / 2;
+        const auto& prop = spoof_props.data[mid];
+        if (prop.key_hash < hash) {
+            left = mid + 1;
+        } else if (prop.key_hash > hash) {
+            right = mid;
+        } else {
+            int cmp = __builtin_strcmp(prop.key, name);
+            if (cmp < 0) {
+                left = mid + 1;
+            } else if (cmp > 0) {
+                right = mid;
+            } else {
+                return &prop;
             }
         }
     }
@@ -92,25 +106,29 @@ static void trim_inplace(char* str) {
 
 static void generate_random_hex(char* buf, int len) {
     if (len <= 0) return;
+
     UniqueFd fd(open("/dev/urandom", O_RDONLY | O_CLOEXEC));
     if (fd >= 0) {
-        int read_len = len / 2;
-        unsigned char* buffer = static_cast<unsigned char*>(malloc(read_len));
-        if (buffer) {
-            if (read(fd, buffer, read_len) == read_len) {
-                const char* digits = "0123456789abcdef";
-                for (int i = 0; i < read_len; ++i) {
-                    buf[i * 2]     = digits[buffer[i] >> 4];
-                    buf[i * 2 + 1] = digits[buffer[i] & 0x0F];
-                }
-                if (len % 2 != 0) buf[len - 1] = '0';
-                buf[len] = '\0';
-                free(buffer);
-                return;
+        unsigned char temp_buf[32]; 
+        int total_hex_chars = 0;
+        const char* digits = "0123456789abcdef";
+        int requested_buf = (len / 2) > 32 ? 32 : (len / 2);
+
+        if (read(fd, temp_buf, requested_buf) == requested_buf) {
+            for (int i = 0; i < requested_buf; ++i) {
+                buf[i * 2]     = digits[temp_buf[i] >> 4];
+                buf[i * 2 + 1] = digits[temp_buf[i] & 0x0F];
             }
-            free(buffer);
+            total_hex_chars = requested_buf * 2;
+
+            if (len > total_hex_chars) {
+                __builtin_memset(buf + total_hex_chars, '0', len - total_hex_chars);
+            }
+            buf[len] = '\0';
+            return;
         }
     }
+
     __builtin_memset(buf, '0', len);
     buf[len] = '\0';
 }
@@ -118,7 +136,8 @@ static void generate_random_hex(char* buf, int len) {
 void InitRandomVbmeta() {
     char fake_digest[65];
     generate_random_hex(fake_digest, 64);
-    push_spoof_prop(calc_gnu_hash("ro.boot.vbmeta.digest"), "ro.boot.vbmeta.digest", fake_digest);
+    constexpr uint32_t vbmeta_digest_hash = calc_gnu_hash("ro.boot.vbmeta.digest");
+    push_spoof_prop(vbmeta_digest_hash, "ro.boot.vbmeta.digest", fake_digest);
 }
 
 void LoadPropConfig() {
@@ -502,6 +521,13 @@ void HookContext::refresh_map_infos() {
             map_info_cache.push_back(entry);
         }
     }
+
+    if (map_info_cache.size > 0) {
+        ::sort(map_info_cache.data, map_info_cache.data + map_info_cache.size,
+               [](const CachedMapEntry& a, const CachedMapEntry& b) {
+                   return a.name_hash < b.name_hash;
+               });
+    }
 }
 
 void HookContext::hook_plt() {
@@ -675,6 +701,14 @@ void HookContext::restore_zygote_hook(JNIEnv *env) {
 void hook_entry(void *start_addr, size_t block_size) {
     LoadPropConfig();
     InitRandomVbmeta();
+
+    auto& spoof_props = GetSpoofProps();
+    if (spoof_props.size > 0) {
+        ::sort(spoof_props.data, spoof_props.data + spoof_props.size, [](const Property& a, const Property& b) {
+            if (a.key_hash != b.key_hash) return a.key_hash < b.key_hash;
+            return __builtin_strcmp(a.key, b.key) < 0;
+        });
+    }
 
     UniqueFd shm_fd(zygiskd::GetZygiskSharedData());
     if (shm_fd >= 0) {

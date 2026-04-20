@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/types.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <sys/auxv.h>
@@ -900,9 +901,40 @@ static int build_cache_cb(struct dl_phdr_info* info, size_t, void* data) {
 }
 
 static inline bool is_library_loaded_in_memory(const char* soname, uint32_t hash, const CachedLibList& cache) {
-    for (size_t i = 0; i < cache.size; i++) {
-        if (cache.data[i].hash == hash) {
-            if (__builtin_strcmp(cache.data[i].name, soname) == 0) return true;
+    if (cache.size == 0) return false;
+
+    size_t low = 0;
+    size_t high = cache.size - 1;
+
+    while (low <= high) {
+        size_t mid = low + (high - low) / 2;
+        const auto& mid_lib = cache.data[mid];
+
+        if (mid_lib.hash < hash) {
+            low = mid + 1;
+        } else if (mid_lib.hash > hash) {
+            if (mid == 0) break;
+            high = mid - 1;
+        } else {
+            // Hash match found.
+            // Because multiple libraries could have the same hash (unlikely but possible),
+            // and we sorted by name as a secondary key, we check both directions.
+
+            // Check current
+            int cmp = __builtin_strcmp(mid_lib.name, soname);
+            if (cmp == 0) return true;
+
+            // Search left
+            for (ssize_t i = (ssize_t)mid - 1; i >= 0 && cache.data[i].hash == hash; --i) {
+                if (__builtin_strcmp(cache.data[i].name, soname) == 0) return true;
+            }
+
+            // Search right
+            for (size_t i = mid + 1; i < cache.size && cache.data[i].hash == hash; ++i) {
+                if (__builtin_strcmp(cache.data[i].name, soname) == 0) return true;
+            }
+
+            return false;
         }
     }
     return false;
@@ -1051,6 +1083,11 @@ extern "C" void* custom_tls_get_addr(tls_index* ti) {
 extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_total_size, uintptr_t *out_entry, uintptr_t *out_init_array, size_t *out_init_count) {
     LoadedModuleList loaded_modules; CachedLibList loaded_libs_cache;
     dl_iterate_phdr(build_cache_cb, &loaded_libs_cache);
+
+    ::sort(loaded_libs_cache.data, loaded_libs_cache.data + loaded_libs_cache.size, [](const CachedLib& a, const CachedLib& b) {
+        if (a.hash != b.hash) return a.hash < b.hash;
+        return __builtin_strcmp(a.name, b.name) < 0;
+    });
 
     // Give a dummy name for the main module
     if (!load_dependencies_recursive("main_module", memfd, loaded_modules, loaded_libs_cache)) {

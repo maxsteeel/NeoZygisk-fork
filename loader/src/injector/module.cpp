@@ -229,14 +229,7 @@ void ZygiskContext::plt_hook_process_regex() {
         if (map.offset != 0 || !map.is_private || !(map.perms & PROT_READ)) continue;
 
         if (ignore_count > 0) {
-            for (size_t j = 0; j < ignore_count; ++j) {
-                auto &ign = ignore_info.data[j];
-                if (!ign.is_regex) {
-                    ign_matches[j] = (__builtin_strstr(map.path, ign.literal) != nullptr);
-                } else {
-                    ign_matches[j] = (regexec(&ign.regex, map.path, 0, nullptr, 0) == 0);
-                }
-            }
+            __builtin_memset(ign_matches, 2, ignore_count);
         }
 
         for (size_t k = 0; k < register_info.size; k++) {
@@ -250,7 +243,16 @@ void ZygiskContext::plt_hook_process_regex() {
             for (size_t j = 0; j < ignore_count; ++j) {
                 auto &ign = ignore_info.data[j];
                 if (ign.symbol[0] != '\0' && __builtin_strcmp(ign.symbol, reg.symbol) != 0) continue;
-                if (ign_matches[j]) {
+
+                if (ign_matches[j] == 2) {
+                    if (!ign.is_regex) {
+                        ign_matches[j] = (__builtin_strstr(map.path, ign.literal) != nullptr);
+                    } else {
+                        ign_matches[j] = (regexec(&ign.regex, map.path, 0, nullptr, 0) == 0);
+                    }
+                }
+
+                if (ign_matches[j] == 1) {
                     ignored = true;
                     break;
                 }
