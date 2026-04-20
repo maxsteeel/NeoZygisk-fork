@@ -20,24 +20,6 @@ if [ "$(which magisk)" ]; then
   done
 fi
 
-create_sys_perm() {
-  mkdir -p $1
-  chmod 555 $1
-  chcon u:object_r:system_file:s0 $1
-}
-
-TMP_PATH=@WORK_DIRECTORY@
-
-if [ -d $TMP_PATH ]; then
-  rm -rf $TMP_PATH
-fi
-
-create_sys_perm $TMP_PATH
-
-export ZYGISK_MODDIR="$MODDIR"
-
-[ "$DEBUG" = true ] && export RUST_BACKTRACE=1
-
 if [ -f $MODDIR/bin/zygisk-ptrace64 ];then
 $MODDIR/bin/zygisk-ptrace64 monitor &
 elif [ -f $MODDIR/bin/zygisk-ptrace32 ];then

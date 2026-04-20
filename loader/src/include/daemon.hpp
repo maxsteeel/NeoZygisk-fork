@@ -88,9 +88,10 @@ enum class SocketAction {
 
 enum class MountNamespace { Clean, Root };
 
-void Init(const char *path, const char *mod_dir);
+constexpr const char* kWorkDirectory = WORK_DIRECTORY;
 
-const char* GetTmpPath();
+void Init();
+
 const char* GetModDir();
 
 int Connect(uint8_t retry);

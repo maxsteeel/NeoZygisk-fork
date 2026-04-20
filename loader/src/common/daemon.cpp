@@ -14,9 +14,7 @@
 constants::ZygiskSharedData* g_shared_data = nullptr;
 
 namespace zygiskd {
-static char TMP_PATH[256] = {0};
-static char MODULE_DIR[256] = {0};
-const char* kCPSocketName = (sizeof(void*) == 8) ? "cp64.sock" : "cp32.sock";
+constexpr const char* kCPSocketName = (sizeof(void*) == 8) ? "cp64.sock" : "cp32.sock";
 static struct sockaddr_un g_daemon_addr;
 static socklen_t g_daemon_socklen = 0;
 
@@ -27,20 +25,14 @@ void UnmapSharedMemory() {
     }
 }
 
-void Init(const char *path, const char *mod_dir) {
-    if (path) strlcpy(TMP_PATH, path, sizeof(TMP_PATH));
-    if (mod_dir) strlcpy(MODULE_DIR, mod_dir, sizeof(MODULE_DIR));
-    setenv("TMP_PATH", TMP_PATH, 0);
-    setenv("ZYGISK_MODDIR", MODULE_DIR, 0);
-
+void Init() {
     g_daemon_addr.sun_family = AF_UNIX;
     size_t len = __builtin_strlen(kCPSocketName);
     __builtin_memcpy(g_daemon_addr.sun_path + 1, kCPSocketName, len);
     g_daemon_socklen = sizeof(g_daemon_addr.sun_family) + len + 1;
 }
 
-const char* GetTmpPath() { return TMP_PATH; }
-const char* GetModDir() { return MODULE_DIR; }
+const char* GetModDir() { return kWorkDirectory; }
 
 int Connect(uint8_t retry) {
     UniqueFd fd(socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));

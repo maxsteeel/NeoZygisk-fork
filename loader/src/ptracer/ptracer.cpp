@@ -201,16 +201,14 @@ static bool execute_remote_injection(int pid, const char *lib_path, uintptr_t en
 
     LOGI("Remote-Custom Linker success. entry: 0x%" PRIxPTR, injector_entry);
 
-    auto remote_tmp_path = push_string(pid, regs, zygiskd::GetTmpPath());
     long args[] = {
         (long)remote_base,
         (long)remote_size,
-        (long)remote_tmp_path,
-        (long)init_array, // Argument 4
-        (long)init_count  // Argument 5
+        (long)init_array, // Argument 3
+        (long)init_count  // Argument 4
     };
 
-    remote_call(pid, regs, injector_entry, 0x0, args, 5);
+    remote_call(pid, regs, injector_entry, 0x0, args, 4);
 
     bool injector_ok = false;
 #if defined(__arm__)

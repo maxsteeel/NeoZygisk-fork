@@ -108,7 +108,7 @@ bool AppMonitor::prepare_environment() {
     __builtin_memset(pre_section_, 0, sizeof(pre_section_));
     __builtin_memset(post_section_, 0, sizeof(post_section_));
     __builtin_memset(this->prop_path_, 0, sizeof(this->prop_path_));
-    snprintf(this->prop_path_, sizeof(this->prop_path_), "%s/module.prop", zygiskd::GetTmpPath());
+    snprintf(this->prop_path_, sizeof(this->prop_path_), "%s/status.prop", zygiskd::GetModDir());
     this->prop_fd_ = UniqueFd(open(this->prop_path_, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
     if (this->prop_fd_ < 0) {
         PLOGE("failed to create/open prop_file at %s", this->prop_path_);

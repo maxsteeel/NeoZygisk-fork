@@ -4,11 +4,9 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
-#include "daemon.hpp"  // For GetTmpPath and UniqueFd
+#include "daemon.hpp"  // For GetModDir and UniqueFd
 #include "logging.hpp"
 #include "monitor.hpp"
-
-const char *const kWorkDirectory = WORK_DIRECTORY;
 
 // The main entry point for the monitoring process.
 void init_monitor() {
@@ -67,7 +65,7 @@ static int handle_version();
  */
 int main(int argc, char **argv) {
     // This initialization is for the daemon's internal logic, not for CLI output.
-    zygiskd::Init(kWorkDirectory, getenv("ZYGISK_MODDIR")); // Pass module directory to daemon
+    zygiskd::Init();
 
     if (argc < 2) {
         print_usage(argv[0]);

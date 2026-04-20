@@ -5,7 +5,7 @@
 #include "zygisk.hpp"
 
 extern "C" [[gnu::visibility("default")]]
-void entry(void* addr, size_t size, const char* path, void (**init_array)(), size_t init_count) {
+void entry(void* addr, size_t size, void (**init_array)(), size_t init_count) {
 
     if (init_array != nullptr && init_count > 0) {
         for (size_t i = 0; i < init_count; i++) {
@@ -15,7 +15,7 @@ void entry(void* addr, size_t size, const char* path, void (**init_array)(), siz
 
     LOGI("zygisk library natively initialized, version %s", ZKSU_VERSION);
 
-    zygiskd::Init(path, nullptr);
+    zygiskd::Init();
 
     if (!zygiskd::PingHeartbeat()) {
         LOGE("zygisk daemon is not running");

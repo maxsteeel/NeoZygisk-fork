@@ -21,6 +21,7 @@ val ccachePath by lazy {
     }
 }
 
+val workDirectory: String by rootProject.extra
 val defaultCFlags = arrayOf(
     "-Wall", "-Wextra", "-Oz",
     "-fno-rtti", "-fno-exceptions",
@@ -30,6 +31,7 @@ val defaultCFlags = arrayOf(
     "-fno-semantic-interposition",
     "-Wno-builtin-macro-redefined", "-D__FILE__=__FILE_NAME__",
     "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0",
+    "-DWORK_DIRECTORY='\"${workDirectory}\"'"
 )
 
 val releaseFlags = arrayOf(
