@@ -13,7 +13,6 @@
 #include <sys/syscall.h>
 #include <linux/audit.h>
 #include <stdint.h>
-#include <atomic>
 #include <stdlib.h>
 
 #include <lsplt.hpp>
@@ -582,14 +581,16 @@ void HookContext::hook_unloader() {
 }
 
 void HookContext::clear_map_paths() {
-    static std::atomic_flag clearing = ATOMIC_FLAG_INIT;
-    if (clearing.test_and_set()) return;
+    static atomic_flag clearing = ATOMIC_FLAG_INIT;
+    if (atomic_flag_test_and_set_explicit(&clearing, memory_order_acquire)) return;
 
     for (size_t i = 0; i < cached_map_infos.size; i++) {
         auto& map = cached_map_infos.data[i];
         size_t len = strnlen(map.path, sizeof(map.path));
         if (len > 0) memzero(map.path, len);
     }
+
+    atomic_flag_clear_explicit(&clearing, memory_order_release); 
 }
 
 void HookContext::restore_plt_hook() {

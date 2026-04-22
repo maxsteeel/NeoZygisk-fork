@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <pthread.h>
 #include <string.h>
 
@@ -39,6 +38,42 @@ inline void sort(It first, It last, Compare comp) {
             *(first + j) = temp;
         }
     }
+}
+
+__attribute__((always_inline))
+static inline uint64_t fast_strtoull(const char* str, char** endptr, int base) {
+    uint64_t result = 0;
+    const char* p = str;
+    while (*p == ' ' || *p == '\t') p++;
+    if (base == 16) {
+        while (true) {
+            char c = *p;
+            uint64_t digit;
+            if (c >= '0' && c <= '9') {
+                digit = c - '0';
+            } else if (c >= 'a' && c <= 'f') {
+                digit = c - 'a' + 10;
+            } else if (c >= 'A' && c <= 'F') {
+                digit = c - 'A' + 10;
+            } else {
+                break;
+            }
+            result = (result << 4) | digit; 
+            p++;
+        }
+    } else if (base == 10) {
+        while (true) {
+            char c = *p;
+            if (c >= '0' && c <= '9') {
+                result = result * 10 + (c - '0');
+                p++;
+            } else {
+                break;
+            }
+        }
+    }
+    if (endptr) *endptr = const_cast<char*>(p);
+    return result;
 }
 
 // Force the compiler to execute the memory wiping code,
@@ -95,22 +130,6 @@ public:
 
 private:
     pthread_mutex_t* mutex;
-};
-
-struct SpinLockGuard {
-    std::atomic_flag& flag_;
-    SpinLockGuard(std::atomic_flag& flag) : flag_(flag) {
-        while (flag_.test_and_set(std::memory_order_acquire)) {
-#if defined(__aarch64__) || defined(__arm__)
-            asm volatile("yield" ::: "memory");
-#elif defined(__i386__) || defined(__x86_64__)
-            asm volatile("pause" ::: "memory");
-#endif
-        }
-    }
-    ~SpinLockGuard() {
-        flag_.clear(std::memory_order_release);
-    }
 };
 
 bool is_kernel_5_9_or_newer();

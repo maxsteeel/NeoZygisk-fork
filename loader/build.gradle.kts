@@ -102,6 +102,7 @@ android {
                 arguments += "-DCMAKE_SHARED_LINKER_FLAGS=${linkerFlags.joinToString(" ")}"
                 arguments += "-DCMAKE_EXE_LINKER_FLAGS=${linkerFlags.joinToString(" ")}"
                 arguments += "-DZKSU_VERSION=$verName-$verCode-$commitHash-release"
+                arguments += "-DANDROID_STL=none"
             }
         }
     }

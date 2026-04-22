@@ -1,7 +1,8 @@
 #include "misc.hpp"
 
-#include <cstdint>
+#include <stdint.h>
 #include <sys/utsname.h>
+#include <stdlib.h>
 
 #include "logging.hpp"
 
@@ -73,6 +74,13 @@ namespace __cxxabiv1 {
     }
 }
 
+void* operator new(size_t size) { if (size == 0) size = 1; return malloc(size); }
+void* operator new[](size_t size) { if (size == 0) size = 1; return malloc(size); }
+void operator delete(void* ptr) noexcept { free(ptr); }
+void operator delete(void* ptr, size_t /* size */) noexcept { free(ptr); }
+void operator delete[](void* ptr) noexcept { free(ptr); }
+void operator delete[](void* ptr, size_t /* size */) noexcept { free(ptr); }
+
 extern "C" {
     // These additional stubs are required to prevent the demangling parser from being linked in.
     KEEP void _ZN12_GLOBAL__N_117itanium_demangle22AbstractManglingParserINS0_14ManglingParserINS_16DefaultAllocatorEEES3_E9parseTypeEv() {}
@@ -85,5 +93,5 @@ extern "C" {
     KEEP int _Unwind_RaiseException(void*) { return 0; }
     KEEP int _Unwind_DeleteException(void*) { return 0; }
     KEEP void __stub_atexit([[maybe_unused]] void (*func)()) {}
-    __attribute__((weak, alias("__stub_atexit"))) void atexit(void (*func)());
+    __attribute__((weak, alias("__stub_atexit"))) int atexit(void (*func)());
 }

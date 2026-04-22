@@ -1,8 +1,9 @@
 #pragma once
 
 #include <unistd.h>
-#include <cstdint>
+#include <stdint.h>
 #include "misc.hpp"
+#include "unique.hpp"
 
 #if defined(__LP64__)
 #define LP_SELECT(lp32, lp64) lp64
@@ -11,50 +12,6 @@
 #endif
 
 extern const char* kCPSocketName;
-
-class UniqueFd {
-    using Fd = int;
-
-public:
-    UniqueFd() = default;
-
-    UniqueFd(Fd fd) : fd_(fd) {}
-
-    ~UniqueFd() {
-        if (fd_ >= 0) close(fd_);
-    }
-
-    // Disallow copy
-    UniqueFd(const UniqueFd&) = delete;
-
-    UniqueFd& operator=(const UniqueFd&) = delete;
-
-    UniqueFd(UniqueFd&& other) noexcept : fd_(other.fd_) {
-        other.fd_ = -1;
-    }
-
-    UniqueFd& operator=(UniqueFd&& other) noexcept {
-        if (this != &other) {
-            if (fd_ >= 0) close(fd_);
-            fd_ = other.fd_;
-            other.fd_ = -1;
-        }
-        return *this;
-    }
-
-    // Implicit cast to Fd
-    operator const Fd&() const { return fd_; }
-
-    // Relinquish ownership of the file descriptor without closing it.
-    Fd release() {
-        Fd temp = fd_;
-        fd_ = -1;
-        return temp;
-    }
-
-private:
-    Fd fd_ = -1;
-};
 
 namespace zygiskd {
 

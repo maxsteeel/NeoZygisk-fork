@@ -71,7 +71,7 @@ bool PingHeartbeat() {
 uint32_t GetProcessFlags(uid_t uid) {
     if (g_shared_data) {
         // Read version to ensure we aren't reading during a write
-        uint32_t version1 = g_shared_data->version.load(std::memory_order_acquire);
+        uint32_t version1 = atomic_load_explicit(&g_shared_data->version, memory_order_acquire);
 
         if ((version1 & 1) == 0) {
             size_t index = uid & (constants::SHM_HASH_MAP_SIZE - 1);
@@ -81,9 +81,9 @@ uint32_t GetProcessFlags(uid_t uid) {
             uint32_t target_uid = static_cast<uint32_t>(uid);
 
             do {
-                uint32_t current_uid = g_shared_data->entries[index].uid.load(std::memory_order_relaxed);
+                uint32_t current_uid = atomic_load_explicit(&g_shared_data->entries[index].uid, memory_order_relaxed);
                 if (current_uid == target_uid) {
-                    cached_flags = g_shared_data->entries[index].flags.load(std::memory_order_relaxed);
+                    cached_flags = atomic_load_explicit(&g_shared_data->entries[index].flags, memory_order_relaxed);
                     found = true;
                     break;
                 } else if (current_uid == UINT32_MAX) {
@@ -92,8 +92,8 @@ uint32_t GetProcessFlags(uid_t uid) {
                 index = (index + 1) & (constants::SHM_HASH_MAP_SIZE - 1);
             } while (index != start_index);
 
-            if (found && (g_shared_data->version.load(std::memory_order_acquire) == version1)) {
-                return cached_flags | g_shared_data->global_root_flags.load(std::memory_order_relaxed);
+            if (found && (atomic_load_explicit(&g_shared_data->version, memory_order_acquire) == version1)) {
+                return cached_flags | atomic_load_explicit(&g_shared_data->global_root_flags, memory_order_relaxed);
             }
         }
     }

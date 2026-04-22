@@ -22,6 +22,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <sys/auxv.h>
+#include <stdatomic.h>
 
 #include "misc.hpp"
 #include "logging.hpp"
@@ -243,8 +244,28 @@ struct CustomRegionList {
     }
 };
 
+#include <stdatomic.h>
+
+struct SpinLockGuard {
+    atomic_flag& flag_; 
+
+    SpinLockGuard(atomic_flag& flag) : flag_(flag) {
+        while (atomic_flag_test_and_set_explicit(&flag_, memory_order_acquire)) {
+#if defined(__aarch64__) || defined(__arm__)
+            asm volatile("yield" ::: "memory");
+#elif defined(__i386__) || defined(__x86_64__)
+            asm volatile("pause" ::: "memory");
+#endif
+        }
+    }
+    
+    ~SpinLockGuard() {
+        atomic_flag_clear_explicit(&flag_, memory_order_release);
+    }
+};
+
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
-static std::atomic_flag g_custom_regions_lock = ATOMIC_FLAG_INIT;
+static atomic_flag g_custom_regions_lock = ATOMIC_FLAG_INIT;
 static CustomRegionList* g_custom_regions = nullptr;
 
 /* Actual allocator function called only once */
@@ -275,32 +296,38 @@ bool is_custom_linker_address(const void* addr) {
 void custom_linker_unload(void* handle) {
     init_region_tracking();
     uintptr_t base = reinterpret_cast<uintptr_t>(handle);
-    SpinLockGuard lock(g_custom_regions_lock);
-    for (size_t i = 0; i < g_custom_regions->size; i++) {
-        auto& reg = g_custom_regions->data[i];
-        if (reg.handle == base) {
-            for (size_t j = 0; j < reg.destructors.size; j++) {
-                const auto& d = reg.destructors.data[j];
-                if (d.type == DestructorAction::FUNC_PTR && d.func_ptr) {
-                    d.func_ptr();
-                } else if (d.type == DestructorAction::TLS_CLEANUP) {
-                    CustomTlsInfo* tls_info = reinterpret_cast<CustomTlsInfo*>(d.mod_id);
-                    pthread_key_delete(tls_info->key);
-                    delete tls_info;
-                } else if (d.type == DestructorAction::TLSDESC_CLEANUP) {
-                    delete d.tlsdesc_arg;
-                }
-            }
+    CustomRegion region_to_unload;
+    bool found = false;
 
-            for (size_t j = 0; j < reg.maps.size; j++) {
-                const auto& map = reg.maps.data[j];
-                if (map.base != 0 && map.size != 0) {
-                    munmap(reinterpret_cast<void*>(map.base), map.size);
-                }
+    {
+        SpinLockGuard lock(g_custom_regions_lock);
+        for (size_t i = 0; i < g_custom_regions->size; i++) {
+            if (g_custom_regions->data[i].handle == base) {
+                __builtin_memcpy((void*)&region_to_unload, &g_custom_regions->data[i], sizeof(CustomRegion));
+                g_custom_regions->data[i].maps.data = nullptr;
+                g_custom_regions->data[i].maps.size = 0;
+                g_custom_regions->data[i].destructors.data = nullptr;
+                g_custom_regions->data[i].destructors.size = 0;
+                g_custom_regions->erase(i);
+                found = true;
+                break;
             }
-            g_custom_regions->erase(i);
-            return;
         }
+    }
+
+    if (found) {
+        for (size_t j = 0; j < region_to_unload.destructors.size; j++) {
+            const auto& d = region_to_unload.destructors.data[j];
+            if (d.type == DestructorAction::FUNC_PTR && d.func_ptr) {
+                d.func_ptr();
+            } else if (d.type == DestructorAction::TLS_CLEANUP) {
+                CustomTlsInfo* tls_info = reinterpret_cast<CustomTlsInfo*>(d.mod_id);
+                pthread_key_delete(tls_info->key);
+            }
+        }
+        
+        // Exiting this if, region_to_unload exits scope 
+        // and its destructors (~UniqueList) free the memory correctly.
     }
 }
 

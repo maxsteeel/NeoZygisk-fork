@@ -17,11 +17,14 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../build/out/${A
 aux_source_directory(. ZYGISKD_SRC_LIST)
 aux_source_directory(root_impl ZYGISKD_SRC_LIST)
 
-add_executable(zygiskd ${ZYGISKD_SRC_LIST})
+add_executable(zygiskd 
+    ${ZYGISKD_SRC_LIST}
+    ../../loader/src/common/misc.cpp
+)
 
 # Since loader common is not exposed as a prefab, we just compile it into zygiskd
-aux_source_directory(../../loader/src/common COMMON_SRC_LIST)
-target_sources(zygiskd PRIVATE ${COMMON_SRC_LIST})
+# aux_source_directory(../../loader/src/common COMMON_SRC_LIST)
+# target_sources(zygiskd PRIVATE ${COMMON_SRC_LIST})
 
 target_include_directories(zygiskd PRIVATE include)
 target_include_directories(zygiskd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../loader/src/include)

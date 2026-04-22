@@ -68,6 +68,7 @@ android {
                 cppFlags("-std=c++23", *defaultCFlags)
 
                 arguments(
+                    "-DANDROID_STL=none",
                     "-DZKSU_VERSION=\"${rootProject.extra["verName"]}\"",
                     "-DMIN_APATCH_VERSION=${rootProject.extra["minAPatchVersion"]}",
                     "-DMIN_KSU_VERSION=${rootProject.extra["minKsuVersion"]}",

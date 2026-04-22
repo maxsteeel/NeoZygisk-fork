@@ -1,11 +1,7 @@
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <atomic>
 
 #include "root_impl.hpp"
 #include "constants.hpp"
@@ -23,8 +19,8 @@ struct ConfigData {
 static const char* CONFIG_FILE = "/data/adb/ap/package_config";
 
 static ConfigData g_config;
-static SpinRWLock g_config_mutex;
-static std::atomic<int64_t> last_stat_time_ms{0};
+static RWLock g_config_mutex;
+static _Atomic(int64_t) last_stat_time_ms = 0;
 
 // Macro to extract only the UID from the packed integer
 #define GET_UID(packed) ((packed) & 0x3FFFFFFF)
@@ -108,7 +104,7 @@ static void parse_and_sort_config(int fd, size_t size, ConfigData& config) {
 
 Version detect_version() {
     static Version cached_version = Version::Null; 
-    static ::once_flag flag{0};
+    static ::once_flag flag = 0;
 
     ::call_once(flag, []() {
         char buf[256];
@@ -138,16 +134,16 @@ void refresh_cache() {
     int64_t now_ms = ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 
     // Prevent excessive disk stats
-    if (now_ms - last_stat_time_ms.load(std::memory_order_relaxed) < 2000) return;
+    if (now_ms - atomic_load_explicit(&last_stat_time_ms, memory_order_relaxed) < 2000) return;
 
     struct stat st;
     if (stat(CONFIG_FILE, &st) != 0) return;
 
-    last_stat_time_ms.store(now_ms, std::memory_order_relaxed);
+    atomic_store_explicit(&last_stat_time_ms, now_ms, memory_order_relaxed);
 
     // Fast Check (Read Lock)
     {
-        SharedLock<SpinRWLock> read_lock(g_config_mutex);
+        SharedMutexGuard read_lock(g_config_mutex);
         if (g_config.mtim.tv_sec == st.st_mtim.tv_sec &&
             g_config.mtim.tv_nsec == st.st_mtim.tv_nsec) {
             return;
@@ -155,7 +151,7 @@ void refresh_cache() {
     }
 
     // Slow Update (Write Lock)
-    UniqueLock<SpinRWLock> write_lock(g_config_mutex);
+    UniqueMutexGuard write_lock(g_config_mutex);
 
     // Double-check to prevent concurrent rebuilds
     if (g_config.mtim.tv_sec == st.st_mtim.tv_sec &&
@@ -195,31 +191,31 @@ static uint32_t find_package(const ConfigData& config, int32_t uid) {
 }
 
 bool uid_granted_root(int32_t uid) {
-    SharedLock<SpinRWLock> lock(g_config_mutex);
+    SharedMutexGuard read_lock(g_config_mutex);
     uint32_t pkg = find_package(g_config, uid);
     return (pkg & (1U << 30)) != 0;
 }
 
 bool uid_should_umount(int32_t uid) {
-    SharedLock<SpinRWLock> lock(g_config_mutex);
+    SharedMutexGuard read_lock(g_config_mutex);
     uint32_t pkg = find_package(g_config, uid);
     return (pkg & (1U << 31)) != 0;
 }
 
 bool uid_is_manager(int32_t uid, int64_t now_ms) {
-    static std::atomic<int32_t> g_manager_uid{-1};
-    static std::atomic<int64_t> last_manager_stat_time_ms{0};
-    int32_t manager_uid = g_manager_uid.load(std::memory_order_relaxed);
+    static _Atomic(int32_t) g_manager_uid = -1;
+    static _Atomic(int64_t) last_manager_stat_time_ms = 0;
+    int32_t manager_uid = atomic_load_explicit(&g_manager_uid, memory_order_relaxed);
 
-    if (manager_uid <= -1 || now_ms - last_manager_stat_time_ms.load(std::memory_order_relaxed) > 1000) {
+    if (manager_uid <= -1 || now_ms - atomic_load_explicit(&last_manager_stat_time_ms, memory_order_relaxed) > 1000) {
         struct stat st;
         if (stat("/data/user_de/0/me.bmax.apatch", &st) == 0) {
             manager_uid = static_cast<int32_t>(st.st_uid);
         } else {
             manager_uid = -2; 
         }
-        g_manager_uid.store(manager_uid, std::memory_order_relaxed);
-        last_manager_stat_time_ms.store(now_ms, std::memory_order_relaxed);
+        atomic_store_explicit(&g_manager_uid, manager_uid, memory_order_relaxed);
+        atomic_store_explicit(&last_manager_stat_time_ms, now_ms, memory_order_relaxed);
     }
     return manager_uid == uid;
 }

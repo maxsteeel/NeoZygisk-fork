@@ -1,15 +1,16 @@
 #pragma once
-#include "../../../zygiskd/src/include/utils.hpp"
 #include <sys/ptrace.h>
 #include <sys/user.h>
-#include <cstdint>
+#include <stdint.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <cinttypes>
+#include <inttypes.h>
+#include <stdlib.h>
 #include <signal.h>
 #include <string.h>
 #include <fcntl.h>
 #include "daemon.hpp"
+#include "misc.hpp"
 
 struct MapInfo {
     /// \brief The start address of the memory region.

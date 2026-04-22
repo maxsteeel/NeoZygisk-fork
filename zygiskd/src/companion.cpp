@@ -5,8 +5,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
-#include <cstring>
-#include <cstdlib>
+#include <string.h>
+#include <stdlib.h>
 
 #include "logging.hpp"
 #include "socket_utils.hpp"

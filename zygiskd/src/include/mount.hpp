@@ -29,7 +29,7 @@ private:
     // Unmounts filesystems related to root solutions from the current mount namespace.
     static bool clean_mount_namespace();
 
-    mutable SpinMutex mtx_;
+    mutable pthread_mutex_t mtx_ = PTHREAD_MUTEX_INITIALIZER;
     int clean_mnt_ns_fd_;
     int root_mnt_ns_fd_;
 };

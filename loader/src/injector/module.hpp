@@ -7,7 +7,7 @@
 #include "elf_utils.hpp"
 #include "lsplt.hpp"
 #include "misc.hpp"
-#include "utils.hpp"
+#include "unique.hpp"
 #include "zygisk.hpp"
 
 struct CachedMapEntry {

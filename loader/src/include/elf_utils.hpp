@@ -3,7 +3,7 @@
 #include <elf.h>
 #include <link.h>
 #include <sys/types.h>
-#include <cstdint>
+#include <stdint.h>
 #include <sys/mman.h>
 
 #ifndef ALIGN_DOWN

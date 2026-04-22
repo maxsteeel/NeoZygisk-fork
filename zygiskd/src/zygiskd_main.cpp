@@ -8,10 +8,10 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <cstdlib>
-#include <cstring>
-#include <cerrno>
-#include <csignal>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <signal.h>
 
 #include <sys/mman.h>
 #include <linux/memfd.h>
@@ -101,11 +101,11 @@ static bool initialize_globals() {
     else if (root == root_impl::RootImpl::KernelSU) global_flags |= ProcessFlags::PROCESS_ROOT_IS_KSU;
     else if (root == root_impl::RootImpl::Magisk) global_flags |= ProcessFlags::PROCESS_ROOT_IS_MAGISK;
     
-    g_shm_base->global_root_flags.store(static_cast<uint32_t>(global_flags), std::memory_order_relaxed);
-    g_shm_base->version.store(0, std::memory_order_relaxed);
+    atomic_store_explicit(&g_shm_base->global_root_flags, static_cast<uint32_t>(global_flags), memory_order_relaxed);
+    atomic_store_explicit(&g_shm_base->version, 0, memory_order_relaxed);
     for (size_t i = 0; i < constants::SHM_HASH_MAP_SIZE; ++i) {
-        g_shm_base->entries[i].uid.store(UINT32_MAX, std::memory_order_relaxed);
-        g_shm_base->entries[i].flags.store(0, std::memory_order_relaxed);
+        atomic_store_explicit(&g_shm_base->entries[i].uid, UINT32_MAX, memory_order_relaxed);
+        atomic_store_explicit(&g_shm_base->entries[i].flags, 0, memory_order_relaxed);
     }
 
     return true;
@@ -134,7 +134,7 @@ static void* shm_refresh_thread(void*) {
         bool changed = false;
 
         for (size_t i = 0; i < constants::SHM_HASH_MAP_SIZE; ++i) {
-            uint32_t uid = g_shm_base->entries[i].uid.load(std::memory_order_relaxed);
+            uint32_t uid = atomic_load_explicit(&g_shm_base->entries[i].uid, memory_order_relaxed);
             if (uid == UINT32_MAX) continue;
 
             ProcessFlags new_flags = ProcessFlags::NONE;
@@ -146,14 +146,14 @@ static void* shm_refresh_thread(void*) {
             }
 
             uint32_t new_val = static_cast<uint32_t>(new_flags);
-            uint32_t old_val = g_shm_base->entries[i].flags.load(std::memory_order_relaxed);
+            uint32_t old_val = atomic_load_explicit(&g_shm_base->entries[i].flags, memory_order_relaxed);
 
             if (new_val != old_val) {
                 pthread_mutex_lock(&g_shm_write_mutex);
-                uint32_t current_ver = g_shm_base->version.load(std::memory_order_relaxed);
-                g_shm_base->version.store(current_ver + 1, std::memory_order_release);
-                g_shm_base->entries[i].flags.store(new_val, std::memory_order_relaxed);
-                g_shm_base->version.store(current_ver + 2, std::memory_order_release);
+                uint32_t current_ver = atomic_load_explicit(&g_shm_base->version, memory_order_relaxed);
+                atomic_store_explicit(&g_shm_base->version, current_ver + 1, memory_order_release);
+                atomic_store_explicit(&g_shm_base->entries[i].flags, new_val, memory_order_relaxed);
+                atomic_store_explicit(&g_shm_base->version, current_ver + 2, memory_order_release);
                 pthread_mutex_unlock(&g_shm_write_mutex);
                 changed = true;
             }
@@ -370,20 +370,20 @@ static void handle_get_process_flags(int stream) {
         size_t index = uid % constants::SHM_HASH_MAP_SIZE;
         size_t start_index = index;
 
-        uint32_t current_version = g_shm_base->version.load(std::memory_order_relaxed);
-        if (current_version % 2 == 0) g_shm_base->version.store(current_version + 1, std::memory_order_release);
+        uint32_t current_version = atomic_load_explicit(&g_shm_base->version, memory_order_relaxed);
+        if (current_version % 2 == 0) atomic_store_explicit(&g_shm_base->version, current_version + 1, memory_order_release);
 
         do {
-            uint32_t current_uid = g_shm_base->entries[index].uid.load(std::memory_order_relaxed);
+            uint32_t current_uid = atomic_load_explicit(&g_shm_base->entries[index].uid, memory_order_relaxed);
             if (current_uid == UINT32_MAX || current_uid == 0 || current_uid == static_cast<uint32_t>(uid)) {
-                g_shm_base->entries[index].uid.store(uid, std::memory_order_relaxed);
-                g_shm_base->entries[index].flags.store(flags_val, std::memory_order_relaxed);
+                atomic_store_explicit(&g_shm_base->entries[index].uid, uid, memory_order_relaxed);
+                atomic_store_explicit(&g_shm_base->entries[index].flags, flags_val, memory_order_relaxed);
                 break;
             }
             index = (index + 1) % constants::SHM_HASH_MAP_SIZE;
         } while (index != start_index);
 
-        g_shm_base->version.store(g_shm_base->version.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+        atomic_store_explicit(&g_shm_base->version, atomic_load_explicit(&g_shm_base->version, memory_order_relaxed) + 1, memory_order_release);
         pthread_mutex_unlock(&g_shm_write_mutex);
     }
 

@@ -1,6 +1,3 @@
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -27,7 +24,7 @@ struct Cache {
 };
 
 static Cache g_cache;
-static SpinRWLock g_cache_mutex;
+static RWLock g_cache_mutex;
 
 static const char* MAGISK_OFFICIAL_PKG = "com.topjohnwu.magisk";
 struct StringPair { const char* first; const char* second; };
@@ -36,7 +33,7 @@ static const StringPair MAGISK_THIRD_PARTIES[] = {
     {"kitsune", "io.github.huskydg.magisk"},
 };
 
-static ::once_flag variant_flag{0};
+static ::once_flag variant_flag = 0;
 static char magisk_variant_pkg[128] = {0};
 
 // --- Native SQLite Implementation ---
@@ -295,7 +292,7 @@ void refresh_cache() {
 
     // Fast check (Shared lock)
     {
-        SharedLock<SpinRWLock> read_lock(g_cache_mutex);
+        SharedMutexGuard read_lock(g_cache_mutex);
         if (g_cache.db_mtime.tv_sec == db_st.st_mtim.tv_sec &&
             g_cache.db_mtime.tv_nsec == db_st.st_mtim.tv_nsec &&
             g_cache.pkg_mtime.tv_sec == pkg_st.st_mtim.tv_sec &&
@@ -306,7 +303,7 @@ void refresh_cache() {
     }
 
     // Heavy update (Unique lock)
-    UniqueLock<SpinRWLock> write_lock(g_cache_mutex);
+    UniqueMutexGuard write_lock(g_cache_mutex);
     
     if (g_cache.db_mtime.tv_sec == db_st.st_mtim.tv_sec &&
         g_cache.db_mtime.tv_nsec == db_st.st_mtim.tv_nsec &&
@@ -424,13 +421,13 @@ static bool is_valid_pkg_name(const char* pkg_name) {
 }
 
 bool uid_granted_root(int32_t uid) {
-    SharedLock<SpinRWLock> lock(g_cache_mutex);
+    SharedMutexGuard lock(g_cache_mutex);
     return list_contains_uid(g_cache.granted_uids, uid);
 }
 
 bool uid_should_umount(int32_t uid) {
     {
-        SharedLock<SpinRWLock> lock(g_cache_mutex);
+        SharedMutexGuard read_lock(g_cache_mutex);
         if (list_contains_uid(g_cache.denylist_uids, uid)) return true;
         if (list_contains_uid(g_cache.all_known_uids, uid)) return false;
     }
@@ -439,12 +436,12 @@ bool uid_should_umount(int32_t uid) {
     if (!get_package_by_uid_from_xml(uid, pkg_name, sizeof(pkg_name))) return false;
     if (!is_valid_pkg_name(pkg_name)) return false;
 
-    SharedLock<SpinRWLock>lock(g_cache_mutex);
+    SharedMutexGuard read_lock(g_cache_mutex);
     return list_contains_pkg(g_cache.denylist_pkgs, pkg_name);
 }
 
 bool uid_is_manager(int32_t uid) {
-    SharedLock<SpinRWLock> lock(g_cache_mutex);
+    SharedMutexGuard lock(g_cache_mutex);
     return g_cache.manager_uid == uid;
 }
 

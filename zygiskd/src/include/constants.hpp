@@ -1,7 +1,7 @@
 #pragma once
 
-#include <atomic>
-#include <cstdint>
+#include <stdatomic.h>
+#include <stdint.h>
 
 // --- Versioning Constants ---
 // These are set at compile time from environment variables via CMake definitions.
@@ -100,17 +100,17 @@ inline ProcessFlags& operator&=(ProcessFlags& a, ProcessFlags b) {
 constexpr size_t SHM_HASH_MAP_SIZE = 8192; // Should be a power of 2 for fast modulo
 
 struct ShmEntry {
-    std::atomic<uint32_t> uid;
-    std::atomic<uint32_t> flags;
+    _Atomic(uint32_t) uid;
+    _Atomic(uint32_t) flags;
 };
 
 struct ZygiskSharedData {
     // This value is incremented before a batch update and after a batch update.
     // Readers should check if the version is even, and verify it hasn't changed during reads.
-    std::atomic<uint32_t> version;
+    _Atomic(uint32_t) version;
 
     // Global flags applied to all processes (e.g. root implementation type)
-    std::atomic<uint32_t> global_root_flags;
+    _Atomic(uint32_t) global_root_flags;
 
     ShmEntry entries[SHM_HASH_MAP_SIZE];
 };

@@ -4,8 +4,8 @@
 #include <sched.h>
 #include <sys/mount.h>
 #include <sys/wait.h>
-#include <cstring>
-#include <cstdlib>
+#include <string.h>
+#include <stdlib.h>
 
 #include "daemon.hpp"
 #include "logging.hpp"
@@ -36,12 +36,12 @@ bool switch_mount_namespace(pid_t pid) {
 MountNamespaceManager::MountNamespaceManager() : clean_mnt_ns_fd_(-1), root_mnt_ns_fd_(-1) {}
 
 int MountNamespaceManager::get_namespace_fd(zygiskd::MountNamespace namespace_type) const {
-    UniqueLock<SpinMutex> lock(mtx_);
+    mutex_guard lock(mtx_);
     return (namespace_type == zygiskd::MountNamespace::Clean) ? clean_mnt_ns_fd_ : root_mnt_ns_fd_;
 }
 
 int MountNamespaceManager::save_mount_namespace(pid_t pid, zygiskd::MountNamespace namespace_type) {
-    UniqueLock<SpinMutex> lock(mtx_);
+    mutex_guard lock(mtx_);
 
     int& fd_ref = (namespace_type == zygiskd::MountNamespace::Clean) ? clean_mnt_ns_fd_ : root_mnt_ns_fd_;
     if (fd_ref >= 0) return fd_ref;

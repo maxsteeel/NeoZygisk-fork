@@ -1,13 +1,13 @@
 #pragma once
-#include "../../../zygiskd/src/include/utils.hpp"
 
 #include <dirent.h>
-#include <cstdio>
+#include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdint.h>
 
 #include "daemon.hpp"
+#include "unique.hpp"
 
 static inline UniqueDir open_dir(const char *path) { return UniqueDir(opendir(path)); }
 static inline UniqueFile xopen_file(const char *path, const char *mode) { return UniqueFile(fopen(path, mode)); }

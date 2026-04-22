@@ -1,5 +1,5 @@
 #pragma once
-#include <cstdint>
+#include <stdint.h>
 #include <stddef.h>
 
 bool is_custom_linker_address(const void* addr);
