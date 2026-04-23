@@ -419,8 +419,8 @@ static inline int64_t sleb128_decode(sleb128_decoder *decoder) {
     return value;
 }
 
-__attribute__((always_inline))
-static inline bool process_relocation([[maybe_unused]] LoadedModule& mod, 
+__attribute__((noinline))
+static bool process_relocation([[maybe_unused]] LoadedModule& mod, 
                                         const LoadedModuleList& loaded_modules,
                                         uintptr_t load_bias, const elf_dyn_info* info,
                                         uintptr_t target, unsigned current_type, 
@@ -632,8 +632,9 @@ static inline bool process_relocation([[maybe_unused]] LoadedModule& mod,
 }
 
 template <typename RelType, bool IsRela>
-static inline bool apply_relocations(LoadedModule& mod, const LoadedModuleList& loaded_modules,
-                                      off_t rel_vaddr, size_t rel_sz, IfuncList& ifuncs) {
+__attribute__((noinline))
+static bool apply_relocations(LoadedModule& mod, const LoadedModuleList& loaded_modules,
+                              off_t rel_vaddr, size_t rel_sz, IfuncList& ifuncs) {
     const elf_dyn_info* info = &mod.dinfo;
     uintptr_t load_bias = mod.load_bias;
     size_t count = rel_sz / sizeof(RelType);

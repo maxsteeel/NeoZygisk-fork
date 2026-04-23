@@ -143,7 +143,7 @@ static void *find_module_base(int pid, const char* suffix) {
 // Most ABIs require the stack to be 16-byte aligned.
 constexpr uintptr_t STACK_ALIGN_MASK = ~0xf;
 
-void align_stack(struct user_regs_struct &regs, long preserve) {
+inline void align_stack(struct user_regs_struct &regs, long preserve) {
     regs.REG_SP = (regs.REG_SP - preserve) & STACK_ALIGN_MASK;
 }
 

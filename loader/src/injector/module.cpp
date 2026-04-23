@@ -18,7 +18,6 @@
 #include <lsplt.hpp>
 
 #include "daemon.hpp"
-#include "dl.hpp"
 #include "files.hpp"
 #include "logging.hpp"
 #include "misc.hpp"
@@ -151,7 +150,7 @@ bool ZygiskModule::tryUnload() const {
         custom_linker_unload(handle);
         return true;
     }
-    return dlclose(handle) == 0;
+    return false;
 }
 
 #define call_app(method)                                                                           \
@@ -319,7 +318,7 @@ void ZygiskContext::sanitize_fds() {
         }
     }
 
-    if (is_kernel_5_9_or_newer()) {
+    if (is_kernel_version_at_least(5, 9)) {
         unsigned int start_fd = 0;
         bool in_range = false;
         size_t n = allowed_fds.size;
@@ -442,16 +441,9 @@ void ZygiskContext::run_modules_pre() {
                 void* entry = reinterpret_cast<void*>(entry_addr);
                 modules.push_back(new ZygiskModule(static_cast<int>(i), handle, entry));
                 LOGV("Module `%s` loaded with custom linker at %p (size: 0x%zx)", m.name, handle, size_mod);
-            } else {
-                LOGW("Custom linker failed for module `%s`. Falling back to dlopen.", m.name);
-                void *handle = DlopenMem(m.memfd, RTLD_NOW);
-                void *entry = handle ? dlsym(handle, "zygisk_module_entry") : nullptr;
-                if (handle && entry) {
-                    modules.push_back(new ZygiskModule(static_cast<int>(i), handle, entry));
-                }
             }
         } else {
-            LOGE("Module `%s` crashed during dlopen/dlsym. Disabling.", m.name);
+            LOGE("Module `%s` crashed during loading. Disabling.", m.name);
             if (m.memfd >= 0) { close(m.memfd); m.memfd = -1; }
             if (!custom_linker_cleanup()) LOGE("Failed to clean up after module `%s` crash.", m.name);
             if (zygiskd::ReportModuleCrash(i) != 0) PLOGE("Failed to report module crash for module `%s`", m.name);

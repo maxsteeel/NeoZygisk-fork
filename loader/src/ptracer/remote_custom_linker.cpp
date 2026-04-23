@@ -122,11 +122,11 @@ static inline bool write_remote_addr(int pid, uintptr_t addr, ElfW(Addr) value) 
     return write_proc(pid, addr, &value, sizeof(value)); 
 }
 
-template <bool IsRela>
-static inline __attribute__((always_inline)) bool process_remote_relocation(
+__attribute__((noinline))
+static bool process_remote_relocation(
     int pid, uintptr_t load_bias, const elf_dyn_info* info, uintptr_t target, unsigned current_type,
-    unsigned current_sym_idx, ElfW(Addr) current_addend,
-    const MapInfoList& local_maps, const MapInfoList& remote_maps) {
+    unsigned current_sym_idx, ElfW(Addr) current_addend, const MapInfoList& local_maps, 
+    const MapInfoList& remote_maps, bool IsRela) {
     
     ElfW(Addr) value = 0;
 
@@ -162,7 +162,7 @@ static inline __attribute__((always_inline)) bool process_remote_relocation(
     }
 #elif defined(__arm__)
     ElfW(Addr) addend_rel = 0;
-    if constexpr (IsRela) {
+    if (IsRela) {
         addend_rel = current_addend;
     } else {
         if (unlikely(!read_proc(pid, target, &addend_rel, sizeof(addend_rel)))) return false;
@@ -186,7 +186,7 @@ static inline __attribute__((always_inline)) bool process_remote_relocation(
     }
 #elif defined(__i386__)
     ElfW(Addr) addend_rel = 0;
-    if constexpr (IsRela) {
+    if (IsRela) {
         addend_rel = current_addend;
     } else {
         if (unlikely(!read_proc(pid, target, &addend_rel, sizeof(addend_rel)))) return false;
@@ -217,7 +217,8 @@ static inline __attribute__((always_inline)) bool process_remote_relocation(
 }
 
 template <typename RelType, bool IsRela>
-static inline bool apply_relocations(int pid, void* file_map, const ElfW(Phdr)* phdr, size_t phnum,
+__attribute__((noinline))
+static bool apply_relocations(int pid, void* file_map, const ElfW(Phdr)* phdr, size_t phnum,
                                      const elf_dyn_info *info, uintptr_t load_bias, ElfW(Addr) vaddr,
                                      size_t sz, const MapInfoList& local_maps,
                                      const MapInfoList& remote_maps) {
@@ -233,31 +234,18 @@ static inline bool apply_relocations(int pid, void* file_map, const ElfW(Phdr)* 
         size_t addend = 0;
         if constexpr (IsRela) addend = r.r_addend;
 
-        if (unlikely(!process_remote_relocation<IsRela>(pid, load_bias, info, 
+        if (unlikely(!process_remote_relocation(pid, load_bias, info, 
                                         load_bias + r.r_offset, 
                                         ELF_R_TYPE(r.r_info), ELF_R_SYM(r.r_info), 
-                                        addend, local_maps, remote_maps))) {
+                                        addend, local_maps, remote_maps, IsRela))) {
             return false;
         }
     }
     return true;
 }
 
-static bool is_memfd_supported_by_kernel() {
-    static int supported = -1;
-    if (supported != -1) return supported == 1;
-
-    struct utsname uts;
-    if (uname(&uts) != 0) return true;
-
-    int major = 0, minor = 0;
-    const char *p = uts.release;
-    while (*p >= '0' && *p <= '9') major = major * 10 + (*p++ - '0');
-    if (*p == '.') p++; 
-    while (*p >= '0' && *p <= '9') minor = minor * 10 + (*p++ - '0');
-
-    supported = (major > 3 || (major == 3 && minor >= 17)) ? 1 : 0;
-    return supported == 1;
+static inline bool is_memfd_supported_by_kernel() {
+    return is_kernel_version_at_least(3, 17);
 }
 
 static long remote_mmap_offset_arg(off_t file_offset, size_t page_size) {
@@ -360,8 +348,7 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
     struct SegInfo { uintptr_t addr; size_t len; int prot; };
     SegInfo segs[32];
     size_t seg_count = 0;
-    char* tail_zeros = (char*)alloca(page_size);
-    __builtin_memset(tail_zeros, 0, page_size);
+    char tail_zeros[256] = {0};
 
     for (int i = 0; i < eh.e_phnum; i++) {
         if (phdr[i].p_type != PT_LOAD) continue;
@@ -386,7 +373,7 @@ bool remote_custom_linker_load_and_resolve_entry(int local_pid, int remote_pid, 
                 size_t tail_len = file_page_end - file_end;
                 size_t written = 0;
                 while (written < tail_len) {
-                    size_t to_write = (tail_len - written > page_size) ? page_size : (tail_len - written);
+                    size_t to_write = (tail_len - written > sizeof(tail_zeros)) ? sizeof(tail_zeros) : (tail_len - written);
                     write_proc(pid, file_end + written, tail_zeros, to_write);
                     written += to_write;
                 }

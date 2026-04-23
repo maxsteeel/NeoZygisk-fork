@@ -132,4 +132,5 @@ private:
     pthread_mutex_t* mutex;
 };
 
-bool is_kernel_5_9_or_newer();
+// Returns true if the current kernel is greater than or equal to req_major.req_minor
+bool is_kernel_version_at_least(int req_major, int req_minor);
