@@ -326,8 +326,15 @@ void custom_linker_unload(void* handle) {
             }
         }
         
-        // Exiting this if, region_to_unload exits scope 
-        // and its destructors (~UniqueList) free the memory correctly.
+        for (size_t j = 0; j < region_to_unload.maps.size; j++) {
+            const auto& map = region_to_unload.maps.data[j];
+            if (map.base != 0 && map.size != 0) {
+                munmap(reinterpret_cast<void*>(map.base), map.size);
+            }
+        }
+        
+        // Exiting this 'if' leaves region_to_unload out of scope and ~UniqueList 
+        // frees the metadata array using free().
     }
 }
 
