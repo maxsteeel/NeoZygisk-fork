@@ -272,11 +272,12 @@ bool ZygiskContext::plt_hook_commit() {
         mutex_guard lock(hook_info_lock);
         plt_hook_process_regex();
 
-        for (size_t i = 0; i < register_info.size; i++) memzero(register_info.data[i].symbol, sizeof(register_info.data[i].symbol));
-        for (size_t i = 0; i < ignore_info.size; i++) memzero(ignore_info.data[i].symbol, sizeof(ignore_info.data[i].symbol));
-
-        register_info.size = 0;
-        ignore_info.size = 0;
+        // When clear() is called, the RegexUniqueList structure will iterate
+        // on all its elements and will call regfree() on those 
+        // where is_regex == true. Then it will set the size = 0.
+        // This avoids Memory Leak and is a thousand times cleaner.
+        register_info.clear();
+        ignore_info.clear();
     }
     return lsplt::CommitHook(g_hook->cached_map_infos);
 }
