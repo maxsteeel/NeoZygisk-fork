@@ -1,45 +1,175 @@
-# NeoZygisk-fork v2.3-308 Update Released
+# NeoZygisk-fork v2.4-460 Update Released
 
-I created this fork because I'm tired of all the detections in the original NeoZygisk, which persist despite NkBe's changes. For now, this fork will only prioritize hiding Zygisk (aside from this, there won't be any other advantages over the original NeoZygisk at the moment).
+I created this fork because I'm tired of all the detections and bad performance in the original NeoZygisk, which persist despite NkBe's changes. For now, this fork will only prioritize optimization and maybe hiding Zygisk.
 
-## Changes since latest version:
+### Latest commits of my fork:
 
-* **Bleeding-Edge Toolchain**: Completely migrated to Gradle 9.4.0, Android Gradle Plugin (AGP) 9.0.1, and Kotlin 2.3.10. Also migrated the build script to Gradle's Lazy Configuration API to support Configuration Cache, and relocated Cargo's target cache for cleaner workspace management.
-
-* **Raw NDK Integration**: Eradicated the deprecated rust-android-gradle plugin. Implemented a custom, raw NDK integration linking Android C++ toolchains directly with Cargo. Module .zip size heavily reduced by ~32% due to strict build environment control and stripped unneeded artifacts.
-
-* **Aggressive Memory Sterilization**: Implemented custom memzero and wipe_string routines utilizing volatile pointers to successfully bypass compiler Dead Store Elimination (DSE) caused by -O3/LTO. Also i've optimized plt_hook regex evaluation to save CPU cycles, alongside global optimizations to C/C++ CFLAGS and Rust compilation flags.
-
-* **Remote Memory Leak Fix**: Resolved a critical remote leak in remote_csoloader.cpp by aggressively zeroing and unmapping the injected library path immediately after the open syscall.
-
-* **ELF String Stripping**: Set NO_SONAME in CMake to strip libzygisk.so from the dynamic string table.
-
-* **Zero-Allocation Zygote Forking**: Replaced standard opendir/readdir calls with direct getdents64 syscalls and implemented inline fast_atoi to drastically reduce CPU overhead during process creation. Also injected branch prediction hints (likely/unlikely) into hot paths to reduce CPU pipeline stalls.
-
-* **Aggressive RAM Reclamation**: Forced OS physical RAM reclamation using shrink_to_fit() before forks, and aggressively cleared file descriptors (FDs) across Zygote to eliminate memory bloat.
-
-
-### Latest detailed changes of my fork:
-
-* **Abandons dlopen, introducing a native CSO Loader**: The injection core of zygisk has been completely restructured, replacing it with a Custom Shared Object (CSO) Loader written natively in C++. Through manual mapping and ELF relocation, "zero linker traces" are achieved, making the injected module completely invisible in the system's soinfo tracking list.
-*Credits to **@ThePedroo** for C implementation of CSOLoader, base for this implementation*
-
-* **Deep Memory Disguise (memfd_create)**: Targeting high-strength root detectors scans such as Native Detector, the originally easily detectable anonymous executable memory ([anon]) is replaced with a memfd-based virtual file descriptor. The injected payload will now perfectly disguise itself as a legitimate JIT-compiled cache (/memfd:jit-cache).
-
-* **Implement Abstract Unix Domain Sockets**: The communication mechanism of the daemon process has been completely upgraded to abstract namespace sockets (abandoning the traditional physical .sock files), ensuring that no physical communication node traces are left in the physical file system.
-
-* **Smart IFUNC Resolver**: To address the crash issue of Android Bionic indirect functions (such as memcpy) encountered when bypassing dlopen, a new local symbol resolution and offset mapping algorithm has been added to ensure stable operation of the C++ virtual machine without the assistance of the official Linker.
-
-* **Bionic Crash Interception**: Intercepts and takes over the destruction and registration process of global variables in C++. This successfully prevents the Bionic system from triggering the ABRT(6) security self-destruct mechanism due to the detection of registration requests from unknown memory sources.
-
-* **Remote execution of native constructors**: CSOLoader can now precisely locate and safely execute DT_INIT_ARRAY within the target process, ensuring that C++ standard library components such as std::string and std::vector are correctly initialized without triggering a segmentation fault.
-
-* **Removal of redundant attexit memory scanner**: Thanks to the new CSOLoader hiding architecture, modules no longer need to brute-force scan and modify the internal structure of libc.so (g_array) at runtime to erase traces. This significantly reduces unnecessary memory operation noise, lowers the risk of being detected by heuristic scanning, and also removes the old clean_linker_trace.
-
-* **Massive Codebase Debloat & Future-Proofing**: Completely eradicated the highly unstable and fragile `solist` (linker soinfo parser) and `fossil` (memory scanner/spoofer) implementations. By relying purely on the new CSOLoader architecture, thousands of lines of obsolete code were purged. This guarantees extreme stability and makes the fork completely immune to future Android OS updates (e.g., Android 17 linker changes) that typically break traditional memory list parsers.
-
-* **Zero-Allocation I/O & Extreme Boot Performance**: Rewrote critical early-boot components (`seccomp` handling, file reading, and unmount parsing) to utilize pure C raw syscalls (`read()`) and fixed stack buffers. By completely eliminating dynamic heap allocations (`malloc`, `std::string`, `std::ifstream`) during Zygote's initialization, this prevents memory fragmentation, avoids allocator deadlocks, and drastically reduces the injection overhead, ensuring lightning-fast boot times.
-
-* **App Zygote Root Detection Bypass**: Addressed a critical vulnerability where `Isolated Services` (such as Chromium sandboxed renderers and banking app secure environments) inherited a dirty mount namespace. By enforcing a manual and surgical `umount` during `nativeSpecializeAppProcess`, the fork now successfully bypasses root detection in highly secure isolated processes and prevents kernel panics associated with leaked file descriptors.
-
-* **Improvements in Unmount**: Introduced a highly optimized, pure C parser for mount points, allowing the injector to clean up Magisk/KernelSU traces at maximum speed without relying on heavy C++ standard library wrappers.
+* fix: prevent memory leaks by properly clearing regex lists (04e2bca)
+* Make jni_hooks.hpp a normal C++ header (24690f3)
+* fix: memory maps leak in custom_linker; update LSPlt (7228861)
+* improve: telegram script; better handling of errors (b7533e5)
+* cleanup: remove dl.hpp (and its related code) and optimize code (67790e8)
+* refactor: completely purge STL and organize some includes (599a2c9)
+* refactor: deprecate TMP_PATH and fix hidden characters in spoof.prop (2189d52)
+* perf: optimize injection core and improve memory management (5bf48bf)
+* refactor: fix memory management and stabilize zygote injection (2e34225)
+* refactor(core): extreme optimization and STL purge (75916d4)
+* refactor: aggressive optimization in linkers and elf utils (2b65cfa)
+* refactor: aggressive optimization across zygiskd daemon (fccfef2)
+* fix some problems and crashes with debug build and apply more optimizations flags (2c33422)
+* refactor: big optimization in `remote_custom_linker` (293171f)
+* perf(linker): cache loaded libraries in std::vector<std::string_view> (3730099)
+* perf: replace qsort with a inline C++ sort and update lsplt (efa26eb)
+* improve: optimize file descriptor sanitization loop in zygiskd (4b445d1)
+* update LSPlt submodule (again) (eac00ee)
+* perf: some optimizations (read commit for more info) (034d617)
+* Skip module loading for isolated processes (#127) (b2f957f)
+* Fix incomplete file descriptor closure in exec_command (13a5ff7)
+* perf: optimize daemon connection retry with exponential backoff (83f88c5)
+* perf: optimize `generate_random_hex` using stack buffer instead of string mutation (8e24d2a)
+* perf: optimize property parsing in hook.cpp (4f5ca46)
+* perf: optimize string splitting in ZygiskModule::app_specialize_pre (5de007f)
+* update LSPlt submodule (c1fc315)
+* refactor(zygiskd): extract logic from refresh_cache to improve maintainability (6a6452b)
+* perf(loader): Optimize MapInfo cache lookup in `refresh_map_infos` (8c226f5)
+* perf: Use condition variable for shm refresh thread (802e2cd)
+* perf(linker): optimize TLS symbol lookup using GNU Hash table (639e679)
+* revert latest umount.cpp changes (ea629d4)
+* fix(daemon): prevent SIGSEGV during module load by inverting DIR resolution (1fb5970)
+* perf(zygiskd): optimize file copy with sendfile (664e57f)
+* fix(injector): enforce mount hiding for denylisted apps (3a49f3f)
+* perf: streamline remote linker dependencies and relocation parsing (1e7f7f0)
+* refactor: centralize architecture-specific relocation logic (fa98aa0)
+* perf: optimize zygiskd module startup path overhead (deefcda)
+* perf(daemon): implement single-pass caching for root implementations (11a9e19)
+* improve(monitor_impl): initialize the first byte as null instead of using memset; use strlcat instead of strcat to avoid buffer overflow (3cf2c44)
+* refactor(linker): implement ELF parsing directly in memory and I/O reduction (e8b1247)
+* build: implement ccache in zygiskd and pass ccache arguments via cmake (e6b07f2)
+* fix(ptracer): resolve absolute paths for ELF parser (e288055)
+* feat(ptracer): replace dlopen with ELF parsing for symbol resolution (b8a284a)
+* feat(hook): resolve JNI symbols directly from memory without dlopen (a8eb649)
+* fix(linker): resolve memory corruption and BSS segment crashes (b217256)
+* feat(linker): implement autonomous system library scanner (5236ff9)
+* ci: implement uploading to telegram CI channel (bf91da7)
+* fix(linker): implement cleanup for failed module loads (e43a490)
+* fix(injector): delegate module disabling to daemon via IPC (baec397)
+* feat(linker): improve ELF loading and relocations (97524bf)
+* improve: reduce module size (8e6f6df)
+* perf!: remove all std::string (340ce85)
+* Refine SELinux rules for sock connection (5e15a9a)
+* refactor!: aggressive memory optimization and STL-free critical paths (2e3ee1a)
+* feat: Android 17 & ARMv9 compatibility (BTI and PAC mitigations) (9be99aa)
+* improve: `ZYGISK_COMPANION_FD` env only for debug build (8ff7072)
+* fix: companion ABI isolation and fix exceve problems (54aed10)
+* refactor: unify build paths, fix xread EOF errors, and DRY up SHM structs (36ef949)
+* fix: add SELinux rules for ksu SELinux context (151de90)
+* consolidate duplicated ELF dynamic info parsing logic (d33473b)
+* set memfd permissions to 0444 (r--r--r--) to avoid problems (ce86587)
+* loader: sanitize hook lifecycle and improve stealth (6ef9bdd)
+* zygiskd: implement SHM refresh flags / uid synchronization (6bdeb48)
+* Revert "feat: implement post-specialization FD sanitizer" (89fe90c)
+* feat: implement post-specialization FD sanitizer (da0e62b)
+* feat(loader): linker hardening, thread safety, and memory management (90e0df9)
+* perf: extensive size optimization and STL dependency reduction (422ad92)
+* fix(loader): check for companion entry point before aborting load (a4c853e)
+* fix(loader): prevent duplicate system library mapping and fix TLS resolution (591c179)
+* fix(loader): abort loading safely if zygisk_module_entry is missing (77f347f)
+* feat(loader): Upgrade custom linker with advanced ELF functions (14d53ab)
+* refactor(loader): Rename remote_csoloader to remote_custom_linker and add licensing (14ace25)
+* feat(loader): Implement ART PLT hook and memory cleanup for custom_linker (ceeab5c)
+* feat(loader): Implement custom_linker replacing DlopenMem (bee4757)
+* perf(csoloader): optimize mprotect loops and memfd creation (e4f48b6)
+* experimental: update NDK to latest version r29 (8a1587d)
+* Optimize kernelsu.cpp with zero-branching, atomic caching, and memory safety fixes (11b5521)
+* fix(apatch): resolve unused variable warnings and NDK atomic limits (1e42e70)
+* perf(apatch): extreme optimization techniques to apatch config reading (2f9b689)
+* refactor: move send_fd to common socket_utils and cleanup zygiskd (18b0f4b)
+* perf: optimize Magisk denylist query by caching package names (c4981d6)
+* perf: optimize UID resolution by directly parsing packages.xml (c87d658)
+* perf: optimize remote_csoloader nbuckets read loop (9850329)
+* clean: remove unused code and fix unused warnings (3fef655)
+* misc: update workflow and update LSPlt submodule (fbbfad7)
+* Refactor kernelsu prctl calls to use helper function (70639c7)
+* perf: Eliminate N+1 DB queries and file I/O in Magisk UID checks (bed489b)
+* feat: implement lazy-caching shared memory architecture (2f3f461)
+* fix file descriptor leak in `exec_command` child process (2595558)
+* security: fix SQL injection in Magisk database query (6ec2bf8)
+* perf: optimize g_spoof_props lookups using binary search (7b549a2)
+* clean: remove unused unwind_get_region_start function (4f159bb)
+* clean: remove unused parse_int function from misc.cpp (f24fae9)
+* clean: remove unused `ZygiskModule::valid` method (cd10742)
+* perf(loader): cache MapInfo lookups to prevent O(N) array scans (175402d)
+* perf: Eliminate redundant string allocation and looping in smart_resolve_symbol (3c460da)
+* perf: optimize spoof_props lookup from O(N) to O(1) (f971b7d)
+* fix(ptracer): resolve memory leaks and ensure buffer safety in MapInfo scanner (f300794)
+* perf: Use dl_iterate_phdr to optimize MapInfo::Scan (138c138)
+* feat(hook): intercept internal system property reads via PLT hooks (675877c)
+* feat(injector): Add robust signal handling during module loading (f4f9976)
+* feat: optimize Zygisk injection decision via lock-free shared memory cache (6a33bb1)
+* feat(daemon): Add anti-dumping and anti-debugging native protections (916fb8c)
+* fix: secure and optimize prctl seccomp injection (8a90d79)
+* feat: Bypass Zygote seccomp restrictions for execve (0801583)
+* feat: optimize fd sanitization on kernel 5.9+ using close_range (3ce1b01)
+* external: update LSPlt submodule to the latest commit (e2c17d8)
+* security: fix arbitrary command injection via popen (b49c4c2)
+* perf: optimize `uid_should_umount` by parsing packages.list (6f8276e)
+* Fix SQL and shell injection in Magisk fallback paths (d27e709)
+* perf: cache libsqlite.so handle and symbols in MagiskDB (deef71b)
+* perf: use std::shared_ptr for apatch config cache to eliminate vector copy (e9af80c)
+* perf: implement zero-copy socket and VFS caching (5f4b354)
+* perf(csoloader): optimize remote ELF injection latency and I/O (9d39a1d)
+* perf(io): eliminate stdio overhead in file_readline (fcff2ef)
+* perf(ipc): overhaul socket I/O for maximum throughput and reduced syscalls (0276bd8)
+* perf(ptracer): optimize PID tracking with O(1) swap-and-pop erasure (b448af8)
+* Refactor complex function inject_on_main (6140b74)
+* refactor(ptracer): optimize MapInfo::Scan parsing logic (909aa96)
+* fix(zygiskd): prevent SQL injection in Magisk database queries (9c26dfa)
+* refactor: migrate manual file descriptor management to UniqueFd (ad3779f)
+* refactor(zygiskd): Rewrite zygiskd entirely in native C++ (558eddc)
+* refactor(ptracer): optimize memory usage and enhance stealth (bfe3294)
+* perf: optimize parse_int and memzero (0634ae2)
+* perf: optimize xread and xwrite (e8cce3c)
+* increase buffer size in utils.cpp to avoid problems (763736b)
+* perf: optimize socket_utils xwrite/xread (30d56fb)
+* Optimize MapInfo::Scan parsing logic (5bdaab9)
+* refactor(apatch): cache config file parsing (d2c4975)
+* perf: optimize memzero map paths (be108be)
+* perf: optimize starts_with string prefix check using std::string_view (6dcca1e)
+* refactor: use std::env::args() iterator instead of collect() (e3dda48)
+* perf: optimize regex evaluation in `plt_hook_process_regex` (9c54aaa)
+* performance: combine loops finding actual path and local base (1f6bde7)
+* security: replace sprintf with snprintf for UNIX domain socket path (d04ee41)
+* Optimize target path prefix checks with starts_with (9aaed05)
+* Remove unused `set_tracing_state` from `AppMonitor` (3f99d16)
+* Remove unused function get_addr_mem_region (81bd8eb)
+* perf: optimize package name parsing in Magisk root detection (7d7598f)
+* Improve executable path retrieval in zygiskd (530e335)
+* -replace std::string with native char arrays in IPC module reads (1bea3ac)
+* fix: use memzero function instead of memset (316bbce)
+* fix: resolve parent UID for AppZygote and isolated services to enforce Denylist (1c1c278)
+* fix: harden ptrace injection against signal race conditions (f6076d9)
+* perf: update LSPlt, replace heavy STL data structures and clean unused imports (4d7bc5f)
+* resolve libzygisk path dynamically from environment (b1e6f7c)
+* Set TMP_PATH env programmatically (#105) (226ac3d)
+* perf: remove heavy stream libraries and optimize string handling (3dc2d09)
+* refactor(common): drop files.cpp and replace std::function with templates (8c64864)
+* feat(module): update changelog for latest release (5fc9284)
+* build: migrate to Gradle 9.4.0, AGP 9.0.1 and implement raw NDK integration (a0f3c94)
+* fix(stealth): eradicate memory leaks and ELF string signatures (4ebb08f)
+* perf: optimize cflags, optimize rust flags and fix warnings (53bb648)
+* perf: add branch prediction hints to hot paths to reduce CPU pipeline stalls (39e4158)
+* perf: aggressive memory reclamation and IPC string obfuscation (aca6071)
+* perf: optimize plt_hook regex evaluation to save CPU cycles (db5d37c)
+* perf(injector): optimize Zygote fork path (b28adad)
+* feat(module): update name, references and changelog (2da8461)
+* fix(injector): fix root detection in app_zygote by forcing manual umount (1e7e454)
+* perf(files): replace heap allocations and malloc with a stack buffer in file readline (0650333)
+* perf(seccomp): replace C++ fstreams with pure C reads to prevent heap allocation (d49b738)
+* refactor(injector): optimize unmount with pure C parser and add kernel-level fast-path (3b948bb)
+* refactor(injector): clean some dead code (b9a2b29)
+* refactor(injector): remove obsolete fossil cleaner and map spoofer (5d3c1cb)
+* refactor(injector): purge obsolete linker soinfo code (solist) (d47e4d1)
+* feat(csoloader): implement memfd memory spoofing (5c2cf34)
+* refactor(injector): purge dead atexit memory scanner (7a0f717)
+* feat(injector): implement native CSO Loader to bypass dlopen (77bc1f2)
+* feat(zygiskd): use abstract unix domain socket for daemon communication (2801c0e)

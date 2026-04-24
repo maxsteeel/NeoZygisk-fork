@@ -1,6 +1,6 @@
 {
-	"version": "v2.3",
-	"versionCode": 308,
-	"zipUrl": "https://github.com/maxsteeel/NeoZygisk/releases/download/v2.3/NeoZygisk-fork-v2.3-308-release.zip",
+	"version": "v2.4",
+	"versionCode": 460,
+	"zipUrl": "https://github.com/maxsteeel/NeoZygisk/releases/download/v2.4/NeoZygisk-fork-v2.4-460-release.zip",
 	"changelog": "https://raw.githubusercontent.com/maxsteeel/NeoZygisk/master/module/changelog.md"
 }
