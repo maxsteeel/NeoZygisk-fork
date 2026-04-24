@@ -218,7 +218,7 @@ static int create_library_fd(int raw_file_fd) {
 
     int seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL;
     fcntl(memfd, F_ADD_SEALS, seals);
-    fchmod(memfd, S_IRUSR | S_IRGRP | S_IROTH);
+    fchmod(memfd, S_IRUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
 
     return memfd.release();
 }
