@@ -12,6 +12,7 @@ struct mount_info {
     char type[64];        
     char source[256];     
     char fs_options[128];
+    bool skip_unmount;
 };
 
 void hook_entry(void *start_addr, size_t block_size);

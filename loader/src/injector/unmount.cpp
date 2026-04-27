@@ -9,11 +9,12 @@
 #include "module.hpp"
 #include "zygisk.hpp"
 
-MountInfoList check_zygote_traces(uint32_t info_flags) {
+MountInfoList check_zygote_traces(uint32_t info_flags, bool* abort) {
     MountInfoList traces;
 
     const char* mount_source_name = nullptr;
     bool is_kernelsu = false;
+    bool is_magisk = info_flags & PROCESS_ROOT_IS_MAGISK;
 
     // Check flags early to avoid reading the file if we don't need to
     if (info_flags & PROCESS_ROOT_IS_APATCH) {
@@ -21,7 +22,7 @@ MountInfoList check_zygote_traces(uint32_t info_flags) {
     } else if (info_flags & PROCESS_ROOT_IS_KSU) {
         mount_source_name = "KSU";
         is_kernelsu = true;
-    } else if (info_flags & PROCESS_ROOT_IS_MAGISK) {
+    } else if (is_magisk) {
         mount_source_name = "magisk";
     } else {
         LOGE("could not determine root implementation, aborting unmount.");
@@ -110,6 +111,21 @@ MountInfoList check_zygote_traces(uint32_t info_flags) {
                     }
 
                     if (should_unmount) {
+                        if (abort && __builtin_strncmp(info.target, "/product", 8) == 0) {
+                            if (__builtin_strncmp(info.target, "/product/bin", 12) != 0 &&
+                                (is_magisk || __builtin_strcmp(info.target, "/product") == 0)) {
+                                LOGV("abort unmounting zygote due to prohibited target: [%s]", info.target);
+                                *abort = true;
+                                free(buf);
+                                traces.size = 0;
+                                return traces;
+                            }
+                        }
+
+                        if (__builtin_strcmp(info.source, "magisk") == 0) {
+                            info.skip_unmount = true;
+                        }
+
                         traces.push_back(info);
                     }
                 }
@@ -121,6 +137,7 @@ MountInfoList check_zygote_traces(uint32_t info_flags) {
     free(buf);
 
     if (traces.size == 0) {
+        if (abort) *abort = true;
         LOGV("no relevant mount points found to unmount.");
         return traces;
     }

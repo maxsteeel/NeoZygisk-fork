@@ -587,24 +587,6 @@ void ZygiskContext::nativeForkSystemServer_post() {
     fork_post();
 }
 
-bool abort_zygote_unmount(const MountInfoList &traces, uint32_t info_flags) {
-    if (traces.size == 0) {
-        LOGV("abort unmounting zygote with an empty trace list");
-        return true;
-    }
-    bool is_magisk = info_flags & PROCESS_ROOT_IS_MAGISK;
-    for (size_t i = 0; i < traces.size; i++) {
-        const auto& trace = traces.data[i];
-        if (__builtin_strncmp(trace.target, "/product", 8) == 0) {
-            if (__builtin_strncmp(trace.target, "/product/bin", 12) == 0) continue;
-            if (!is_magisk && __builtin_strcmp(trace.target, "/product") != 0) continue;
-            LOGV("abort unmounting zygote due to prohibited target: [%s]", trace.target);
-            return true;
-        }
-    }
-    return false;
-}
-
 void ZygiskContext::nativeSpecializeAppProcess_pre() {
     process = env->GetStringUTFChars(args.app->nice_name, nullptr);
     LOGV("pre specialize [%s]", process);
@@ -614,18 +596,18 @@ void ZygiskContext::nativeSpecializeAppProcess_pre() {
     if (!g_hook->zygote_unmounted && (flags & DO_REVERT_UNMOUNT)) {
         LOGI("AppZygote [%s] is on denylist, performing manual unmount", process);
         
-        MountInfoList new_traces = check_zygote_traces(info_flags);
+        bool abort = false;
+        MountInfoList new_traces = check_zygote_traces(info_flags, &abort);
 
         {
             mutex_guard lock(unmount_lock); 
 
-            g_hook->zygote_traces.size = 0;
-            for(size_t i=0; i<new_traces.size; i++) g_hook->zygote_traces.push_back(new_traces.data[i]);
+            g_hook->zygote_traces = static_cast<MountInfoList&&>(new_traces);
 
-            if (!abort_zygote_unmount(g_hook->zygote_traces, info_flags)) {
+            if (!abort) {
                 for (size_t i = 0; i < g_hook->zygote_traces.size; i++) {
                     const auto& trace = g_hook->zygote_traces.data[i];
-                    if (__builtin_strcmp(trace.source, "magisk") == 0) continue;
+                    if (trace.skip_unmount) continue;
                     LOGV("AppZygote unmounting %s", trace.target);
                     umount2(trace.target, MNT_DETACH);
                 }
@@ -650,18 +632,18 @@ void ZygiskContext::nativeForkAndSpecialize_pre() {
     if (!g_hook->zygote_unmounted && g_hook->zygote_traces.size == 0) {
         info_flags = zygiskd::GetProcessFlags(args.app->uid);
 
-        MountInfoList new_traces = check_zygote_traces(info_flags);
+        bool abort = false;
+        MountInfoList new_traces = check_zygote_traces(info_flags, &abort);
 
         {
             mutex_guard lock(unmount_lock);
-            g_hook->zygote_traces.size = 0;
-            for(size_t i=0; i<new_traces.size; i++) g_hook->zygote_traces.push_back(new_traces.data[i]);
+            g_hook->zygote_traces = static_cast<MountInfoList&&>(new_traces);
 
-            if (!abort_zygote_unmount(g_hook->zygote_traces, info_flags)) {
+            if (!abort) {
                 size_t valid = 0;
                 for (size_t i = 0; i < g_hook->zygote_traces.size; i++) {
                     const auto& trace = g_hook->zygote_traces.data[i];
-                    if (__builtin_strcmp(trace.source, "magisk") == 0) {
+                    if (trace.skip_unmount) {
                         LOGV("skip magisk specific mounts for compatibility: %s", trace.source);
                         g_hook->zygote_traces.data[valid++] = trace; 
                     } else {
@@ -683,10 +665,18 @@ void ZygiskContext::nativeForkAndSpecialize_pre() {
         app_specialize_pre();
         if (flags & DO_REVERT_UNMOUNT) {
             LOGI("Reverting mounts for denylisted app: %s", process);
-            MountInfoList traces = check_zygote_traces(info_flags);
-            for (size_t i = 0; i < traces.size; i++) {
-                LOGV("Child unmounting %s", traces.data[i].target);
-                umount2(traces.data[i].target, MNT_DETACH);
+
+            if (g_hook->zygote_unmounted && g_hook->zygote_traces.size > 0) {
+                for (size_t i = 0; i < g_hook->zygote_traces.size; i++) {
+                    LOGV("Child unmounting %s", g_hook->zygote_traces.data[i].target);
+                    umount2(g_hook->zygote_traces.data[i].target, MNT_DETACH);
+                }
+            } else {
+                MountInfoList traces = check_zygote_traces(info_flags);
+                for (size_t i = 0; i < traces.size; i++) {
+                    LOGV("Child unmounting %s", traces.data[i].target);
+                    umount2(traces.data[i].target, MNT_DETACH);
+                }
             }
         }
     }

@@ -459,4 +459,4 @@ inline const lsplt::MapInfo* find_in_cache(const CachedMapList& cache, const cha
     return nullptr;
 }
 
-MountInfoList check_zygote_traces(uint32_t info_flags);
+MountInfoList check_zygote_traces(uint32_t info_flags, bool* abort = nullptr);
