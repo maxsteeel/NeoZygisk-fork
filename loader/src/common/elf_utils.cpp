@@ -217,100 +217,36 @@ bool find_dynsym_value(const elf_dyn_info *info, const char *sym_name, ElfW(Addr
     return false;
 }
 
-struct alignas(void*) SymData {
+struct SymData {
     const char* lib_name;
     const char* sym_name;
-    uint32_t sym_hash;
     void* result;
 };
 
 static int sym_cb(struct dl_phdr_info* info, size_t, void* data) {
     auto* search = reinterpret_cast<SymData*>(data);
 
-    // Check if this is the library we are looking for
-    if (!info->dlpi_name || !__builtin_strstr(info->dlpi_name, search->lib_name)) return 0;
+    if (!info->dlpi_name) return 0;
+    const char* name = __builtin_strrchr(info->dlpi_name, '/');
+    name = name ? name + 1 : info->dlpi_name;
+    if (__builtin_strcmp(name, search->lib_name) != 0) return 0;
 
-    ElfW(Addr) base = info->dlpi_addr;
-    ElfW(Dyn)* dyn = nullptr;
+    ElfW(Ehdr)* eh = reinterpret_cast<ElfW(Ehdr)*>(info->dlpi_addr);
+    elf_dyn_info dinfo = {};
+    if (elf_load_dyn_info(reinterpret_cast<void*>(info->dlpi_addr), false, eh, info->dlpi_phdr, &dinfo)) {
+        ElfW(Addr) val = 0;
 
-    // Find the PT_DYNAMIC section
-    for (int i = 0; i < info->dlpi_phnum; i++) {
-        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
-            dyn = reinterpret_cast<ElfW(Dyn)*>(base + info->dlpi_phdr[i].p_vaddr);
-            break;
+        if (find_dynsym_value(&dinfo, search->sym_name, &val)) {
+            search->result = reinterpret_cast<void*>(info->dlpi_addr + val);
+            return 1;
         }
     }
-
-    if (!dyn) return 0;
-
-    ElfW(Sym)* symtab = nullptr;
-    const char* strtab = nullptr;
-    uint32_t* gnu_hash = nullptr;
-    uint32_t found_tables = 0;
-
-    // Extracting tables with EARLY EXIT
-    for (ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; d++) {
-        switch (d->d_tag) {
-            case DT_SYMTAB: 
-                symtab = reinterpret_cast<ElfW(Sym)*>(base + d->d_un.d_ptr); 
-                found_tables++; 
-                break;
-            case DT_STRTAB: 
-                strtab = reinterpret_cast<const char*>(base + d->d_un.d_ptr); 
-                found_tables++; 
-                break;
-            case DT_GNU_HASH: 
-                gnu_hash = reinterpret_cast<uint32_t*>(base + d->d_un.d_ptr); 
-                found_tables++; 
-                break;
-        }
-
-        if (found_tables == 3) break; 
-    }
-
-    if (found_tables == 3) {
-        uint32_t nbuckets = gnu_hash[0];
-        uint32_t symoffset = gnu_hash[1];
-        uint32_t bloom_size = gnu_hash[2];
-        uint32_t shift2 = gnu_hash[3];
-
-        const ElfW(Addr)* bloom_filter = reinterpret_cast<const ElfW(Addr)*>(&gnu_hash[4]);
-        const uint32_t* buckets = reinterpret_cast<const uint32_t*>(&bloom_filter[bloom_size]);
-        const uint32_t* chains = &buckets[nbuckets];
-
-        uint32_t hash = search->sym_hash;
-        constexpr uint32_t ADDR_BITS = sizeof(ElfW(Addr)) * 8;
-        constexpr uint32_t ADDR_MASK = ADDR_BITS - 1;
-        uint32_t word_num = (hash / ADDR_BITS) & (bloom_size - 1);
-        uint32_t h2 = hash >> shift2;
-
-        ElfW(Addr) mask = (((ElfW(Addr))1) << (hash & ADDR_MASK)) |
-                          (((ElfW(Addr))1) << (h2 & ADDR_MASK));
-
-        if ((bloom_filter[word_num] & mask) != mask) return 0;
-
-        uint32_t bucket = hash % nbuckets;
-        uint32_t sym_idx = buckets[bucket];
-
-        // Walk the hash chain
-        if (sym_idx >= symoffset) {
-            do {
-                const ElfW(Sym)& sym = symtab[sym_idx];
-                if (((chains[sym_idx - symoffset] ^ hash) >> 1) == 0 && sym.st_shndx != SHN_UNDEF) {
-                    if (__builtin_strcmp(strtab + sym.st_name, search->sym_name) == 0) {
-                        search->result = reinterpret_cast<void*>(base + sym.st_value);
-                        return 1; 
-                    }
-                }
-                sym_idx++;
-            } while ((chains[sym_idx - 1 - symoffset] & 1) == 0);
-        }
-    }
+    
     return 0; 
 }
 
 void* resolve_symbol(const char* lib_name, const char* sym_name) {
-    SymData search = {lib_name, sym_name, calc_gnu_hash(sym_name), nullptr};
+    SymData search = {lib_name, sym_name, nullptr}; 
     dl_iterate_phdr(sym_cb, &search);
     return search.result;
 }

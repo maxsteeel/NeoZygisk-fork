@@ -120,12 +120,7 @@ __asm__ (
 extern "C" ptrdiff_t custom_tlsdesc_resolver_stub(void*);
 #endif
 
-struct deferred_ifunc { uintptr_t target; uintptr_t resolver; };
-struct IfuncList : public UniqueList<deferred_ifunc> {
-    void push_back(uintptr_t target, uintptr_t resolver) {
-        UniqueList<deferred_ifunc>::push_back({target, resolver});
-    }
-};
+inline void* operator new(size_t, void* p) noexcept { return p; }
 
 struct tlsdesc { void* resolver; uint64_t arg; };
 struct CustomTlsInfo { size_t module_id; pthread_key_t key; size_t size; };
@@ -162,89 +157,54 @@ struct LoadedModuleList : public UniqueList<LoadedModule> {
         if (this->size >= this->capacity) {
             size_t new_cap = this->capacity == 0 ? 4 : this->capacity * 2;
             LoadedModule* new_data = static_cast<LoadedModule*>(malloc(new_cap * sizeof(LoadedModule)));
-            if (!new_data) return this->data[this->size - 1]; // Safe fallback
             if (this->data && this->size > 0) {
-                __builtin_memcpy((void*)new_data, this->data, this->size * sizeof(LoadedModule));
+                __builtin_memcpy((void*)new_data, (void*)this->data, this->size * sizeof(LoadedModule));
             }
             if (this->data) free(this->data);
             this->data = new_data;
             this->capacity = new_cap;
         }
-        // Initialize the newly allocated structure cleanly
-        __builtin_memset((void*)&this->data[this->size], 0, sizeof(LoadedModule));
-        return this->data[this->size++];
+        LoadedModule* mod = new (&this->data[this->size]) LoadedModule();
+        this->size++;
+        return *mod;
     }
-};
-
-struct CachedLib { const char* name; uint32_t hash; };
-struct CachedLibList : public UniqueList<CachedLib> {
-    void push_back(const char* n) {
-        if (this->size >= this->capacity) {
-            size_t new_cap = this->capacity == 0 ? 128 : this->capacity * 2;
-            CachedLib* new_data = static_cast<CachedLib*>(malloc(new_cap * sizeof(CachedLib)));
-            if (!new_data) return;
-            if (this->data && this->size > 0) {
-                __builtin_memcpy(new_data, this->data, this->size * sizeof(CachedLib));
-            }
-            if (this->data) free(this->data);
-            this->data = new_data;
-            this->capacity = new_cap;
+    void pop_back() {
+        if (this->size > 0) {
+            this->size--;
+            this->data[this->size].~LoadedModule();
+            __builtin_memset((void*)&this->data[this->size], 0, sizeof(LoadedModule)); 
         }
-        this->data[this->size++] = {n, calc_gnu_hash(n)};
     }
 };
 
 struct CustomRegion { uintptr_t handle; MemMapList maps; DestructorList destructors; };
-struct CustomRegionList {
-    CustomRegion* data = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    CustomRegionList() = default;
-    CustomRegionList(const CustomRegionList&) = delete;
-    CustomRegionList& operator=(const CustomRegionList&) = delete;
-    CustomRegionList(CustomRegionList&& other) noexcept : data(other.data), size(other.size), capacity(other.capacity) {
-        other.data = nullptr; other.size = 0; other.capacity = 0;
-    }
-    CustomRegionList& operator=(CustomRegionList&& other) noexcept {
-        if (this != &other) {
-            data = other.data; size = other.size; capacity = other.capacity;
-            other.data = nullptr; other.size = 0; other.capacity = 0;
-        }
-        return *this;
-    }
-    // We intentionally don't free in destructor because this is a global state
-    ~CustomRegionList() = default; 
+struct CustomRegionList : public UniqueList<CustomRegion> {
     CustomRegion& push_back() {
-        if (size >= capacity) {
-            size_t new_cap = capacity == 0 ? 4 : capacity * 2;
+        if (this->size >= this->capacity) {
+            size_t new_cap = this->capacity == 0 ? 4 : this->capacity * 2;
             CustomRegion* new_data = static_cast<CustomRegion*>(malloc(new_cap * sizeof(CustomRegion)));
-            if (!new_data) return data[size > 0 ? size - 1 : 0]; // Evitar desreferenciar nullptr
-            if (data && size > 0) {
-                __builtin_memcpy((void*)new_data, data, size * sizeof(CustomRegion));
+            if (this->data && this->size > 0) {
+                __builtin_memcpy((void*)new_data, (void*)this->data, this->size * sizeof(CustomRegion));
             }
-            if (data) free(data);
-            data = new_data;
-            capacity = new_cap;
+            if (this->data) free(this->data);
+            this->data = new_data;
+            this->capacity = new_cap;
         }
-        __builtin_memset((void*)&data[size], 0, sizeof(CustomRegion)); // Clean initialization
-        return data[size++];
+        CustomRegion* reg = new (&this->data[this->size]) CustomRegion();
+        this->size++;
+        return *reg;
     }
+
     void erase(size_t index) {
-        if (index >= size) return;
-        // Call destructors for the internal lists before shifting memory
-        data[index].maps.~MemMapList();
-        data[index].destructors.~DestructorList();
-        if (index < size - 1) {
-            __builtin_memmove((void*)&data[index], (void*)&data[index + 1], (size - index - 1) * sizeof(CustomRegion));
+        if (index >= this->size) return;
+        this->data[index].maps.~MemMapList();
+        this->data[index].destructors.~DestructorList();
+        if (index < this->size - 1) {
+            __builtin_memmove((void*)&this->data[index], (void*)&this->data[index + 1], (this->size - index - 1) * sizeof(CustomRegion));
         }
-        size--;
-        // The garbage left in the last slot after the memmove is cleaned
-        // to prevent old internal lists from being accidentally reused or released twice.
-        __builtin_memset((void*)&data[size], 0, sizeof(CustomRegion));
+        this->size--;
     }
 };
-
-#include <stdatomic.h>
 
 struct SpinLockGuard {
     atomic_flag& flag_; 
@@ -264,27 +224,18 @@ struct SpinLockGuard {
     }
 };
 
-static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 static atomic_flag g_custom_regions_lock = ATOMIC_FLAG_INIT;
-static CustomRegionList* g_custom_regions = nullptr;
 
-/* Actual allocator function called only once */
-static void do_init_tracking() {
-    g_custom_regions = new CustomRegionList();
-}
-
-static void init_region_tracking() {
-    // pthread_once guarantees do_init_tracking runs strictly once, 
-    // even if 100 threads call it at the exact same nanosecond.
-    pthread_once(&g_init_once, do_init_tracking);
+static CustomRegionList& get_custom_regions() {
+    static CustomRegionList instance;
+    return instance;
 }
 
 bool is_custom_linker_address(const void* addr) {
-    init_region_tracking();
     uintptr_t ptr = reinterpret_cast<uintptr_t>(addr);
     SpinLockGuard lock(g_custom_regions_lock);
-    for (size_t i = 0; i < g_custom_regions->size; i++) {
-        const auto& reg = g_custom_regions->data[i];
+    for (size_t i = 0; i < get_custom_regions().size; i++) {
+        const auto& reg = get_custom_regions().data[i];
         for (size_t j = 0; j < reg.maps.size; j++) {
             const auto& map = reg.maps.data[j];
             if (ptr >= map.base && ptr < map.base + map.size) return true;
@@ -294,21 +245,20 @@ bool is_custom_linker_address(const void* addr) {
 }
 
 void custom_linker_unload(void* handle) {
-    init_region_tracking();
     uintptr_t base = reinterpret_cast<uintptr_t>(handle);
     CustomRegion region_to_unload;
     bool found = false;
 
     {
         SpinLockGuard lock(g_custom_regions_lock);
-        for (size_t i = 0; i < g_custom_regions->size; i++) {
-            if (g_custom_regions->data[i].handle == base) {
-                __builtin_memcpy((void*)&region_to_unload, &g_custom_regions->data[i], sizeof(CustomRegion));
-                g_custom_regions->data[i].maps.data = nullptr;
-                g_custom_regions->data[i].maps.size = 0;
-                g_custom_regions->data[i].destructors.data = nullptr;
-                g_custom_regions->data[i].destructors.size = 0;
-                g_custom_regions->erase(i);
+        for (size_t i = 0; i < get_custom_regions().size; i++) {
+            if (get_custom_regions().data[i].handle == base) {
+                __builtin_memcpy((void*)&region_to_unload, &get_custom_regions().data[i], sizeof(CustomRegion));
+                get_custom_regions().data[i].maps.data = nullptr;
+                get_custom_regions().data[i].maps.size = 0;
+                get_custom_regions().data[i].destructors.data = nullptr;
+                get_custom_regions().data[i].destructors.size = 0;
+                get_custom_regions().erase(i);
                 found = true;
                 break;
             }
@@ -323,6 +273,9 @@ void custom_linker_unload(void* handle) {
             } else if (d.type == DestructorAction::TLS_CLEANUP) {
                 CustomTlsInfo* tls_info = reinterpret_cast<CustomTlsInfo*>(d.mod_id);
                 pthread_key_delete(tls_info->key);
+                delete tls_info;
+            } else if (d.type == DestructorAction::TLSDESC_CLEANUP) {
+                delete d.tlsdesc_arg;
             }
         }
         
@@ -404,18 +357,12 @@ static bool resolve_symbol_addr(const elf_dyn_info *info,
     return false;
 }
 
-struct sleb128_decoder { const uint8_t *current; };
-static inline void sleb128_decoder_init(sleb128_decoder *decoder, const uint8_t *buffer) {
-    decoder->current = buffer;
-}
-
-static inline int64_t sleb128_decode(sleb128_decoder *decoder) {
-    int64_t value = 0;
-    size_t shift = 0;
+static inline int64_t sleb128_decode(const uint8_t*& current) {
+    int64_t value = 0; size_t shift = 0;
     uint8_t byte;
 
     do {
-        byte = *decoder->current++;
+        byte = *current++;
         value |= ((int64_t)(byte & 0x7F)) << shift;
         shift += 7;
     } while (byte & 0x80);
@@ -427,12 +374,9 @@ static inline int64_t sleb128_decode(sleb128_decoder *decoder) {
 }
 
 __attribute__((noinline))
-static bool process_relocation([[maybe_unused]] LoadedModule& mod, 
-                                        const LoadedModuleList& loaded_modules,
-                                        uintptr_t load_bias, const elf_dyn_info* info,
-                                        uintptr_t target, unsigned current_type, 
-                                        unsigned current_sym_idx, ElfW(Addr) current_addend,
-                                        [[maybe_unused]] bool is_rela, IfuncList& ifuncs) {
+static bool process_relocation([[maybe_unused]] LoadedModule& mod, const LoadedModuleList& loaded_modules,
+                               uintptr_t load_bias, const elf_dyn_info* info, uintptr_t target, unsigned current_type, 
+                               unsigned current_sym_idx, ElfW(Addr) current_addend, [[maybe_unused]] bool is_rela) {
     
     ElfW(Addr) value = 0;
 
@@ -441,9 +385,6 @@ static bool process_relocation([[maybe_unused]] LoadedModule& mod,
         case R_AARCH64_RELATIVE: 
             value = (ElfW(Addr))load_bias + current_addend; 
             break;
-        case R_AARCH64_IRELATIVE: 
-            ifuncs.push_back(target, (uintptr_t)load_bias + current_addend); 
-            return true;
         case R_AARCH64_GLOB_DAT:
         case R_AARCH64_JUMP_SLOT:
         case R_AARCH64_ABS64: {
@@ -500,9 +441,6 @@ static bool process_relocation([[maybe_unused]] LoadedModule& mod,
         case R_X86_64_RELATIVE: 
             value = (ElfW(Addr))load_bias + current_addend; 
             break;
-        case R_X86_64_IRELATIVE: 
-            ifuncs.push_back(target, (uintptr_t)load_bias + current_addend); 
-            return true;
         case R_X86_64_GLOB_DAT:
         case R_X86_64_JUMP_SLOT:
         case R_X86_64_64: {
@@ -544,9 +482,6 @@ static bool process_relocation([[maybe_unused]] LoadedModule& mod,
         case R_ARM_RELATIVE: 
             value = (ElfW(Addr))load_bias + addend_rel; 
             break;
-        case R_ARM_IRELATIVE: 
-            ifuncs.push_back(target, (uintptr_t)load_bias + addend_rel); 
-            return true;
         case R_ARM_GLOB_DAT:
         case R_ARM_JUMP_SLOT:
         case R_ARM_ABS32: {
@@ -590,9 +525,6 @@ static bool process_relocation([[maybe_unused]] LoadedModule& mod,
         case R_386_RELATIVE: 
             value = (ElfW(Addr))load_bias + addend_rel; 
             break;
-        case R_386_IRELATIVE: 
-            ifuncs.push_back(target, (uintptr_t)load_bias + addend_rel); 
-            return true;
         case R_386_GLOB_DAT:
         case R_386_JMP_SLOT:
         case R_386_32: {
@@ -640,8 +572,7 @@ static bool process_relocation([[maybe_unused]] LoadedModule& mod,
 
 template <typename RelType, bool IsRela>
 __attribute__((noinline))
-static bool apply_relocations(LoadedModule& mod, const LoadedModuleList& loaded_modules,
-                              off_t rel_vaddr, size_t rel_sz, IfuncList& ifuncs) {
+static bool apply_relocations(LoadedModule& mod, const LoadedModuleList& loaded_modules, off_t rel_vaddr, size_t rel_sz) {
     const elf_dyn_info* info = &mod.dinfo;
     uintptr_t load_bias = mod.load_bias;
     size_t count = rel_sz / sizeof(RelType);
@@ -658,7 +589,7 @@ static bool apply_relocations(LoadedModule& mod, const LoadedModuleList& loaded_
         ElfW(Addr) addend = 0;
         if constexpr (IsRela) addend = r.r_addend;
 
-        if (unlikely(!process_relocation(mod, loaded_modules, load_bias, info, target, type, sym, addend, IsRela, ifuncs))) {
+        if (unlikely(!process_relocation(mod, loaded_modules, load_bias, info, target, type, sym, addend, IsRela))) {
             return false;
         }
     }
@@ -666,8 +597,7 @@ static bool apply_relocations(LoadedModule& mod, const LoadedModuleList& loaded_
 }
 
 static bool apply_android_relocations(LoadedModule& mod, const LoadedModuleList& loaded_modules,
-                                      off_t reloc_vaddr, size_t reloc_sz,
-                                      IfuncList& ifuncs, bool is_rela) {
+                                      off_t reloc_vaddr, size_t reloc_sz, bool is_rela) {
     const elf_dyn_info* info = &mod.dinfo;
     uintptr_t load_bias = mod.load_bias;
     uint8_t* reloc_data = reinterpret_cast<uint8_t*>(load_bias + reloc_vaddr);
@@ -677,19 +607,17 @@ static bool apply_android_relocations(LoadedModule& mod, const LoadedModuleList&
         return false;
     }
 
-    sleb128_decoder decoder;
-    sleb128_decoder_init(&decoder, reloc_data + 4);
-
-    uint64_t num_relocs = sleb128_decode(&decoder);
-    ElfW(Addr) current_offset = sleb128_decode(&decoder);
+    const uint8_t* current = reloc_data + 4;
+    uint64_t num_relocs = sleb128_decode(current);
+    ElfW(Addr) current_offset = sleb128_decode(current);
 
     unsigned current_sym_idx = 0;
     unsigned current_type = 0;
     ElfW(Addr) current_addend = 0;
 
     for (uint64_t i = 0; i < num_relocs; ) {
-        uint64_t group_size = sleb128_decode(&decoder);
-        uint64_t group_flags = sleb128_decode(&decoder);
+        uint64_t group_size = sleb128_decode(current);
+        uint64_t group_flags = sleb128_decode(current);
 
         size_t group_r_offset_delta = 0;
         const size_t RELOCATION_GROUPED_BY_INFO_FLAG = 1;
@@ -698,11 +626,11 @@ static bool apply_android_relocations(LoadedModule& mod, const LoadedModuleList&
         const size_t RELOCATION_GROUP_HAS_ADDEND_FLAG = 8;
 
         if (group_flags & RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG) {
-            group_r_offset_delta = sleb128_decode(&decoder);
+            group_r_offset_delta = sleb128_decode(current);
         }
 
         if (group_flags & RELOCATION_GROUPED_BY_INFO_FLAG) {
-            ElfW(Addr) r_info = sleb128_decode(&decoder);
+            ElfW(Addr) r_info = sleb128_decode(current);
             current_sym_idx = ELF_R_SYM(r_info);
             current_type = ELF_R_TYPE(r_info);
         }
@@ -710,10 +638,8 @@ static bool apply_android_relocations(LoadedModule& mod, const LoadedModuleList&
         size_t group_flags_reloc = 0;
         if (is_rela) {
             group_flags_reloc = group_flags & (RELOCATION_GROUP_HAS_ADDEND_FLAG | RELOCATION_GROUPED_BY_ADDEND_FLAG);
-            if (group_flags_reloc == RELOCATION_GROUP_HAS_ADDEND_FLAG) {
-                // Each relocation has an addend.
-            } else if (group_flags_reloc == (RELOCATION_GROUP_HAS_ADDEND_FLAG | RELOCATION_GROUPED_BY_ADDEND_FLAG)) {
-                current_addend += sleb128_decode(&decoder);
+            if (group_flags_reloc == (RELOCATION_GROUP_HAS_ADDEND_FLAG | RELOCATION_GROUPED_BY_ADDEND_FLAG)) {
+                current_addend += sleb128_decode(current);
             } else {
                 current_addend = 0;
             }
@@ -725,19 +651,19 @@ static bool apply_android_relocations(LoadedModule& mod, const LoadedModuleList&
             if (group_flags & RELOCATION_GROUPED_BY_OFFSET_DELTA_FLAG) {
                 current_offset += group_r_offset_delta;
             } else {
-                current_offset += sleb128_decode(&decoder);
+                current_offset += sleb128_decode(current);
             }
             if ((group_flags & RELOCATION_GROUPED_BY_INFO_FLAG) == 0) {
-                ElfW(Addr) r_info = sleb128_decode(&decoder);
+                ElfW(Addr) r_info = sleb128_decode(current);
                 current_sym_idx = ELF_R_SYM(r_info);
                 current_type = ELF_R_TYPE(r_info);
             }
             if (is_rela && group_flags_reloc == RELOCATION_GROUP_HAS_ADDEND_FLAG) {
-                current_addend += sleb128_decode(&decoder);
+                current_addend += sleb128_decode(current);
             }
 
             uintptr_t target = load_bias + current_offset;
-            if (unlikely(!process_relocation(mod, loaded_modules, load_bias, info, target, current_type, current_sym_idx, current_addend, is_rela, ifuncs))) {
+            if (unlikely(!process_relocation(mod, loaded_modules, load_bias, info, target, current_type, current_sym_idx, current_addend, is_rela))) {
                 return false;
             }
         }
@@ -781,46 +707,37 @@ static bool apply_relr_section(LoadedModule& mod, off_t relr_vaddr, size_t relr_
 }
 
 static bool apply_module_relocations(LoadedModule& mod, const LoadedModuleList& loaded_modules) {
-    IfuncList ifuncs;
 
     if (mod.dinfo.rela_sz && mod.dinfo.rela_vaddr) {
-        if (!apply_relocations<ElfW(Rela), true>(mod, loaded_modules, mod.dinfo.rela_vaddr, mod.dinfo.rela_sz, ifuncs)) return false;
+        if (!apply_relocations<ElfW(Rela), true>(mod, loaded_modules, mod.dinfo.rela_vaddr, mod.dinfo.rela_sz)) return false;
     }
     if (mod.dinfo.rel_sz && mod.dinfo.rel_vaddr) {
-        if (!apply_relocations<ElfW(Rel), false>(mod, loaded_modules, mod.dinfo.rel_vaddr, mod.dinfo.rel_sz, ifuncs)) return false;
+        if (!apply_relocations<ElfW(Rel), false>(mod, loaded_modules, mod.dinfo.rel_vaddr, mod.dinfo.rel_sz)) return false;
     }
     if (mod.dinfo.jmprel_sz && mod.dinfo.jmprel_vaddr) {
         if (mod.dinfo.pltrel_type == DT_RELA) {
-            if (!apply_relocations<ElfW(Rela), true>(mod, loaded_modules, mod.dinfo.jmprel_vaddr, mod.dinfo.jmprel_sz, ifuncs)) return false;
+            if (!apply_relocations<ElfW(Rela), true>(mod, loaded_modules, mod.dinfo.jmprel_vaddr, mod.dinfo.jmprel_sz)) return false;
         } else {
-            if (!apply_relocations<ElfW(Rel), false>(mod, loaded_modules, mod.dinfo.jmprel_vaddr, mod.dinfo.jmprel_sz, ifuncs)) return false;
+            if (!apply_relocations<ElfW(Rel), false>(mod, loaded_modules, mod.dinfo.jmprel_vaddr, mod.dinfo.jmprel_sz)) return false;
         }
     }
 
     if (mod.dinfo.android_rel_sz && mod.dinfo.android_rel_vaddr) {
-        if (!apply_android_relocations(mod, loaded_modules, mod.dinfo.android_rel_vaddr, mod.dinfo.android_rel_sz, ifuncs, mod.dinfo.android_is_rela)) return false;
+        if (!apply_android_relocations(mod, loaded_modules, mod.dinfo.android_rel_vaddr, mod.dinfo.android_rel_sz, mod.dinfo.android_is_rela)) return false;
     }
     if (mod.dinfo.relr_sz && mod.dinfo.relr_vaddr) {
         if (!apply_relr_section(mod, mod.dinfo.relr_vaddr, mod.dinfo.relr_sz)) return false;
     }
 
-    uint64_t hwcap = getauxval(AT_HWCAP);
-    for (size_t i = 0; i < ifuncs.size; i++) {
-        const auto& ifunc = ifuncs.data[i];
-        typedef void* (*ifunc_resolver_t)(uint64_t);
-        auto resolver = reinterpret_cast<ifunc_resolver_t>(ifunc.resolver);
-        uintptr_t value = PAC_STRIP(reinterpret_cast<uintptr_t>(resolver(hwcap)));
-        *reinterpret_cast<ElfW(Addr)*>(ifunc.target) = value;
-    }
-
     return true;
 }
 
-static bool load_single_library(const char *lib_path, int memfd, LoadedModule* out_module) {
+static bool load_single_library(int memfd, LoadedModule* out_module, const char* module_name) {
     long page_size_long = sysconf(_SC_PAGESIZE);
     size_t page_size = (size_t)page_size_long;
 
-    UniqueFd fd(memfd >= 0 ? dup(memfd) : open(lib_path, O_RDONLY | O_CLOEXEC));
+    if (memfd < 0) return false;
+    UniqueFd fd(dup(memfd));
     if (fd < 0) return false;
 
     ElfW(Ehdr) eh;
@@ -830,7 +747,7 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
 
     if (!compute_load_layout(fd, page_size, &eh, phdr, &min_vaddr, &map_size)) return false;
 
-    void* remote_base_ptr = mmap(nullptr, map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void* remote_base_ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (remote_base_ptr == MAP_FAILED) return false;
     uintptr_t remote_base = reinterpret_cast<uintptr_t>(remote_base_ptr);
 
@@ -847,37 +764,10 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
         uintptr_t seg_page_end = page_end(seg_end, page_size);
         size_t seg_page_len = seg_page_end - seg_page;
 
-        bool is_writable = (phdr[i].p_flags & PF_W) != 0;
-        off_t file_page_offset = page_start(phdr[i].p_offset, page_size);
-        uintptr_t file_end = phdr[i].p_vaddr + phdr[i].p_filesz + load_bias;
-        uintptr_t file_page_end = page_end(file_end, page_size);
-
         if (phdr[i].p_filesz > 0) {
-            // Normal segment backed by file
-            void* seg_map = mmap(reinterpret_cast<void*>(seg_page), file_page_end - seg_page, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, fd, file_page_offset);
-            if (seg_map == MAP_FAILED) return false;
-
-            // Fill with zeros the difference between the end of the data and the end of the page
-            if (is_writable && file_page_end > file_end) {
-                memset(reinterpret_cast<void*>(file_end), 0, file_page_end - file_end);
-            }
-        } else {
-            // BSS segment (p_filesz == 0).
-            // It has no data in the file, only reserved space in memory.
-            // We map it as anonymous memory so that it doesn't stay in PROT_NONE.
-            void* seg_map = mmap(reinterpret_cast<void*>(seg_page), seg_page_len, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (seg_map == MAP_FAILED) return false;
-        }
-
-        // Handling BSS expansion for hybrid segments (.data + .bss)
-        if (phdr[i].p_memsz > phdr[i].p_filesz && phdr[i].p_filesz > 0) {
-            uintptr_t bss_end = seg_end;
-            uintptr_t bss_page_end_align = page_start(file_end + page_size - 1, page_size);
-
-            if (bss_end > bss_page_end_align) {
-                void* bss_map = mmap(reinterpret_cast<void*>(bss_page_end_align), bss_end - bss_page_end_align, 
-                                     PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                if (bss_map == MAP_FAILED) return false;
+            if (pread(fd, reinterpret_cast<void*>(seg_start), phdr[i].p_filesz, phdr[i].p_offset) != (ssize_t)phdr[i].p_filesz) {
+                munmap(remote_base_ptr, map_size);
+                return false;
             }
         }
 
@@ -905,18 +795,9 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
         dinfo.tls_mod_id = tls_info->module_id;
     }
 
-    const char* src = lib_path;
-    char* dst = out_module->path;
-    size_t i = 0;
-    uint16_t last_slash = 0;
-    while (*src && i < sizeof(out_module->path) - 1) {
-        if (*src == '/') last_slash = i + 1;
-        dst[i++] = *src++;
-    }
-    dst[i] = '\0';
-    
-    out_module->basename_offset = last_slash;
-    out_module->name_hash = calc_gnu_hash(&out_module->path[last_slash]);
+    strlcpy(out_module->path, module_name, sizeof(out_module->path));
+    out_module->basename_offset = 0;
+    out_module->name_hash = calc_gnu_hash(module_name);
     out_module->load_bias = load_bias;
     out_module->base = remote_base;
     out_module->size = map_size;
@@ -925,75 +806,44 @@ static bool load_single_library(const char *lib_path, int memfd, LoadedModule* o
     return true;
 }
 
-static int build_cache_cb(struct dl_phdr_info* info, size_t, void* data) {
-    auto* cache = reinterpret_cast<CachedLibList*>(data);
-    if (info->dlpi_name) {
-        const char* name = __builtin_strrchr(info->dlpi_name, '/');
-        name = name ? name + 1 : info->dlpi_name;
-        if (name[0] != '\0') cache->push_back(name);
-    }
-    return 0;
-}
-
-static inline bool is_library_loaded_in_memory(const char* soname, uint32_t hash, const CachedLibList& cache) {
-    if (cache.size == 0) return false;
-
-    size_t low = 0;
-    size_t high = cache.size - 1;
-
-    while (low <= high) {
-        size_t mid = low + (high - low) / 2;
-        const auto& mid_lib = cache.data[mid];
-
-        if (mid_lib.hash < hash) {
-            low = mid + 1;
-        } else if (mid_lib.hash > hash) {
-            if (mid == 0) break;
-            high = mid - 1;
-        } else {
-            // Hash match found.
-            // Because multiple libraries could have the same hash (unlikely but possible),
-            // and we sorted by name as a secondary key, we check both directions.
-
-            // Check current
-            int cmp = __builtin_strcmp(mid_lib.name, soname);
-            if (cmp == 0) return true;
-
-            // Search left
-            for (ssize_t i = (ssize_t)mid - 1; i >= 0 && cache.data[i].hash == hash; --i) {
-                if (__builtin_strcmp(cache.data[i].name, soname) == 0) return true;
+static bool is_lib_loaded(const char* target_soname) {
+    struct CallbackCtx {
+        const char* target;
+        bool found;
+        static int check(struct dl_phdr_info* info, size_t, void* data) {
+            auto* ctx = reinterpret_cast<CallbackCtx*>(data);
+            if (info->dlpi_name) {
+                const char* name = __builtin_strrchr(info->dlpi_name, '/');
+                name = name ? name + 1 : info->dlpi_name;
+                if (__builtin_strcmp(name, ctx->target) == 0) {
+                    ctx->found = true;
+                    return 1; // Stop iterating! We found it.
+                }
             }
-
-            // Search right
-            for (size_t i = mid + 1; i < cache.size && cache.data[i].hash == hash; ++i) {
-                if (__builtin_strcmp(cache.data[i].name, soname) == 0) return true;
-            }
-
-            return false;
+            return 0;
         }
-    }
-    return false;
+    } ctx = {target_soname, false};
+    
+    dl_iterate_phdr(CallbackCtx::check, &ctx);
+    return ctx.found;
 }
 
-static bool load_dependencies_recursive(const char *lib_path, int memfd, LoadedModuleList& loaded_modules, const CachedLibList& loaded_libs_cache) {
-    const char *soname = __builtin_strrchr(lib_path, '/');
-    soname = soname ? soname + 1 : lib_path;
-    uint32_t soname_hash = calc_gnu_hash(soname);
+static bool load_dependencies_recursive(const char *module_name, int memfd, LoadedModuleList& loaded_modules) {
+    uint32_t soname_hash = calc_gnu_hash(module_name);
 
     for (size_t i = 0; i < loaded_modules.size; i++) {
         const auto& m = loaded_modules.data[i];
-
         if (m.name_hash == soname_hash) {
-            if (__builtin_strcmp(&m.path[m.basename_offset], soname) == 0) return true;
+            if (__builtin_strcmp(&m.path[m.basename_offset], module_name) == 0) return true;
         }
     }
 
-    if (is_library_loaded_in_memory(soname, soname_hash, loaded_libs_cache)) return true;
+    if (is_lib_loaded(module_name)) return true;
 
     LoadedModule& mod = loaded_modules.push_back();
-    if (!load_single_library(lib_path, memfd, &mod)) {
+    if (!load_single_library(memfd, &mod, module_name)) {
         // Revert push_back if failed
-        loaded_modules.size--;
+        loaded_modules.pop_back();
         return false;
     }
 
@@ -1004,8 +854,7 @@ static bool load_dependencies_recursive(const char *lib_path, int memfd, LoadedM
         size_t off = loaded_modules.data[current_idx].dinfo.needed_str_offsets[i];
         if (off >= loaded_modules.data[current_idx].dinfo.strsz) continue;
         const char *dep_soname = &loaded_modules.data[current_idx].dinfo.strtab[off];
-        uint32_t dep_hash = calc_gnu_hash(dep_soname);
-        if (!is_library_loaded_in_memory(dep_soname, dep_hash, loaded_libs_cache)) {
+        if (!is_lib_loaded(dep_soname)) {
             LOGW("Warning: Module requires non-system dependency `%s` which is not in RAM.", dep_soname);
 
             // TODO: support multi-so module packages, maybe constructing
@@ -1017,16 +866,13 @@ static bool load_dependencies_recursive(const char *lib_path, int memfd, LoadedM
     return true;
 }
 
-static LoadedModuleList* g_currently_loading_modules = nullptr;
-
 static void register_loaded_modules(const LoadedModuleList& loaded_modules) {
     if (loaded_modules.size == 0) return;
 
-    init_region_tracking();
     SpinLockGuard lock(g_custom_regions_lock);
     const LoadedModule& main_mod = loaded_modules.data[0];
     
-    CustomRegion& region = g_custom_regions->push_back();
+    CustomRegion& region = get_custom_regions().push_back();
     region.handle = main_mod.base;
     DestructorAction action;
 
@@ -1089,16 +935,6 @@ static inline void cleanup_failed_load(const LoadedModuleList& loaded_modules) {
     }
 }
 
-bool custom_linker_cleanup() {
-    if (g_currently_loading_modules) {
-        LOGW("Unmapping orphan modules.");
-        cleanup_failed_load(*g_currently_loading_modules);
-        g_currently_loading_modules = nullptr;
-        return true;
-    }
-    return false;
-}
-
 extern "C" void* custom_tls_get_addr(tls_index* ti) {
     CustomTlsInfo* tls_info = reinterpret_cast<CustomTlsInfo*>(ti->module_id);
     if (tls_info && tls_info->module_id == ti->module_id) {
@@ -1116,36 +952,24 @@ extern "C" void* custom_tls_get_addr(tls_index* ti) {
 
 // ---------------- MAIN ----------------
 extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_total_size, uintptr_t *out_entry, uintptr_t *out_init_array, size_t *out_init_count) {
-    LoadedModuleList loaded_modules; CachedLibList loaded_libs_cache;
-    dl_iterate_phdr(build_cache_cb, &loaded_libs_cache);
-
-    ::sort(loaded_libs_cache.data, loaded_libs_cache.data + loaded_libs_cache.size, [](const CachedLib& a, const CachedLib& b) {
-        if (a.hash != b.hash) return a.hash < b.hash;
-        return __builtin_strcmp(a.name, b.name) < 0;
-    });
+    LoadedModuleList loaded_modules;
 
     // Give a dummy name for the main module
-    if (!load_dependencies_recursive("main_module", memfd, loaded_modules, loaded_libs_cache)) {
+    if (!load_dependencies_recursive("main_module", memfd, loaded_modules)) {
         LOGE("Failed to recursively load main module and its dependencies");
         cleanup_failed_load(loaded_modules);
         return false;
     }
 
     if (loaded_modules.size == 0) return false;
-    g_currently_loading_modules = &loaded_modules;
 
     // Step 1: Hook TLS for all modules first
     constexpr const char* target_tls = "__tls_get_addr";
-    constexpr uint32_t target_hash = calc_gnu_hash(target_tls);
-    constexpr uint32_t ADDR_BITS = sizeof(ElfW(Addr)) * 8;
-    constexpr uint32_t ADDR_MASK = ADDR_BITS - 1;
 
     for (size_t k = 0; k < loaded_modules.size; k++) {
         auto& mod = loaded_modules.data[k];
         const elf_dyn_info* info = &mod.dinfo;
         if (info->nsyms == 0 || info->symtab == nullptr) continue;
-
-        bool found = false;
 
         // imported (undefined) symbols reside in the unhashed portion of the GNU hash table
         size_t limit = (info->gnu_buckets != nullptr) ? info->gnu_symndx : info->nsyms;
@@ -1156,43 +980,7 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
                 if (__builtin_strcmp(name, target_tls) == 0) {
                     sym.st_value = PAC_STRIP(reinterpret_cast<uintptr_t>(&custom_tls_get_addr)) - mod.load_bias;
                     sym.st_shndx = 1;
-                    found = true;
                     break;
-                }
-            }
-        }
-
-        if (found) continue;
-
-        if (info->gnu_buckets != nullptr && info->gnu_bloom_filter != nullptr) {
-            uint32_t h2 = target_hash >> info->gnu_shift2;
-            uint32_t word_num = (target_hash / ADDR_BITS) & (info->gnu_bloom_filter_size - 1);
-
-            ElfW(Addr) mask = (((ElfW(Addr))1) << (target_hash & ADDR_MASK)) |
-                              (((ElfW(Addr))1) << (h2 & ADDR_MASK));
-
-            if ((info->gnu_bloom_filter[word_num] & mask) == mask) {
-                uint32_t sym_idx = info->gnu_buckets[target_hash % info->gnu_buckets_size];
-                if (sym_idx >= info->gnu_symndx) {
-                    uint32_t chain_idx = sym_idx - info->gnu_symndx;
-
-                    while (sym_idx < info->nsyms) {
-                        uint32_t chain_val = info->gnu_chains[chain_idx];
-                        if ((chain_val | 1) == (target_hash | 1)) {
-                            ElfW(Sym)& sym = info->symtab[sym_idx];
-                            if (sym.st_name != 0 && sym.st_name < info->strsz) {
-                                const char *name = &info->strtab[sym.st_name];
-                                if (__builtin_strcmp(name, target_tls) == 0) {
-                                    sym.st_value = PAC_STRIP(reinterpret_cast<uintptr_t>(&custom_tls_get_addr)) - mod.load_bias;
-                                    sym.st_shndx = 1;
-                                    break;
-                                }
-                            }
-                        }
-                        if (chain_val & 1) break;
-                        chain_idx++;
-                        sym_idx++;
-                    }
                 }
             }
         }
@@ -1263,7 +1051,5 @@ extern "C" bool custom_linker_load(int memfd, uintptr_t *out_base, size_t *out_t
     *out_init_count = main_mod.dinfo.init_arraysz ? (main_mod.dinfo.init_arraysz / sizeof(ElfW(Addr))) : 0;
 
     register_loaded_modules(loaded_modules);
-    g_currently_loading_modules = nullptr;
-
     return true;
 }

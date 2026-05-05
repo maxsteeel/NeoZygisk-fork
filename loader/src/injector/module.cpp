@@ -446,7 +446,6 @@ void ZygiskContext::run_modules_pre() {
         } else {
             LOGE("Module `%s` crashed during loading. Disabling.", m.name);
             if (m.memfd >= 0) { close(m.memfd); m.memfd = -1; }
-            if (!custom_linker_cleanup()) LOGE("Failed to clean up after module `%s` crash.", m.name);
             if (zygiskd::ReportModuleCrash(i) != 0) PLOGE("Failed to report module crash for module `%s`", m.name);
         }
         g_in_module_load = 0;
