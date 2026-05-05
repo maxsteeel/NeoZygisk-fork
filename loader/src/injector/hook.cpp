@@ -28,149 +28,6 @@
 extern constants::ZygiskSharedData* g_shared_data;
 const char *moduleId = "zygisksu";
 
-struct Property {
-    uint32_t key_hash;
-    char key[92];
-    char value[92];
-};
-
-UniqueList<Property>& GetSpoofProps() {
-    // Safe local static initialization
-    // This ensures that the constructor is called exactly once in 
-    // runtime, ignoring linker order problems.
-    static UniqueList<Property> spoof_props;
-    return spoof_props;
-}
-
-static void push_spoof_prop(uint32_t hash, const char* key, const char* value) {
-    Property p;
-    p.key_hash = hash;
-    size_t kl = __builtin_strlen(key); 
-    if (kl > 91) kl = 91;
-    __builtin_memcpy(p.key, key, kl); 
-    p.key[kl] = '\0';
-    size_t vl = __builtin_strlen(value); 
-    if (vl > 91) vl = 91;
-    __builtin_memcpy(p.value, value, vl); 
-    p.value[vl] = '\0';
-    GetSpoofProps().push_back(p);
-}
-
-static const Property* find_spoof_prop(const char* name) {
-    if (!name) return nullptr;
-    auto& spoof_props = GetSpoofProps();
-    if (spoof_props.size == 0) return nullptr;
-    uint32_t hash = calc_gnu_hash(name);
-
-    size_t left = 0;
-    size_t right = spoof_props.size;
-    while (left < right) {
-        size_t mid = left + (right - left) / 2;
-        const auto& prop = spoof_props.data[mid];
-        if (prop.key_hash < hash) {
-            left = mid + 1;
-        } else if (prop.key_hash > hash) {
-            right = mid;
-        } else {
-            int cmp = __builtin_strcmp(prop.key, name);
-            if (cmp < 0) {
-                left = mid + 1;
-            } else if (cmp > 0) {
-                right = mid;
-            } else {
-                return &prop;
-            }
-        }
-    }
-    return nullptr;
-}
-
-struct prop_info;
-typedef void (*prop_info_cb)(void* cookie, const char* name, const char* value, uint32_t serial);
-
-struct CustomCallbackCookie {
-    prop_info_cb original_callback;
-    void* original_cookie;
-};
-
-static void trim_inplace(char* str) {
-    if (!str) return;
-    char* start = str;
-    while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
-    char* end = start + __builtin_strlen(start) - 1;
-    while (end > start && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) end--;
-    *(end + 1) = '\0';
-    if (start != str) __builtin_memmove(str, start, end - start + 2);
-}
-
-static void generate_random_hex(char* buf, int len) {
-    if (len <= 0) return;
-
-    UniqueFd fd(open("/dev/urandom", O_RDONLY | O_CLOEXEC));
-    if (fd >= 0) {
-        unsigned char temp_buf[32]; 
-        int total_hex_chars = 0;
-        const char* digits = "0123456789abcdef";
-        int requested_buf = (len / 2) > 32 ? 32 : (len / 2);
-
-        if (read(fd, temp_buf, requested_buf) == requested_buf) {
-            for (int i = 0; i < requested_buf; ++i) {
-                buf[i * 2]     = digits[temp_buf[i] >> 4];
-                buf[i * 2 + 1] = digits[temp_buf[i] & 0x0F];
-            }
-            total_hex_chars = requested_buf * 2;
-
-            if (len > total_hex_chars) {
-                __builtin_memset(buf + total_hex_chars, '0', len - total_hex_chars);
-            }
-            buf[len] = '\0';
-            return;
-        }
-    }
-
-    __builtin_memset(buf, '0', len);
-    buf[len] = '\0';
-}
-
-void InitRandomVbmeta() {
-    char fake_digest[65];
-    generate_random_hex(fake_digest, 64);
-    constexpr uint32_t vbmeta_digest_hash = calc_gnu_hash("ro.boot.vbmeta.digest");
-    push_spoof_prop(vbmeta_digest_hash, "ro.boot.vbmeta.digest", fake_digest);
-}
-
-void LoadPropConfig() {
-    char config_path[256];
-    snprintf(config_path, sizeof(config_path), "/data/adb/modules/%s/spoof.prop", moduleId);
-    
-    UniqueFd fd(open(config_path, O_RDONLY | O_CLOEXEC));
-    if (fd < 0) return;
-
-    struct stat st;
-    if (fstat(fd, &st) == 0 && st.st_size > 0) {
-        char* buffer = (char*)malloc(st.st_size + 1);
-        if (read(fd, buffer, st.st_size) == st.st_size) {
-            buffer[st.st_size] = '\0';
-            char* saveptr;
-            char* line = strtok_r(buffer, "\n", &saveptr);
-            while (line != nullptr) {
-                char* eq_pos = __builtin_strchr(line, '=');
-                if (eq_pos && line[0] != '#') {
-                    *eq_pos = '\0';
-                    char* key = line;
-                    char* value = eq_pos + 1;
-                    trim_inplace(key);
-                    trim_inplace(value);
-                    if (key[0] != '\0') {
-                        push_spoof_prop(calc_gnu_hash(key), key, value);
-                    }
-                }
-                line = strtok_r(nullptr, "\n", &saveptr);
-            }
-        }
-    }
-}
-
 // *********************
 // Zygisk Bootstrapping
 // *********************
@@ -292,45 +149,7 @@ DCL_HOOK_FUNC(static int, unshare, int flags) {
     return old_unshare(flags);
 }
 
-static void custom_property_read_callback(void* cookie, const char* name, const char* value, uint32_t serial) {
-    if (cookie == nullptr) return;
-    auto* custom_cookie = static_cast<CustomCallbackCookie*>(cookie);
-
-    if (const Property* prop = find_spoof_prop(name)) {
-        custom_cookie->original_callback(custom_cookie->original_cookie, name, prop->value, serial);
-        return;
-    }
-
-    custom_cookie->original_callback(custom_cookie->original_cookie, name, value, serial);
-}
-
-DCL_HOOK_FUNC(void, __system_property_read_callback, const prop_info* pi, prop_info_cb callback, void* cookie) {
-    CustomCallbackCookie custom_cookie{callback, cookie};
-    old___system_property_read_callback(pi, custom_property_read_callback, &custom_cookie);
-}
-
-DCL_HOOK_FUNC(int, __system_property_get, const char *name, char *value) {
-    if (const Property* prop = find_spoof_prop(name)) {
-        int len = __builtin_strlen(prop->value);
-        if (value) {
-            __builtin_memcpy(value, prop->value, len);
-            value[len] = '\0';
-        }
-        return len;
-    }
-    return old___system_property_get(name, value);
-}
-
 DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *default_value) {
-
-    if (const Property* prop = find_spoof_prop(key)) {
-        int len = __builtin_strlen(prop->value);
-        if (value) {
-            __builtin_memcpy(value, prop->value, len);
-            value[len] = '\0';
-        }
-        return len;
-    }
 
     static bool unloader_triggered = false;
 
@@ -344,11 +163,8 @@ DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *defau
             for (size_t i = g_hook->plt_backup.size; i > 0; ) {
                 i--;
                 const auto& bkp = g_hook->plt_backup.data[i];
-                bool is_prop_get = (*bkp.backup_ptr == reinterpret_cast<void*>(old_property_get));
-                bool is_sys_prop_get = (*bkp.backup_ptr == reinterpret_cast<void*>(old___system_property_get));
-                bool is_sys_prop_read = (*bkp.backup_ptr == reinterpret_cast<void*>(old___system_property_read_callback));
 
-                if (is_prop_get || is_sys_prop_get || is_sys_prop_read) {
+                if (bkp.backup_ptr == reinterpret_cast<void*>(old_property_get)) {
                     if (!lsplt::RegisterHook(bkp.dev, bkp.inode, bkp.sym, *bkp.backup_ptr, nullptr) ||
                         !lsplt::CommitHook(g_hook->cached_map_infos, true)) {
                         PLOGE("unhook %s", bkp.sym);
@@ -390,63 +206,6 @@ DCL_HOOK_FUNC(static int, pthread_attr_setstacksize, void *target, size_t size) 
     }
 
     return res;
-}
-
-#if defined(__aarch64__)
-#define SECCOMP_AUDIT_ARCH AUDIT_ARCH_AARCH64
-#elif defined(__arm__)
-#define SECCOMP_AUDIT_ARCH AUDIT_ARCH_ARM
-#elif defined(__x86_64__)
-#define SECCOMP_AUDIT_ARCH AUDIT_ARCH_X86_64
-#elif defined(__i386__)
-#define SECCOMP_AUDIT_ARCH AUDIT_ARCH_I386
-#else
-#error "Unsupported architecture"
-#endif
-
-DCL_HOOK_FUNC(int, prctl, int option, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5) {
-    if (option == PR_SET_SECCOMP && arg2 == SECCOMP_MODE_FILTER) {
-        struct sock_fprog* prog = reinterpret_cast<struct sock_fprog*>(arg3);
-        if (prog != nullptr && prog->len > 0) {
-            // We want to prepend rules to check the arch and allow __NR_execve.
-            const struct sock_filter prepend[] = {
-                // 1. Check Architecture
-                BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
-                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SECCOMP_AUDIT_ARCH, 0, 3), // If match, go to next. If not, jump 3 instructions (to original filter).
-
-                // 2. Check Syscall Number
-                BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-                BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_execve, 0, 1), // If match, go to allow. If not, jump 1 instruction (to original filter).
-
-                // 3. Allow Syscall
-                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-            };
-
-            size_t prepend_len = sizeof(prepend) / sizeof(prepend[0]);
-            size_t total_len = prepend_len + prog->len;
-
-            if (total_len <= BPF_MAXINSNS) {
-                // Use dynamic allocation via malloc.
-                size_t alloc_size = total_len * sizeof(struct sock_filter);
-                struct sock_filter* new_filter = static_cast<struct sock_filter*>(malloc(alloc_size));
-
-                if (new_filter != nullptr) {
-                    __builtin_memcpy(new_filter, prepend, sizeof(prepend));
-                    __builtin_memcpy(new_filter + prepend_len, prog->filter, prog->len * sizeof(struct sock_filter));
-
-                    // Temporarily modify the prog to point to our new filter
-                    struct sock_fprog new_prog;
-                    new_prog.len = static_cast<unsigned short>(total_len);
-                    new_prog.filter = new_filter;
-
-                    int result = old_prctl(option, arg2, reinterpret_cast<unsigned long>(&new_prog), arg4, arg5);
-                    free(new_filter);
-                    return result;
-                }
-            }
-        }
-    }
-    return old_prctl(option, arg2, arg3, arg4, arg5);
 }
 
 #undef DCL_HOOK_FUNC
@@ -550,9 +309,6 @@ void HookContext::hook_plt() {
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, unshare);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, strdup);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, property_get);
-    PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, __system_property_get);
-    PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, __system_property_read_callback);
-    PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, prctl);
 
     if (!lsplt::CommitHook(cached_map_infos)) LOGE("HookContext::hook_plt failed");
 
@@ -701,24 +457,13 @@ void HookContext::restore_zygote_hook(JNIEnv *env) {
 // -----------------------------------------------------------------
 
 void hook_entry(void *start_addr, size_t block_size) {
-    LoadPropConfig();
-    InitRandomVbmeta();
-
-    auto& spoof_props = GetSpoofProps();
-    if (spoof_props.size > 0) {
-        ::sort(spoof_props.data, spoof_props.data + spoof_props.size, [](const Property& a, const Property& b) {
-            if (a.key_hash != b.key_hash) return a.key_hash < b.key_hash;
-            return __builtin_strcmp(a.key, b.key) < 0;
-        });
-    }
-
     UniqueFd shm_fd(zygiskd::GetZygiskSharedData());
     if (shm_fd >= 0) {
         void* map_res = mmap(nullptr, sizeof(constants::ZygiskSharedData), PROT_READ, MAP_SHARED, shm_fd, 0);
         if (map_res != MAP_FAILED) {
             g_shared_data = static_cast<constants::ZygiskSharedData*>(map_res);
             prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, g_shared_data, sizeof(constants::ZygiskSharedData), "jit-cache");
-            LOGV("Successfully mapped zero-ipc shared data");
+            LOGI("Successfully mapped shared data!");
         } else {
             PLOGE("Failed to mmap zygisk-shm");
         }
