@@ -2,8 +2,6 @@
 
 #include <android/dlext.h>
 #include <fcntl.h>
-#include <setjmp.h>
-#include <signal.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -24,64 +22,6 @@
 #include "zygisk.hpp"
 #include "custom_linker.hpp"
 #include "utils.hpp"
-
-static __thread sigjmp_buf g_segv_jmp_buf;
-static __thread volatile sig_atomic_t g_in_module_load = 0;
-static struct sigaction old_segv, old_bus;
-static pthread_mutex_t unmount_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static void module_segv_handler(int sig, siginfo_t *info, void *context) {
-    if (g_in_module_load) {
-        siglongjmp(g_segv_jmp_buf, 1);
-    }
-
-    // Chain to previous handler if not caught by us
-    struct sigaction *old_sa = (sig == SIGSEGV) ? &old_segv : &old_bus;
-    if (old_sa->sa_flags & SA_SIGINFO) {
-        if (old_sa->sa_sigaction) {
-            old_sa->sa_sigaction(sig, info, context);
-        }
-    } else {
-        if (old_sa->sa_handler == SIG_DFL || old_sa->sa_handler == SIG_IGN) {
-            signal(sig, SIG_DFL);
-            raise(sig);
-        } else if (old_sa->sa_handler) {
-            old_sa->sa_handler(sig);
-        }
-    }
-}
-
-class ModuleSecurityGuard {
-    void* altstack_mem;
-    struct sigaction old_segv, old_bus;
-    stack_t old_ss;
-
-public:
-    ModuleSecurityGuard() {
-        altstack_mem = malloc(SIGSTKSZ);
-        stack_t ss = {}; 
-        ss.ss_sp = altstack_mem;
-        ss.ss_flags = 0;
-        ss.ss_size = SIGSTKSZ;
-        sigaltstack(&ss, &old_ss);
-        struct sigaction sa = {};
-        sa.sa_sigaction = module_segv_handler;
-        sa.sa_flags = SA_ONSTACK | SA_SIGINFO;
-        sigemptyset(&sa.sa_mask);
-        sigaction(SIGSEGV, &sa, &old_segv);
-        sigaction(SIGBUS, &sa, &old_bus);
-    }
-
-    ~ModuleSecurityGuard() {
-        sigaction(SIGSEGV, &old_segv, nullptr);
-        sigaction(SIGBUS, &old_bus, nullptr);
-
-        stack_t disable_ss = {};
-        disable_ss.ss_flags = SS_DISABLE;
-        sigaltstack(&disable_ss, nullptr);
-        free(altstack_mem);
-    }
-};
 
 ZygiskModule::ZygiskModule(int id, void *handle, void *entry)
     : id(id), handle(handle), entry{entry}, api{}, mod{nullptr} {
@@ -173,85 +113,40 @@ void ZygiskModule::postAppSpecialize(const AppSpecializeArgs_v5 *args) const { c
 void ZygiskModule::preServerSpecialize(ServerSpecializeArgs_v1 *args) const { mod.v1->preServerSpecialize(mod.v1->impl, args); }
 void ZygiskModule::postServerSpecialize(const ServerSpecializeArgs_v1 *args) const { mod.v1->postServerSpecialize(mod.v1->impl, args); }
 
-static inline bool is_simple_literal(const char *str) {
-    return strpbrk(str, ".*+?^$[]|()\\") == nullptr;
-}
-
 void ZygiskContext::plt_hook_register(const char *regex, const char *symbol, void *fn, void **backup) {
-    if (regex == nullptr || symbol == nullptr || fn == nullptr) return;
-
+    if (!regex || !symbol || !fn) return;
     RegisterInfo info;
-    strlcpy(info.symbol, symbol ? symbol : "", sizeof(info.symbol));
+    strlcpy(info.symbol, symbol, sizeof(info.symbol));
+    strlcpy(info.literal, regex, sizeof(info.literal)); // Ignoramos si es regex, lo tratamos como literal
     info.callback = fn;
     info.backup = backup;
-
-    if (is_simple_literal(regex)) {
-        info.is_regex = false;
-        strlcpy(info.literal, regex ? regex : "", sizeof(info.literal));
-    } else {
-        info.is_regex = true;
-        if (regcomp(&info.regex, regex, REG_NOSUB) != 0) return;
-    }
-
-    mutex_guard lock(hook_info_lock);
     register_info.push_back(info);
 }
 
 void ZygiskContext::plt_hook_exclude(const char *regex, const char *symbol) {
     if (!regex) return;
-
     IgnoreInfo ign;
     strlcpy(ign.symbol, symbol ? symbol : "", sizeof(ign.symbol));
-
-    if (is_simple_literal(regex)) {
-        ign.is_regex = false;
-        strlcpy(ign.literal, regex ? regex : "", sizeof(ign.literal));
-    } else {
-        ign.is_regex = true;
-        if (regcomp(&ign.regex, regex, REG_NOSUB) != 0) return;
-    }
-
-    mutex_guard lock(hook_info_lock);
+    strlcpy(ign.literal, regex, sizeof(ign.literal));
     ignore_info.push_back(ign);
 }
 
 void ZygiskContext::plt_hook_process_regex() {
     if (register_info.size == 0) return;
-    const size_t ignore_count = ignore_info.size;
-    uint8_t* ign_matches = nullptr;
-    if (ignore_count > 0) {
-        ign_matches = new uint8_t[ignore_count];
-    }
 
     for (size_t i = 0; i < g_hook->cached_map_infos.size; i++) {
         auto& map = g_hook->cached_map_infos.data[i];
         if (map.offset != 0 || !map.is_private || !(map.perms & PROT_READ)) continue;
 
-        if (ignore_count > 0) {
-            __builtin_memset(ign_matches, 2, ignore_count);
-        }
-
         for (size_t k = 0; k < register_info.size; k++) {
             auto& reg = register_info.data[k];
-            if (!reg.is_regex) {
-                if (!__builtin_strstr(map.path, reg.literal)) continue;
-            } else {
-                if (regexec(&reg.regex, map.path, 0, nullptr, 0) != 0) continue;
-            }
+            if (!__builtin_strstr(map.path, reg.literal)) continue;
+
             bool ignored = false;
-            for (size_t j = 0; j < ignore_count; ++j) {
+            for (size_t j = 0; j < ignore_info.size; ++j) {
                 auto &ign = ignore_info.data[j];
                 if (ign.symbol[0] != '\0' && __builtin_strcmp(ign.symbol, reg.symbol) != 0) continue;
-
-                if (ign_matches[j] == 2) {
-                    if (!ign.is_regex) {
-                        ign_matches[j] = (__builtin_strstr(map.path, ign.literal) != nullptr);
-                    } else {
-                        ign_matches[j] = (regexec(&ign.regex, map.path, 0, nullptr, 0) == 0);
-                    }
-                }
-
-                if (ign_matches[j] == 1) {
+                if (__builtin_strstr(map.path, ign.literal)) {
                     ignored = true;
                     break;
                 }
@@ -261,24 +156,17 @@ void ZygiskContext::plt_hook_process_regex() {
             }
         }
     }
-
-    if (ign_matches) {
-        delete[] ign_matches;
-    }
 }
 
 bool ZygiskContext::plt_hook_commit() {
-    {
-        mutex_guard lock(hook_info_lock);
-        plt_hook_process_regex();
+    plt_hook_process_regex();
 
-        // When clear() is called, the RegexUniqueList structure will iterate
-        // on all its elements and will call regfree() on those 
-        // where is_regex == true. Then it will set the size = 0.
-        // This avoids Memory Leak and is a thousand times cleaner.
-        register_info.clear();
-        ignore_info.clear();
-    }
+    // When clear() is called, the RegexUniqueList structure will iterate
+    // on all its elements and will call regfree() on those 
+    // where is_regex == true. Then it will set the size = 0.
+    // This avoids Memory Leak and is a thousand times cleaner.
+    register_info.clear();
+    ignore_info.clear();
     return lsplt::CommitHook(g_hook->cached_map_infos);
 }
 
@@ -286,73 +174,71 @@ void ZygiskContext::sanitize_fds() {
     if (unlikely(!is_child())) return;
 
     if (can_exempt_fd() && exempted_fds.size > 0) {
-        auto update_fd_array = [&](int old_len) -> jintArray {
-            jintArray array = env->NewIntArray(static_cast<int>(old_len + exempted_fds.size));
-            if (array == nullptr) return nullptr;
+        jintArray old_arr = *args.app->fds_to_ignore;
+        int old_len = old_arr ? env->GetArrayLength(old_arr) : 0;
+        int new_len = old_len + exempted_fds.size;
 
-            env->SetIntArrayRegion(array, old_len, static_cast<int>(exempted_fds.size), exempted_fds.data);
+        if (jintArray new_arr = env->NewIntArray(new_len)) {
+            if (old_len > 0) {
+                void* old_data = env->GetPrimitiveArrayCritical(old_arr, nullptr);
+                if (old_data) {
+                    env->SetIntArrayRegion(new_arr, 0, old_len, static_cast<jint*>(old_data));
+                    for (int i = 0; i < old_len; ++i) {
+                        int fd = static_cast<jint*>(old_data)[i];
+                        if (fd >= 0 && static_cast<size_t>(fd) < allowed_fds.size) {
+                            allowed_fds.data[fd] = true;
+                        }
+                    }
+                    env->ReleasePrimitiveArrayCritical(old_arr, old_data, JNI_ABORT);
+                }
+            }
+            env->SetIntArrayRegion(new_arr, old_len, exempted_fds.size, exempted_fds.data);
             for (size_t i = 0; i < exempted_fds.size; i++) {
                 int fd = exempted_fds.data[i];
                 if (fd >= 0 && static_cast<size_t>(fd) < allowed_fds.size) {
                     allowed_fds.data[fd] = true;
                 }
             }
-            *args.app->fds_to_ignore = array;
-            return array;
-        };
-
-        if (jintArray fdsToIgnore = *args.app->fds_to_ignore) {
-            int *arr = env->GetIntArrayElements(fdsToIgnore, nullptr);
-            int len = env->GetArrayLength(fdsToIgnore);
-            for (int i = 0; i < len; ++i) {
-                int fd = arr[i];
-                if (fd >= 0 && static_cast<size_t>(fd) < allowed_fds.size) {
-                    allowed_fds.data[fd] = true;
-                }
-            }
-            if (jintArray newFdList = update_fd_array(len)) {
-                env->SetIntArrayRegion(newFdList, 0, len, arr);
-            }
-            env->ReleaseIntArrayElements(fdsToIgnore, arr, JNI_ABORT);
-        } else {
-            update_fd_array(0);
+            *args.app->fds_to_ignore = new_arr;
         }
     }
 
-    if (is_kernel_version_at_least(5, 9)) {
+    static int supports_close_range = -1;
+    if (unlikely(supports_close_range == -1)) {
+        supports_close_range = is_kernel_version_at_least(5, 9) ? 1 : 0;
+    }
+
+    if (supports_close_range == 1) {
         unsigned int start_fd = 0;
         bool in_range = false;
-        size_t n = allowed_fds.size;
-        for (size_t i = 0; i < n; ++i) {
+        for (size_t i = 0; i < allowed_fds.size; ++i) {
             if (!allowed_fds.data[i]) {
                 if (!in_range) {
                     start_fd = static_cast<unsigned int>(i);
                     in_range = true;
                 }
-            } else {
-                if (in_range) {
-                    syscall(__NR_close_range, start_fd, static_cast<unsigned int>(i - 1), 0);
-                    in_range = false;
-                }
+            } else if (in_range) {
+                syscall(__NR_close_range, start_fd, static_cast<unsigned int>(i - 1), 0);
+                in_range = false;
             }
         }
         if (in_range) {
             syscall(__NR_close_range, start_fd, ~0U, 0);
         } else {
-            syscall(__NR_close_range, static_cast<unsigned int>(n), ~0U, 0);
+            syscall(__NR_close_range, static_cast<unsigned int>(allowed_fds.size), ~0U, 0);
         }
     } else {
-        int fd_dir = open("/proc/self/fd", O_RDONLY | O_DIRECTORY);
+        int fd_dir = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (likely(fd_dir >= 0)) {
-            char buf[4096];
+            char buf[32768];
             int nread;
             while ((nread = syscall(__NR_getdents64, fd_dir, buf, sizeof(buf))) > 0) {
                 for (int bpos = 0; bpos < nread;) {
                     auto d = reinterpret_cast<struct linux_dirent64 *>(buf + bpos);
                     if (d->d_name[0] >= '0' && d->d_name[0] <= '9') {
                         int fd = fast_atoi(d->d_name);
-                        if (unlikely((fd < 0 || static_cast<size_t>(fd) >= allowed_fds.size ||
-                                      !allowed_fds.data[fd]) && fd != fd_dir)) {
+                        if (fd >= 0 && fd != fd_dir && 
+                            (static_cast<size_t>(fd) >= allowed_fds.size || !allowed_fds.data[fd])) {
                             close(fd);
                         }
                     }
@@ -392,19 +278,15 @@ void ZygiskContext::fork_pre() {
 
     if (unlikely(!is_child())) return;
 
-    int fd_dir = open("/proc/self/fd", O_RDONLY | O_DIRECTORY);
+    int fd_dir = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (likely(fd_dir >= 0)) {
-        char buf[4096];
+        char buf[32768]; 
         int nread;
         while ((nread = syscall(__NR_getdents64, fd_dir, buf, sizeof(buf))) > 0) {
             for (int bpos = 0; bpos < nread;) {
                 auto d = reinterpret_cast<struct linux_dirent64 *>(buf + bpos);
                 if (d->d_name[0] >= '0' && d->d_name[0] <= '9') {
                     int fd = fast_atoi(d->d_name);
-                    // Ensure the list is big enough dynamically
-                    while (static_cast<size_t>(fd) >= allowed_fds.capacity) {
-                        allowed_fds.push_back(false);
-                    }
                     if (fd >= 0) allowed_fds.data[fd] = true;
                 }
                 bpos += d->d_reclen;
@@ -427,59 +309,27 @@ void ZygiskContext::fork_post() {
 void ZygiskContext::run_modules_pre() {
     constexpr size_t MAX_MODULES = 256;
     zygiskd::Module ms[MAX_MODULES];
-    ModuleSecurityGuard guard;
 
     size_t size = zygiskd::ReadModules(ms, MAX_MODULES);
 
     for (size_t i = 0; i < size; i++) {
         auto &m = ms[i];
-        g_in_module_load = 1;
-        if (sigsetjmp(g_segv_jmp_buf, 1) == 0) {
-            uintptr_t base, entry_addr;
-            size_t size_mod, init_array, init_count;
-            if (custom_linker_load(m.memfd, &base, &size_mod, &entry_addr, &init_array, &init_count)) {
-                void* handle = reinterpret_cast<void*>(base); 
-                void* entry = reinterpret_cast<void*>(entry_addr);
-                modules.push_back(new ZygiskModule(static_cast<int>(i), handle, entry));
-                LOGV("Module `%s` loaded with custom linker at %p (size: 0x%zx)", m.name, handle, size_mod);
-            }
-        } else {
-            LOGE("Module `%s` crashed during loading. Disabling.", m.name);
-            if (m.memfd >= 0) { close(m.memfd); m.memfd = -1; }
-            if (zygiskd::ReportModuleCrash(i) != 0) PLOGE("Failed to report module crash for module `%s`", m.name);
+        uintptr_t base, entry_addr;
+        size_t size_mod, init_array, init_count;
+        
+        if (custom_linker_load(m.memfd, &base, &size_mod, &entry_addr, &init_array, &init_count)) {
+            modules.push_back(new ZygiskModule(static_cast<int>(i), (void*)base, (void*)entry_addr));
+            LOGV("Module `%s` loaded at %p", m.name, (void*)base);
         }
-        g_in_module_load = 0;
         close(m.memfd);
     }
 
-    size_t valid_modules = 0;
     for (size_t i = 0; i < modules.size; i++) {
         auto *m = modules.data[i];
-        auto &mod = ms[m->id];
-        bool crashed = false;
-
-        g_in_module_load = 1;
-        if (sigsetjmp(g_segv_jmp_buf, 1) == 0) {
-            m->onLoad(env);
-            if (flags & APP_SPECIALIZE) m->preAppSpecialize(args.app);
-            else if (flags & SERVER_FORK_AND_SPECIALIZE) m->preServerSpecialize(args.server);
-        } else {
-            crashed = true;
-            LOGE("Module `%s` crashed during onLoad/preSpecialize.", mod.name);
-        }
-        g_in_module_load = 0;
-
-        if (!crashed) {
-            // Keep valid modules packed at the front
-            if (valid_modules != i) modules.data[valid_modules] = modules.data[i];
-            valid_modules++;
-        } else {
-            delete m;
-        }
+        m->onLoad(env);
+        if (flags & APP_SPECIALIZE) m->preAppSpecialize(args.app);
+        else if (flags & SERVER_FORK_AND_SPECIALIZE) m->preServerSpecialize(args.server);
     }
-    modules.size = valid_modules; // Drop crashed modules efficiently
-
-    for (size_t i = 0; i < size; i++) memzero(ms[i].name, sizeof(ms[i].name));
 }
 
 void ZygiskContext::run_modules_post() {
@@ -496,54 +346,44 @@ void ZygiskContext::run_modules_post() {
 
 void ZygiskContext::app_specialize_pre() {
     uid_t uid = args.app->uid;
-    bool is_isolated_aid = uid >= AID_ISOLATED_START && uid <= AID_ISOLATED_END;
+    bool is_isolated = uid >= AID_ISOLATED_START && uid <= AID_ISOLATED_END;
 
-    if (is_isolated_aid && args.app->app_data_dir) {
+    if (is_isolated) {
         bool found_parent = false;
         if (args.app->app_data_dir) {
-            const char *data_dir = env->GetStringUTFChars(args.app->app_data_dir, nullptr);
-            if (data_dir != nullptr) {
+            if (const char *dir = env->GetStringUTFChars(args.app->app_data_dir, nullptr)) {
                 struct stat st;
-                if (stat(data_dir, &st) == 0) {
+                if (stat(dir, &st) == 0) {
                     uid = st.st_uid;
                     found_parent = true;
-                    LOGV("identify isolated service via app_data_dir [uid:%d, data_dir:%s]", uid, data_dir);
                 }
-                env->ReleaseStringUTFChars(args.app->app_data_dir, data_dir);
+                env->ReleaseStringUTFChars(args.app->app_data_dir, dir);
             }
         }
 
         if (!found_parent && args.app->pkg_data_info_list && *args.app->pkg_data_info_list) {
-            jobjectArray pkg_array = *args.app->pkg_data_info_list; 
-            jint count = env->GetArrayLength(pkg_array);
-            if (count > 0) {
-                jstring pkg_data_info = (jstring) env->GetObjectArrayElement(pkg_array, 0);
-                if (pkg_data_info) {
-                    const char *info_str = env->GetStringUTFChars(pkg_data_info, nullptr);
-                    if (info_str) {
-                        const char *p = info_str;
+            jobjectArray arr = *args.app->pkg_data_info_list;
+            if (env->GetArrayLength(arr) > 0) {
+                if (jstring info = static_cast<jstring>(env->GetObjectArrayElement(arr, 0))) {
+                    if (const char *str = env->GetStringUTFChars(info, nullptr)) {
+                        const char *p = str;
                         if ((p = __builtin_strchr(p, ',')) && (p = __builtin_strchr(p + 1, ',')) &&
                             (p = __builtin_strchr(p + 1, ',')) && *(++p) != '\0') {
-                            const char *data_dir = p;
                             struct stat st;
-                            if (stat(data_dir, &st) == 0) {
-                                uid = st.st_uid;
-                                LOGV("identify isolated service via pkg_data_info [uid:%d, data_dir:%s]", uid, data_dir);
-                            }
+                            if (stat(p, &st) == 0) uid = st.st_uid;
                         }
-                        env->ReleaseStringUTFChars(pkg_data_info, info_str);
+                        env->ReleaseStringUTFChars(info, str);
                     }
-                    env->DeleteLocalRef(pkg_data_info);
+                    env->DeleteLocalRef(info);
                 }
             }
         }
     }
 
-    bool skip_zygiskd = is_isolated_aid && zygiskd::Connect(1) == -1;
+    bool skip_zygiskd = is_isolated && zygiskd::Connect(1) == -1;
     if (!skip_zygiskd && info_flags == 0) info_flags = zygiskd::GetProcessFlags(uid);
 
     if ((info_flags & UNMOUNT_MASK) == UNMOUNT_MASK) {
-        LOGI("[%s] is on the denylist", process);
         flags |= DO_REVERT_UNMOUNT;
     }
 
@@ -564,6 +404,7 @@ void ZygiskContext::server_specialize_pre() {
     run_modules_pre();
     zygiskd::SystemServerStarted();
 }
+
 void ZygiskContext::server_specialize_post() { run_modules_post(); }
 
 void ZygiskContext::nativeForkSystemServer_pre() {
@@ -597,22 +438,17 @@ void ZygiskContext::nativeSpecializeAppProcess_pre() {
         
         bool abort = false;
         MountInfoList new_traces = check_zygote_traces(info_flags, &abort);
+        g_hook->zygote_traces = static_cast<MountInfoList&&>(new_traces);
 
-        {
-            mutex_guard lock(unmount_lock); 
-
-            g_hook->zygote_traces = static_cast<MountInfoList&&>(new_traces);
-
-            if (!abort) {
-                for (size_t i = 0; i < g_hook->zygote_traces.size; i++) {
-                    const auto& trace = g_hook->zygote_traces.data[i];
-                    if (trace.skip_unmount) continue;
-                    LOGV("AppZygote unmounting %s", trace.target);
-                    umount2(trace.target, MNT_DETACH);
-                }
-                g_hook->zygote_unmounted = true;
-                g_hook->zygote_traces.size = 0;
+        if (!abort) {
+            for (size_t i = 0; i < g_hook->zygote_traces.size; i++) {
+                const auto& trace = g_hook->zygote_traces.data[i];
+                if (trace.skip_unmount) continue;
+                LOGV("AppZygote unmounting %s", trace.target);
+                umount2(trace.target, MNT_DETACH);
             }
+            g_hook->zygote_unmounted = true;
+            g_hook->zygote_traces.size = 0;
         }
     }
 }
@@ -625,58 +461,36 @@ void ZygiskContext::nativeSpecializeAppProcess_post() {
 
 void ZygiskContext::nativeForkAndSpecialize_pre() {
     process = env->GetStringUTFChars(args.app->nice_name, nullptr);
-    LOGV("pre forkAndSpecialize [%s]", process);
     flags |= APP_FORK_AND_SPECIALIZE;
 
     if (!g_hook->zygote_unmounted && g_hook->zygote_traces.size == 0) {
         info_flags = zygiskd::GetProcessFlags(args.app->uid);
 
         bool abort = false;
-        MountInfoList new_traces = check_zygote_traces(info_flags, &abort);
+        g_hook->zygote_traces = check_zygote_traces(info_flags, &abort);
 
-        {
-            mutex_guard lock(unmount_lock);
-            g_hook->zygote_traces = static_cast<MountInfoList&&>(new_traces);
-
-            if (!abort) {
-                size_t valid = 0;
-                for (size_t i = 0; i < g_hook->zygote_traces.size; i++) {
-                    const auto& trace = g_hook->zygote_traces.data[i];
-                    if (trace.skip_unmount) {
-                        LOGV("skip magisk specific mounts for compatibility: %s", trace.source);
-                        g_hook->zygote_traces.data[valid++] = trace; 
-                    } else {
-                        LOGV("unmounting %s (mnt_id: %u)", trace.target, trace.id);
-                        if (umount2(trace.target, MNT_DETACH) != 0) {
-                            LOGE("failed to unmount %s: %s", trace.target, strerror(errno));
-                            g_hook->zygote_traces.data[valid++] = trace; 
-                        }
-                    }
-                }
-                g_hook->zygote_traces.size = valid;
-                g_hook->zygote_unmounted = true;
+        if (!abort) {
+            for (size_t i = 0; i < g_hook->zygote_traces.size; i++) {
+                umount2(g_hook->zygote_traces.data[i].target, MNT_DETACH);
             }
+            g_hook->zygote_traces.size = 0;
+            g_hook->zygote_unmounted = true;
         }
     }
 
     fork_pre();
+    
     if (is_child()) {
         app_specialize_pre();
         if (flags & DO_REVERT_UNMOUNT) {
-            LOGI("Reverting mounts for denylisted app: %s", process);
-
-            if (g_hook->zygote_unmounted && g_hook->zygote_traces.size > 0) {
-                for (size_t i = 0; i < g_hook->zygote_traces.size; i++) {
-                    LOGV("Child unmounting %s", g_hook->zygote_traces.data[i].target);
-                    umount2(g_hook->zygote_traces.data[i].target, MNT_DETACH);
-                }
-            } else {
-                MountInfoList traces = check_zygote_traces(info_flags);
-                for (size_t i = 0; i < traces.size; i++) {
-                    LOGV("Child unmounting %s", traces.data[i].target);
-                    umount2(traces.data[i].target, MNT_DETACH);
-                }
+            if (g_hook->zygote_traces.size == 0) {
+                g_hook->zygote_traces = check_zygote_traces(info_flags);
             }
+
+            for (size_t i = 0; i < g_hook->zygote_traces.size; i++) {
+                umount2(g_hook->zygote_traces.data[i].target, MNT_DETACH);
+            }
+            g_hook->zygote_traces.size = 0;
         }
     }
     sanitize_fds();
@@ -687,27 +501,14 @@ void ZygiskContext::nativeForkAndSpecialize_post() {
         LOGV("post forkAndSpecialize [%s]", process);
         zygiskd::UnmapSharedMemory();
         app_specialize_post();
+    } else {
+        if (process) env->ReleaseStringUTFChars(args.app->nice_name, process);
     }
     fork_post();
 }
 
 bool ZygiskContext::update_mount_namespace(zygiskd::MountNamespace namespace_type) {
-    const char *type_str = (namespace_type == zygiskd::MountNamespace::Clean ? "Clean" : "Root");
-    LOGV("updating mount namespace to type %s", type_str);
-
-    int ns_fd = zygiskd::UpdateMountNamespace(namespace_type);
-
-    if (ns_fd < 0) {
-        LOGW("mount namespace [%s] not available/cached", type_str);
-        return false;
-    }
-
-    int ret = setns(ns_fd, CLONE_NEWNS);
-    if (ret != 0) {
-        PLOGE("setns failed for type %s", type_str);
-        close(ns_fd);
-        return false;
-    }
-    close(ns_fd);
-    return true;
+    UniqueFd ns_fd(zygiskd::UpdateMountNamespace(namespace_type));
+    if (ns_fd < 0) return false;
+    return setns(ns_fd, CLONE_NEWNS) == 0;
 }

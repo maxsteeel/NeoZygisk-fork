@@ -10,12 +10,6 @@
 #include "unique.hpp"
 #include "zygisk.hpp"
 
-struct CachedMapEntry {
-    const char* name;
-    uint32_t name_hash;
-    const lsplt::MapInfo* info;
-};
-
 struct PltBackupEntry {
     dev_t dev;
     ino_t inode;
@@ -39,7 +33,6 @@ struct IgnoreInfo {
     regex_t regex;
 };
 
-using CachedMapList = UniqueList<CachedMapEntry>;
 using PltBackupList = UniqueList<PltBackupEntry>;
 using MountInfoList = UniqueList<mount_info>;
 using RegisterInfoList = RegexUniqueList<RegisterInfo>;
@@ -360,7 +353,6 @@ struct ZygiskContext {
     BoolList allowed_fds;
     IntList exempted_fds;
 
-    pthread_mutex_t hook_info_lock;
     RegisterInfoList register_info;
     IgnoreInfoList ignore_info;
 
@@ -406,15 +398,11 @@ struct JNIMethods {
 
 struct HookContext : JniHookDefinitions {
     void *start_addr = nullptr;
-    jmethodID member_getModifiers = nullptr;
     lsplt::MapInfoList cached_map_infos = {};
-    CachedMapList map_info_cache;
     PltBackupList plt_backup;
     MountInfoList zygote_traces;
     size_t block_size = 0;
-    jint MODIFIER_NATIVE = 0;
     bool should_unmap = false;
-    bool skip_hooking_unloader = false;
     bool zygote_unmounted = false;
 
     HookContext(void *start_addr, size_t block_size);
@@ -425,38 +413,11 @@ struct HookContext : JniHookDefinitions {
     void hook_zygote_jni();
     void restore_zygote_hook(JNIEnv *env);
     void hook_jni_methods(JNIEnv *env, const char *clz, JNIMethods methods);
-    void refresh_map_infos();
     void clear_map_paths();
 
 private:
     void register_hook(dev_t dev, ino_t inode, const char *symbol, void *new_func, void **old_func);
 };
 
-inline const lsplt::MapInfo* find_in_cache(const CachedMapList& cache, const char* name) {
-    uint32_t target_hash = calc_gnu_hash(name);
-
-    size_t left = 0;
-    size_t right = cache.size;
-
-    // Binary search for the first element with name_hash >= target_hash
-    while (left < right) {
-        size_t mid = left + (right - left) / 2;
-        if (cache.data[mid].name_hash < target_hash) {
-            left = mid + 1;
-        } else {
-            right = mid;
-        }
-    }
-
-    // Linear scan for hash collisions
-    while (left < cache.size && cache.data[left].name_hash == target_hash) {
-        if (__builtin_strcmp(cache.data[left].name, name) == 0) {
-            return cache.data[left].info;
-        }
-        left++;
-    }
-
-    return nullptr;
-}
 
 MountInfoList check_zygote_traces(uint32_t info_flags, bool* abort = nullptr);

@@ -1,24 +1,15 @@
 #include <dlfcn.h>
 #include <pthread.h>
-#include <sched.h>
 #include <sys/mman.h>
-#include <sys/mount.h>
-#include <sys/resource.h>
-#include <sys/stat.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <linux/seccomp.h>
-#include <linux/filter.h>
+#include <sys/resource.h> 
 #include <sys/prctl.h>
-#include <sys/syscall.h>
-#include <linux/audit.h>
 #include <stdint.h>
 #include <stdlib.h>
 
 #include <lsplt.hpp>
 
 #include "android_util.hpp"
-#include "elf_utils.hpp"
 #include "daemon.hpp"
 #include "misc.hpp"
 #include "module.hpp"
@@ -116,8 +107,7 @@ DCL_HOOK_FUNC(static char *, strdup, const char *str) {
             // Wipe the old map paths populated by hook_plt() before overwriting them.
             // The new scan will repopulate the map info with the same paths, but they 
             // will be wiped again in hook_zygote_jni() after we are done with hooking.
-            g_hook->clear_map_paths();
-            g_hook->refresh_map_infos();
+            g_hook->hook_unloader();
             zygote_hooked = true;
         }
     }
@@ -149,40 +139,6 @@ DCL_HOOK_FUNC(static int, unshare, int flags) {
     return old_unshare(flags);
 }
 
-DCL_HOOK_FUNC(int, property_get, const char *key, char *value, const char *default_value) {
-
-    static bool unloader_triggered = false;
-
-    if (unlikely(!unloader_triggered)) {
-        unloader_triggered = true;
-
-        if (!g_hook->skip_hooking_unloader) {
-            g_hook->hook_unloader();
-            g_hook->skip_hooking_unloader = true;
-
-            for (size_t i = g_hook->plt_backup.size; i > 0; ) {
-                i--;
-                const auto& bkp = g_hook->plt_backup.data[i];
-
-                if (bkp.backup_ptr == reinterpret_cast<void*>(old_property_get)) {
-                    if (!lsplt::RegisterHook(bkp.dev, bkp.inode, bkp.sym, *bkp.backup_ptr, nullptr) ||
-                        !lsplt::CommitHook(g_hook->cached_map_infos, true)) {
-                        PLOGE("unhook %s", bkp.sym);
-                    } else {
-                        if (i < g_hook->plt_backup.size - 1) {
-                            __builtin_memmove(&g_hook->plt_backup.data[i], &g_hook->plt_backup.data[i + 1], 
-                                              (g_hook->plt_backup.size - i - 1) * sizeof(PltBackupEntry));
-                        }
-                        g_hook->plt_backup.size--;
-                    }
-                }
-            }
-            g_hook->clear_map_paths();
-        }
-    }
-    return old_property_get(key, value, default_value);
-}
-
 // We cannot directly call `munmap` to unload ourselves, otherwise when `munmap` returns,
 // it will return to our code which has been unmapped, causing segmentation fault.
 // Instead, we hook `pthread_attr_setstacksize` which will be called when VM daemon threads start.
@@ -212,9 +168,13 @@ DCL_HOOK_FUNC(static int, pthread_attr_setstacksize, void *target, size_t size) 
 
 // -----------------------------------------------------------------
 static size_t get_fd_max() {
-    rlimit r{32768, 32768};
-    getrlimit(RLIMIT_NOFILE, &r);
-    return r.rlim_max;
+    static size_t cached_max = 0;
+    if (unlikely(cached_max == 0)) {
+        rlimit r{32768, 32768};
+        getrlimit(RLIMIT_NOFILE, &r);
+        cached_max = r.rlim_max;
+    }
+    return cached_max;
 }
 
 ZygiskContext::ZygiskContext(JNIEnv *env, void *args)
@@ -223,14 +183,12 @@ ZygiskContext::ZygiskContext(JNIEnv *env, void *args)
       process(nullptr),
       pid(-1),
       flags(0),
-      info_flags(0),
-      hook_info_lock(PTHREAD_MUTEX_INITIALIZER) {
+      info_flags(0) {
 
     size_t fd_max = get_fd_max();
     allowed_fds.capacity = fd_max;
     allowed_fds.size = fd_max;
-    allowed_fds.data = (bool*)malloc(fd_max * sizeof(bool));
-    __builtin_memset(allowed_fds.data, 0, fd_max * sizeof(bool));
+    allowed_fds.data = static_cast<bool*>(calloc(fd_max, sizeof(bool)));
     g_ctx = this;
 }
 
@@ -264,90 +222,53 @@ void HookContext::register_hook(dev_t dev, ino_t inode, const char *symbol, void
 
 #define PLT_HOOK_REGISTER(DEV, INODE, NAME) PLT_HOOK_REGISTER_SYM(DEV, INODE, #NAME, NAME)
 
-void HookContext::refresh_map_infos() {
-    map_info_cache.size = 0;
-    cached_map_infos = lsplt::Scan();
-    
-    for (size_t i = 0; i < cached_map_infos.size; i++) {
-        const auto& map = cached_map_infos.data[i];
-        if (map.path[0] != '\0') {
-            const char* filename = __builtin_strrchr(map.path, '/');
-            filename = filename ? filename + 1 : map.path;
-            CachedMapEntry entry;
-            entry.name = filename;
-            entry.name_hash = calc_gnu_hash(filename);
-            entry.info = &map;
-            map_info_cache.push_back(entry);
-        }
-    }
-
-    if (map_info_cache.size > 0) {
-        ::sort(map_info_cache.data, map_info_cache.data + map_info_cache.size,
-               [](const CachedMapEntry& a, const CachedMapEntry& b) {
-                   return a.name_hash < b.name_hash;
-               });
-    }
-}
-
 void HookContext::hook_plt() {
     ino_t android_runtime_inode = 0;
     dev_t android_runtime_dev = 0;
 
-    refresh_map_infos();
+    cached_map_infos = lsplt::Scan();
 
-    if (const auto* info = find_in_cache(map_info_cache, "libandroid_runtime.so")) {
-        android_runtime_inode = info->inode;
-        android_runtime_dev = info->dev;
-    }
+    for (size_t i = 0; i < cached_map_infos.size; i++) {
+        const char* path = cached_map_infos.data[i].path;
+        if (path[0] == '\0') continue;
 
-    if (const auto* info = find_in_cache(map_info_cache, "libart.so")) {
-        g_art_inode = info->inode;
-        g_art_dev = info->dev;
+        const char* filename = __builtin_strrchr(path, '/');
+        filename = filename ? filename + 1 : path;
+
+        if (__builtin_strcmp(filename, "libandroid_runtime.so") == 0) {
+            android_runtime_inode = cached_map_infos.data[i].inode;
+            android_runtime_dev = cached_map_infos.data[i].dev;
+        } else if (__builtin_strcmp(filename, "libart.so") == 0) {
+            g_art_inode = cached_map_infos.data[i].inode;
+            g_art_dev = cached_map_infos.data[i].dev;
+        }
+
+        if (android_runtime_inode && g_art_inode) break;
     }
 
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, fork);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, unshare);
     PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, strdup);
-    PLT_HOOK_REGISTER(android_runtime_dev, android_runtime_inode, property_get);
 
     if (!lsplt::CommitHook(cached_map_infos)) LOGE("HookContext::hook_plt failed");
-
-    size_t new_size = 0;
-    for (size_t i = 0; i < plt_backup.size; i++) {
-        if (*plt_backup.data[i].backup_ptr != nullptr) {
-            plt_backup.data[new_size++] = plt_backup.data[i];
-        }
-    }
-    plt_backup.size = new_size;
 }
 
 void HookContext::hook_unloader() {
-    clear_map_paths();
-    refresh_map_infos();
-    if (g_art_inode == 0 || g_art_dev == 0) {
-        if (const auto* info = find_in_cache(map_info_cache, "libart.so")) {
-            g_art_inode = info->inode;
-            g_art_dev = info->dev;
+    if (g_art_inode != 0 && g_art_dev != 0) {
+        PLT_HOOK_REGISTER(g_art_dev, g_art_inode, pthread_attr_setstacksize);
+        if (!lsplt::CommitHook(cached_map_infos)) {
+            LOGE("HookContext::hook_unloader failed");
         }
+    } else {
+        LOGE("libart.so not found! Unloader hook failed.");
     }
-
-    PLT_HOOK_REGISTER(g_art_dev, g_art_inode, pthread_attr_setstacksize);
-    if (!lsplt::CommitHook(cached_map_infos)) {
-        LOGE("HookContext::hook_unloader failed");
-    }
+    clear_map_paths(); 
 }
 
 void HookContext::clear_map_paths() {
-    static atomic_flag clearing = ATOMIC_FLAG_INIT;
-    if (atomic_flag_test_and_set_explicit(&clearing, memory_order_acquire)) return;
-
     for (size_t i = 0; i < cached_map_infos.size; i++) {
-        auto& map = cached_map_infos.data[i];
-        size_t len = strnlen(map.path, sizeof(map.path));
-        if (len > 0) memzero(map.path, len);
+        __builtin_memset(cached_map_infos.data[i].path, 0, sizeof(cached_map_infos.data[i].path));
     }
-
-    atomic_flag_clear_explicit(&clearing, memory_order_release); 
 }
 
 void HookContext::restore_plt_hook() {
@@ -362,10 +283,6 @@ void HookContext::restore_plt_hook() {
         LOGE("failed to restore plt_hook");
         should_unmap = false;
     }
-
-    // Clear cached map info
-    clear_map_paths();
-    cached_map_infos.size = 0;
 }
 
 // -----------------------------------------------------------------
@@ -378,7 +295,7 @@ void HookContext::hook_jni_methods(JNIEnv *env, const char *clz, JNIMethods meth
         return;
     }
 
-    JNINativeMethod* hooks = new JNINativeMethod[methods.size()];
+    auto* hooks = static_cast<JNINativeMethod*>(alloca(sizeof(JNINativeMethod) * methods.size()));
     size_t hooks_count = 0;
 
     for (auto &native_method : methods) {
@@ -397,11 +314,6 @@ void HookContext::hook_jni_methods(JNIEnv *env, const char *clz, JNIMethods meth
             continue;
         }
         auto method = util::jni::ToReflectedMethod(env, clazz, method_id, is_static);
-        auto modifier = util::jni::CallIntMethod(env, method, member_getModifiers);
-        if ((modifier & MODIFIER_NATIVE) == 0) {
-            native_method.fnPtr = nullptr;
-            continue;
-        }
         auto artMethod = util::art::ArtMethod::FromReflectedMethod(env, method);
         hooks[hooks_count++] = native_method;
         auto original_method = artMethod->GetData();
@@ -410,47 +322,25 @@ void HookContext::hook_jni_methods(JNIEnv *env, const char *clz, JNIMethods meth
     }
 
     if (hooks_count > 0) env->RegisterNatives(clazz, hooks, hooks_count);
-    delete[] hooks;
 }
 
 void HookContext::hook_zygote_jni() {
     auto get_created_java_vms = reinterpret_cast<jint (*)(JavaVM **, jsize, jsize *)>(
         dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs"));
     if (!get_created_java_vms) {
-        void* sym = resolve_symbol("libnativehelper.so", "JNI_GetCreatedJavaVMs");
-        if (sym) {
-            get_created_java_vms = reinterpret_cast<decltype(get_created_java_vms)>(sym);
-        } else {
-            LOGW("JNI_GetCreatedJavaVMs not found in memory");
-            return;
-        }
+        LOGE("JNI_GetCreatedJavaVMs not found in memory!");
+        return;
     }
     JavaVM *vm = nullptr;
     jsize num = 0;
-    jint res = get_created_java_vms(&vm, 1, &num);
-    if (res != JNI_OK || vm == nullptr) return;
+    if (get_created_java_vms(&vm, 1, &num) != JNI_OK || vm == nullptr) return;
     JNIEnv *env = nullptr;
-    res = vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
-    if (res != JNI_OK || env == nullptr) return;
+    if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK || env == nullptr) return;
 
-    auto classMember = util::jni::FindClass(env, "java/lang/reflect/Member");
-    if (classMember != nullptr)
-        member_getModifiers = util::jni::GetMethodID(env, classMember, "getModifiers", "()I");
-    auto classModifier = util::jni::FindClass(env, "java/lang/reflect/Modifier");
-    if (classModifier != nullptr) {
-        auto fieldId = util::jni::GetStaticFieldID(env, classModifier, "NATIVE", "I");
-        if (fieldId != nullptr)
-            MODIFIER_NATIVE = util::jni::GetStaticIntField(env, classModifier, fieldId);
-    }
-    if (member_getModifiers == nullptr || MODIFIER_NATIVE == 0) return;
     if (!util::art::ArtMethod::Init(env)) {
         LOGE("failed to init ArtMethod");
         return;
     }
-    hook_jni_methods(env, kZygote, JNIMethods(zygote_methods, sizeof(zygote_methods) / sizeof(zygote_methods[0])));
-}
-
-void HookContext::restore_zygote_hook(JNIEnv *env) {
     hook_jni_methods(env, kZygote, JNIMethods(zygote_methods, sizeof(zygote_methods) / sizeof(zygote_methods[0])));
 }
 
@@ -473,6 +363,14 @@ void hook_entry(void *start_addr, size_t block_size) {
 
     g_hook = new HookContext(start_addr, block_size);
     g_hook->hook_plt();
+}
+
+void HookContext::restore_zygote_hook(JNIEnv *env) {
+    auto clazz = env->FindClass(kZygote);
+    if (clazz) {
+        env->RegisterNatives(clazz, zygote_methods, sizeof(zygote_methods) / sizeof(zygote_methods[0]));
+    }
+    env->ExceptionClear();
 }
 
 void hookJniNativeMethods(JNIEnv *env, const char *clz, JNINativeMethod *methods, int numMethods) {
